@@ -28,6 +28,8 @@ namespace bmoe {
 class IRouteTraceSink;
 class IComputeTraceSink;
 class IIoTraceSink;
+struct LlamaSessionConfig;
+struct LlamaSessionAccess;
 
 // Everything fixed for the model's lifetime — set once at open(). n_ctx and n_batch are
 // baked into the llama context at creation and cannot change per prompt, so size them for
@@ -54,6 +56,8 @@ struct SessionConfig {
     // open() builds the wider verify batch, and — for the MTP source only — the draft context.
     // See RunConfig::spec.
     SpecConfig spec;
+    // Optional native embedding configuration, defined separately in llama_session.h.
+    std::shared_ptr<const LlamaSessionConfig> native;
 };
 
 // The RunConfig → SessionConfig mapping, in one place. Both entry points that open a session from a
@@ -94,6 +98,14 @@ struct GenerateRequest {
     // default output, and every benchmark run) does not, and should turn it off. Default on so an
     // embedder that does not know about this flag keeps the old behaviour.
     bool render_text = true;
+    // Optional embedding hooks. Sampling receives the logits row; it must also accept
+    // its chosen token. Custom sampling cannot be combined with speculative decoding.
+    std::function<int32_t(int)> sample_token;
+    // May be polled by the CPU abort callback. Must not throw.
+    std::function<bool()> should_stop;
+    std::function<void(float)> on_progress;
+    // A normal end of generation (e.g. a stop string), checked after token delivery.
+    std::function<bool()> stop_generation;
 };
 
 // Teacher-forced quality measurement. The text is fixed, so every cell scores the SAME token
@@ -209,6 +221,7 @@ public:
     PplResult perplexity(const PplRequest & req);
 
 private:
+    friend struct LlamaSessionAccess;
     Session();
     struct Impl;
     std::unique_ptr<Impl> impl_;

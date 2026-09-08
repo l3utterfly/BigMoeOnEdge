@@ -43,7 +43,10 @@ option(BMOE_BUILD_TOOLS "Build standalone diagnostic tools (bmoe-iobench)" OFF)
 # upstream versions, so a submodule bump may need the chat glue in runtime.cpp updated (the
 # gates catch it at build time). That trade-off is deliberate; see docs/seam.md.
 set(BMOE_HAVE_LLAMA OFF)
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/CMakeLists.txt")
+if(TARGET llama AND TARGET llama-common)
+    # Embedders share one llama.cpp runtime; never build a second set of llama/ggml symbols.
+    set(BMOE_HAVE_LLAMA ON)
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/CMakeLists.txt")
     set(BMOE_HAVE_LLAMA ON)
     # Upstream examples/tests/server stay off; build the common utils we link for chat.
     set(LLAMA_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
@@ -52,6 +55,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/CMakeLists.txt")
     set(LLAMA_BUILD_COMMON  ON  CACHE BOOL "" FORCE)
     set(LLAMA_CURL          OFF CACHE BOOL "" FORCE)  # common's model-download path unused
     add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL)
+    set(BMOE_LLAMA_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp")
 endif()
 
 add_subdirectory(core)

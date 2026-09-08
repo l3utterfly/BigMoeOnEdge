@@ -9,6 +9,7 @@ add_library(bmoe_core STATIC
     src/moe/arch_registry.cpp
     src/engine/ngram_draft.cpp
 )
+set_target_properties(bmoe_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(bmoe_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -54,7 +55,7 @@ if(BMOE_HAVE_LLAMA)
     # Intra-layer I/O–compute overlap needs the fork's expert-ready hook in ggml-cpu.h. Detect
     # it by inspecting the submodule header rather than the git remote, so any tree carrying the
     # hook (a rebase, a different fork) enables the feature. PUBLIC so cli/ and tests/ see it.
-    set(_ggml_cpu_h "${CMAKE_SOURCE_DIR}/third_party/llama.cpp/ggml/include/ggml-cpu.h")
+    set(_ggml_cpu_h "${BMOE_LLAMA_SOURCE_DIR}/ggml/include/ggml-cpu.h")
     if(EXISTS "${_ggml_cpu_h}")
         file(READ "${_ggml_cpu_h}" _ggml_cpu_src)
         if(_ggml_cpu_src MATCHES "ggml_cpu_set_expert_ready_hook")

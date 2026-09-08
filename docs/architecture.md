@@ -12,13 +12,15 @@ a single ~25-line hook on a fork branch with an explicit sunset (see below and
 ```
 cli/            bmoe-cli — parses flags, the only place env vars are read
 core/
-  include/bmoe/ ports (interfaces) + config, pure policy, no llama.cpp dependency
+  include/bmoe/ ports + config (policy), with a separate optional native adapter
     config.h        RunConfig + validate()
     expert_source.h IExpertSource — the residency strategy port
     row_source.h    IRowSource - the row-gathered residency port
     recipe.h        MoeRecipe + registry
     metrics.h       TokenMetrics / RunSummary + IMetricsSink
     runtime.h       run() entry point
+    session.h       persistent session and engine-independent generation hooks
+    llama_session.h optional public llama.cpp context/config/cache adapter for native hosts
   src/
     io/         platform_io — O_DIRECT reads + reserve/commit/evict VM, cross-platform
                 file_reader — pooled positioned reader, per-consumer O_DIRECT

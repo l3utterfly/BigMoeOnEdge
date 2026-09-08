@@ -32,6 +32,8 @@ warming the cache changes latency, never the bytes.
 - **`false` (continue):** the prompt continues the current conversation. In chat mode the Session
   owns the conversation (`chat_history`) and re-renders the model's chat template over the *whole*
   history each turn, so the caller sends only the new user message — not the running transcript.
+  With chat mode off, the caller supplies the complete formatted transcript; the same
+  prefix comparison reuses its KV without rendering a second chat template.
 
 **KV prefix reuse.** Re-rendering the full history would re-tokenize the entire conversation, but
 most of it is already decoded into the KV. Each turn the engine diffs the freshly rendered tokens
@@ -71,6 +73,27 @@ size them for the longest prompt + generation the session will serve. A request 
 `n_ctx` is rejected without tearing the session down.
 
 ## CLI and app
+
+Native hosts can link `bmoe_core` against existing `llama` and `llama-common` CMake
+targets. Set `BMOE_LLAMA_SOURCE_DIR` to that checkout for optional expert-ready-hook
+detection; the nested llama.cpp dependency is not built in this mode.
+
+The optional `bmoe/llama_session.h` adapter exposes a borrowed context for an
+embedding host's sampler and raw-prompt sequence-cache save/restore. Set
+`SessionConfig::native->backend_initialized` when the host owns backend lifetime,
+and use `configure_context` for KV types or attention options. Model loading still
+enforces CPU, mmap, and no repacking. Context/batch sizes remain in `SessionConfig`.
+
+`GenerateRequest::sample_token` replaces sampling and accepts a logits-row index;
+the host must sample and accept the returned token using the borrowed context.
+This cannot be combined with speculative decoding. `on_progress` runs after
+prefill chunks; `should_stop` can also run from the CPU abort callback and must not
+throw. These callbacks are borrowed only for the duration of `generate()`.
+`stop_generation` is checked after token delivery and ends normally without a
+cancel rollback, allowing the host to implement stop strings. Raw-prompt cache
+restore replaces the current KV, and a failed restore clears it. Token IDs/cache
+files are model and context specific. Never use the borrowed context or cache
+operations concurrently with generation.
 
 `bmoe-cli --session` exposes this over a line protocol (requests on stdin, `BMOE_*` responses on
 stdout — see [telemetry.md](telemetry.md)). The Android example runs one such process per model:

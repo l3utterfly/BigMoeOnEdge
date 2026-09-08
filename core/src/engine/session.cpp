@@ -1,4 +1,5 @@
 #include "bmoe/session.h"
+#include "bmoe/llama_session.h"
 #include "bmoe/recipe.h"
 #include "bmoe/route_trace.h"
 #include "bmoe/decode_trace.h"
@@ -330,7 +331,7 @@ struct Session::Impl {
     // greedy default, where the decode loop stays on the argmax fast path. See open()/generate().
     llama_sampler * smpl = nullptr;
 
-    // Multi-turn chat state (chat mode only). chat_history is the running conversation the
+    // Multi-turn state. chat_history is the chat-mode conversation the
     // template is re-rendered over each turn; kv_tokens mirrors the tokens currently decoded
     // into the context's KV (seq 0), in order, so the next turn can reuse the common prefix
     // and prefill only the diverging suffix instead of re-running the whole conversation.
@@ -360,6 +361,12 @@ struct Session::Impl {
     bool info_sent = false;
 
     std::atomic<bool> cancel_requested{false};
+    std::function<bool()> should_stop;
+
+    bool cancelled() {
+        if (should_stop && should_stop()) cancel_requested.store(true, std::memory_order_relaxed);
+        return cancel_requested.load(std::memory_order_relaxed);
+    }
 
     ~Impl() {
         // Deterministic teardown order: stop the I/O pool (it holds fds into the mmap and its
@@ -382,6 +389,31 @@ struct Session::Impl {
 
 Session::Session() : impl_(std::make_unique<Impl>()) {}
 Session::~Session() = default;
+
+llama_context * LlamaSessionAccess::context(Session &session) { return session.impl_->ctx.get(); }
+
+bool LlamaSessionAccess::save_cache(Session &session, const std::string &path) {
+    auto & im = *session.impl_;
+    if (im.chat_on || im.cfg.spec.enabled() || im.kv_tokens.empty()) return false;
+    return llama_state_seq_save_file(im.ctx.get(), path.c_str(), 0,
+                                    im.kv_tokens.data(), im.kv_tokens.size()) > 0;
+}
+
+bool LlamaSessionAccess::restore_cache(Session &session, const std::string &path) {
+    auto & im = *session.impl_;
+    if (im.chat_on || im.cfg.spec.enabled()) return false;
+    std::vector<llama_token> tokens(llama_n_ctx(im.ctx.get()));
+    size_t count = 0;
+    llama_memory_clear(llama_get_memory(im.ctx.get()), true);
+    im.kv_tokens.clear();
+    if (!llama_state_seq_load_file(im.ctx.get(), path.c_str(), 0, tokens.data(), tokens.size(), &count)) {
+        llama_memory_clear(llama_get_memory(im.ctx.get()), true);
+        return false;
+    }
+    tokens.resize(count);
+    im.kv_tokens = std::move(tokens);
+    return true;
+}
 
 double Session::load_seconds() const {
     return impl_->load_seconds;
@@ -587,9 +619,11 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     Impl & im = *self->impl_;
     im.cfg = cfg;
 
-    // llama_backend_init/free is process-global and reference counted; init here, free in ~Impl.
-    llama_backend_init();
-    im.backend_inited = true;
+    // Embedded hosts can own the process-global backend for several concurrent sessions.
+    if (!cfg.native || !cfg.native->backend_initialized) {
+        llama_backend_init();
+        im.backend_inited = true;
+    }
 
     const auto t_load0 = clock_t_::now();
 
@@ -704,6 +738,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     im.hook->set_route_ahead(cfg.moe.route_ahead);
 
     llama_context_params cparams = llama_context_default_params();
+    if (cfg.native && cfg.native->configure_context) cfg.native->configure_context(cparams);
     cparams.n_ctx = cfg.n_ctx;
     cparams.n_batch = cfg.n_batch;
     // The graph is reserved for the widest ubatch, so this is what sets the resident compute
@@ -772,7 +807,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         ctx,
         [](void * ud) -> bool {
             auto * p = static_cast<Impl *>(ud);
-            return p->cancel_requested.load(std::memory_order_relaxed) || p->source.fatal();
+            return p->cancelled() || p->source.fatal();
         },
         &im);
 
@@ -1176,13 +1211,29 @@ RunResult Session::generate(const GenerateRequest & req,
     // Fresh cancel latch for this generation; a stale request from a prior aborted call must
     // not carry over. (cancel() sets it; the abort callback reads it.)
     im.cancel_requested.store(false, std::memory_order_relaxed);
+    im.should_stop = req.should_stop;
+    struct ClearStopHook {
+        Impl & im;
+        ~ClearStopHook() { im.should_stop = nullptr; }
+    } clear_stop_hook{im};
 
     RunResult res;
     auto fail = [&](std::string msg) {
+        // A failed decode may have partially changed memory. Never reuse an uncertain prefix.
+        llama_memory_clear(llama_get_memory(ctx), true);
+        im.kv_tokens.clear();
         res.ok = false;
         res.error = std::move(msg);
         return res;
     };
+
+    if (req.sample_token && im.cfg.spec.enabled())
+        return fail("custom sampling cannot be combined with speculative decoding");
+    if (im.cancelled()) {
+        res.ok = true;
+        res.cancelled = true;
+        return res;
+    }
 
     // clear_kv = "new chat": drop the KV and the engine-held conversation. Otherwise this turn
     // continues the conversation, reusing the KV prefix already decoded from earlier turns.
@@ -1290,13 +1341,13 @@ RunResult Session::generate(const GenerateRequest & req,
         }
     };
 
-    // Reuse the KV prefix already decoded from earlier turns (chat mode only): find how many
+    // Reuse the KV prefix already decoded from earlier turns, including raw transcripts: find how many
     // leading tokens still match the cache, drop the divergent tail, and prefill only the suffix.
     // Keeping at least one token to decode means a turn is never a no-op. clear_kv leaves
     // kv_tokens empty, so n_common = 0 and this reduces to a full prefill — the one-shot path the
     // byte-identity gates exercise stays unchanged.
     size_t n_common = 0;
-    if (chat_on && !im.kv_tokens.empty()) {
+    if (!im.kv_tokens.empty()) {
         const size_t max_common = tokens.size() > 0 ? tokens.size() - 1 : 0;
         while (n_common < im.kv_tokens.size() && n_common < max_common && im.kv_tokens[n_common] == tokens[n_common])
             ++n_common;
@@ -1331,6 +1382,7 @@ RunResult Session::generate(const GenerateRequest & req,
             }
         } else {
             llama_memory_clear(llama_get_memory(ctx), true);
+            im.kv_tokens.clear();
         }
         // Whatever the target rolled back to, the draft context follows: a cancelled turn that left
         // the two at different positions would fail the NEXT turn, not this one.
@@ -1402,6 +1454,12 @@ RunResult Session::generate(const GenerateRequest & req,
     const bool spec_on = im.cfg.spec.enabled();
     const bool mtp_on = im.mtp != nullptr;
     for (int i = (int) n_common; i < n_prompt; i += im.cfg.n_batch) {
+        if (im.cancelled()) {
+            rollback_turn();
+            res.ok = true;
+            res.cancelled = true;
+            return res;
+        }
         const int chunk = std::min(im.cfg.n_batch, n_prompt - i);
         llama_batch pf;
         if (mtp_on) {
@@ -1414,7 +1472,7 @@ RunResult Session::generate(const GenerateRequest & req,
         }
         trace_begin(i, chunk, /*phase*/ 0);
         if (llama_decode(ctx, pf) != 0) {
-            if (im.cancel_requested.load(std::memory_order_relaxed)) {
+            if (im.cancelled()) {
                 rollback_turn();
                 res.ok = true;
                 res.cancelled = true;
@@ -1424,15 +1482,15 @@ RunResult Session::generate(const GenerateRequest & req,
             return fail("prefill decode failed");
         }
         trace_flush();
+        if (req.on_progress) req.on_progress(float(i + chunk) / float(n_prompt));
         // The draft context has to walk the prompt too: its KV must reach the last prompt position
         // or the first draft is made from a hidden state that never saw the prompt.
         if (mtp_on && !common_speculative_process(im.mtp.get(), pf))
             return fail("MTP draft context failed to process the prefill batch");
     }
     // The suffix is now in the KV; record it so the next turn can diff against it.
-    if (chat_on)
-        for (int i = (int) n_common; i < n_prompt; ++i)
-            im.kv_tokens.push_back(tokens[i]);
+    for (int i = (int) n_common; i < n_prompt; ++i)
+        im.kv_tokens.push_back(tokens[i]);
     // Announced only once the prompt is in both contexts: begin() checks how far the draft context
     // has actually got, so calling it before prefill would warn about a gap that is about to close.
     if (mtp_on) common_speculative_begin(im.mtp.get(), /*seq_id*/ 0, tokens);
@@ -1511,9 +1569,13 @@ RunResult Session::generate(const GenerateRequest & req,
     // to the resident reference the gates check); with a sampling chain, draw from the context's
     // last-position logits, which llama_sampler_sample reads at index -1 — the same logits argmax
     // would have read.
-    llama_token tok = im.smpl ? llama_sampler_sample(im.smpl, ctx, -1) : argmax(logits, im.n_vocab);
+    llama_token tok = LLAMA_TOKEN_NULL;
+    if (req.n_predict > 0 && !im.cancelled())
+        tok = req.sample_token ? req.sample_token(-1) :
+            (im.smpl ? llama_sampler_sample(im.smpl, ctx, -1) : argmax(logits, im.n_vocab));
 
     while (n_gen < req.n_predict) {
+        if (im.cancelled()) { res.cancelled = true; break; }
         if (llama_vocab_is_eog(im.vocab, tok)) break;
 
         // ── draft ──
@@ -1598,7 +1660,7 @@ RunResult Session::generate(const GenerateRequest & req,
         const uint64_t f1 = pio::major_faults();
         const double c1 = pio::process_cpu_seconds();
         if (dec != 0) {
-            if (im.cancel_requested.load(std::memory_order_relaxed)) {
+            if (im.cancelled()) {
                 res.cancelled = true;
                 break;
             }
@@ -1693,9 +1755,17 @@ RunResult Session::generate(const GenerateRequest & req,
             const llama_token out = confirmed[e];
             char piece[256];
             int np = llama_token_to_piece(im.vocab, out, piece, sizeof(piece), 0, true);
-            std::string delta = np > 0 ? std::string(piece, np) : std::string();
+            std::string delta;
+            if (np < 0) {
+                delta.resize(-np);
+                np = llama_token_to_piece(im.vocab, out, delta.data(), (int) delta.size(), 0, true);
+                if (np < 0) return fail("token detokenization failed");
+                delta.resize(np);
+            } else if (np > 0) {
+                delta.assign(piece, np);
+            }
             gen += delta;
-            if (chat_on) im.kv_tokens.push_back(out); // this token is now in the KV
+            im.kv_tokens.push_back(out); // this token is now in the KV
             if (spec_on) mtp_ctx.push_back(out);
             ++n_gen;
 
@@ -1723,6 +1793,7 @@ RunResult Session::generate(const GenerateRequest & req,
                 tally.record(m, 0.0, 0, 0.0, im.turn, moe.enabled ? &st : nullptr);
             if (on_token) on_token(m);
             if (sink) sink->on_token(m);
+            if (req.stop_generation && req.stop_generation()) { eog_hit = true; break; }
         }
 
         if (eog_hit) break;
@@ -1732,7 +1803,9 @@ RunResult Session::generate(const GenerateRequest & req,
         n_past += 1 + n_acc;
         const int32_t row = wide ? n_acc : -1;
         logits = llama_get_logits_ith(ctx, row);
-        tok = im.smpl ? llama_sampler_sample(im.smpl, ctx, row) : argmax(logits, im.n_vocab);
+        if (n_gen < req.n_predict && !im.cancelled())
+            tok = req.sample_token ? req.sample_token(row) :
+                (im.smpl ? llama_sampler_sample(im.smpl, ctx, row) : argmax(logits, im.n_vocab));
     }
 
     // Speculation can leave the KV ahead of what the caller received: an accepted end-of-generation

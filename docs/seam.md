@@ -4,6 +4,12 @@ Everything that connects BigMoeOnEdge to llama.cpp goes through two public mecha
 This file documents the exact contract so it can be re-verified when the submodule is
 updated.
 
+Native embedding additionally uses the public context, tokenizer, sampler, and
+sequence-state APIs through `bmoe/llama_session.h`. It does not expose model
+internals or change the streaming callback. The policy header `session.h` remains
+independent of llama.cpp headers; see [session.md](session.md) for host ownership
+and per-generation callback lifetimes.
+
 ## 1. The eval-callback
 
 `llama_context_params.cb_eval` / `cb_eval_user_data` (public) install a function called by

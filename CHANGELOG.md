@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## Native embedding integration - 2026-09-08
+
+### Added
+- Reuse an embedding application's existing llama/llama-common CMake targets and
+  backend lifetime, with an optional public llama.cpp context adapter.
+- Per-request custom sampling, cancellation, prefill progress, and normal stop
+  hooks; raw-prompt KV prefix reuse and sequence-cache persistence for native hosts.
+
+### Fixed
+- Preserve token pieces larger than the generation loop's stack buffer.
+- Clear uncertain KV state after generation failures before another request can reuse it.
+
 ## [0.24.0] - 2026-09-07
 
 ### Added
