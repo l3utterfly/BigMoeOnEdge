@@ -1591,12 +1591,14 @@ RunResult Session::generate(const GenerateRequest & req,
             im.draft_buf.clear();
             if (mtp_on) {
                 common_speculative_draft_params & dp = common_speculative_get_draft_params(im.mtp.get(), /*seq*/ 0);
-                dp.drafting = true;
-                dp.n_max = std::min(im.cfg.spec.draft_max, room);
-                dp.n_past = n_past;
-                dp.id_last = tok;
-                dp.prompt = &mtp_ctx;
-                dp.result = &im.draft_buf;
+                // Upstream renamed the position field from n_past to pos0; its type and
+                // aggregate order are unchanged, including in our standalone llama.cpp pin.
+                dp = {/* drafting */ true,
+                      /* n_max */ std::min(im.cfg.spec.draft_max, room),
+                      /* absolute position */ n_past,
+                      /* id_last */ tok,
+                      /* prompt */ &mtp_ctx,
+                      /* result */ &im.draft_buf};
                 common_speculative_draft(im.mtp.get());
                 if ((int) im.draft_buf.size() > room) im.draft_buf.resize((size_t) room);
                 n_draft = (int) im.draft_buf.size();

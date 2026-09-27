@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## Native embedding compatibility - 2026-09-27
+
+### Fixed
+- Initialize speculative draft parameters with the absolute next-token position across
+  llama.cpp's `n_past` to `pos0` field rename, retaining compatibility with the standalone pin.
+
 ## Native embedding integration - 2026-09-08
 
 ### Added

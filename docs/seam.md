@@ -152,6 +152,11 @@ block's expert layer if the draft context carries the same `cb_eval`, and `init_
 its context parameters from a full `common_params` with no way to inject one. See
 [mtp.md](mtp.md).
 
+The draft parameters are aggregate-initialized in the upstream field order. This supports
+both the standalone pin's `n_past` field and the embedding host's renamed `pos0` field;
+both receive the absolute next-token position maintained by the decode loop, not a
+separately derived token count. Recheck the aggregate layout when upgrading `common`.
+
 Unlike the public-C-API streaming seam, `common` is **not a stable API** — it can change
 between upstream versions. So a submodule bump may require updating this chat glue in
 `session.cpp` / `chat_parse.cpp` / `thinking_control.cpp`; the build and gates catch a break at
