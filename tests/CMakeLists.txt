@@ -1,10 +1,16 @@
 # Byte-identity gates. The tiny synthetic models are generated at test time by
 # scripts/make-tiny-moe.py (requires python3 with the gguf package); if it is
 # unavailable the tests are skipped rather than failing the build. One model per expert
-# layout the streamer supports: qwen3moe (split gate/up/down) and gemma4 (fused gate_up).
+# layout the streamer supports: qwen3moe (split gate/up/down), gemma4 (fused gate_up) and
+# nemotron_h_moe (gate-less up/down).
 
 add_executable(bmoe_moe_gates moe_gates.cpp)
 target_link_libraries(bmoe_moe_gates PRIVATE bmoe_core)
+# G16 probes the loopback rpc-server port before registering it.
+if(WIN32)
+    target_link_libraries(bmoe_moe_gates PRIVATE ws2_32)
+endif()
+target_include_directories(bmoe_moe_gates PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
 
 # Reasoning-parser wiring regression (issue #49). Needs no model — it drives the extracted
 # bmoe::detail::build_parse_params directly — so it runs unconditionally, unlike the gates below.
@@ -14,6 +20,15 @@ target_include_directories(bmoe_chat_parse_test PRIVATE ${CMAKE_SOURCE_DIR}/core
 target_compile_definitions(bmoe_chat_parse_test PRIVATE
     BMOE_QWEN3_TEMPLATE_PATH="${CMAKE_SOURCE_DIR}/third_party/llama.cpp/models/templates/Qwen3.5-4B.jinja")
 add_test(NAME chat_parse COMMAND bmoe_chat_parse_test)
+
+# Tool calls through the engine's chat types (bmoe/chat.h): tools into a real vendored template, a
+# call parsed back out, and the next prompt extending the previous one. Needs no model.
+add_executable(bmoe_chat_messages_test chat_messages_test.cpp)
+target_link_libraries(bmoe_chat_messages_test PRIVATE bmoe_core)
+target_include_directories(bmoe_chat_messages_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/engine)
+target_compile_definitions(bmoe_chat_messages_test PRIVATE
+    BMOE_QWEN3_TEMPLATE_PATH="${CMAKE_SOURCE_DIR}/third_party/llama.cpp/models/templates/Qwen3.5-4B.jinja")
+add_test(NAME chat_messages COMMAND bmoe_chat_messages_test)
 
 # Thinking-control tests (issue #82). Drives bmoe::detail::probe_think_control and the prefill
 # against real vendored templates, so it needs no model and runs unconditionally.
@@ -36,6 +51,29 @@ add_executable(bmoe_config_test config_test.cpp)
 target_link_libraries(bmoe_config_test PRIVATE bmoe_core)
 add_test(NAME config_validate COMMAND bmoe_config_test)
 
+# The parameter table (bmoe/params.h): every flag the CLI used to parse by hand must set the same
+# field to the same value, and to_args() must read back into the config it came from. Pure policy.
+add_executable(bmoe_params_test params_test.cpp)
+target_link_libraries(bmoe_params_test PRIVATE bmoe_core)
+add_test(NAME params_table COMMAND bmoe_params_test)
+
+# bmoe-server's policy: the chat protocol, the turn queue, the settings layers and the JSON edges.
+# No HTTP, no session, no model.
+if(TARGET bmoe_server_core)
+    add_executable(bmoe_server_test server_test.cpp)
+    target_link_libraries(bmoe_server_test PRIVATE bmoe_server_core)
+    add_test(NAME server_logic COMMAND bmoe_server_test)
+endif()
+
+# bmoe-server's engine host: loads, turns, cancel and unload across threads, and which failures
+# close the session, over a scripted session behind the host's seam (server/hosted_session.h).
+# No model.
+if(TARGET bmoe_server)
+    add_executable(bmoe_engine_host_test engine_host_test.cpp)
+    target_link_libraries(bmoe_engine_host_test PRIVATE bmoe_server)
+    add_test(NAME engine_host COMMAND bmoe_engine_host_test)
+endif()
+
 # release_file_mappings: on Windows it must find and drop this process's own view + section of a
 # file and leave the placeholders in place; on POSIX it must report unsupported and touch nothing.
 add_executable(bmoe_mapping_release_test mapping_release_test.cpp)
@@ -56,6 +94,13 @@ target_link_libraries(bmoe_stall_union_test PRIVATE bmoe_core)
 target_include_directories(bmoe_stall_union_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
 add_test(NAME stall_union COMMAND bmoe_stall_union_test)
 
+# How llama.cpp's tensor and graph-node names are read, and the fitter's expert-override patterns.
+# Pure string rules over the conventions every reader shares, so they run without a model.
+add_executable(bmoe_tensor_names_test tensor_names_test.cpp)
+target_link_libraries(bmoe_tensor_names_test PRIVATE bmoe_core)
+target_include_directories(bmoe_tensor_names_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
+add_test(NAME tensor_names COMMAND bmoe_tensor_names_test)
+
 # The CSV `# summary` trailer serialization. Drives the sink directly with a filled RunSummary —
 # no model, no llama.cpp — so the emitted key names and units are pinned by a test rather than by
 # whatever script last read them. The prefill keys must match BMOE_DONE's, token for token.
@@ -63,11 +108,19 @@ add_executable(bmoe_csv_summary_test csv_summary_test.cpp)
 target_link_libraries(bmoe_csv_summary_test PRIVATE bmoe_core)
 add_test(NAME csv_summary COMMAND bmoe_csv_summary_test)
 
+# decide()'s policy (the prompt split, choice checks and scoring, when the prefix state is
+# restored, stored or left alone) over a scripted fake backend. No model, no llama.cpp, so it runs
+# unconditionally; the same path on a real model is gate G18.
+add_executable(bmoe_decide_test decide_test.cpp)
+target_link_libraries(bmoe_decide_test PRIVATE bmoe_core)
+target_include_directories(bmoe_decide_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/engine/decide)
+add_test(NAME decide_policy COMMAND bmoe_decide_test)
+
 find_program(PYTHON3 NAMES python3 python)
 
 if(PYTHON3)
     # arch → (fixture id, gguf filename). Each gets a generate fixture + a gate run.
-    foreach(spec "qwen3moe" "gemma4")
+    foreach(spec "qwen3moe" "gemma4" "nemotron_h_moe")
         set(_model "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-${spec}.gguf")
         set(_fixture "TINY_MOE_MODEL_${spec}")
 
@@ -99,3 +152,9 @@ if(PYTHON3)
 else()
     message(WARNING "python3 not found: MoE gates will not run (models cannot be generated)")
 endif()
+
+# The hardware planner. Pure policy over synthetic machine profiles — no model, no llama.cpp, no
+# device — which is the point: rules meant to hold on hardware we do not own are checked here.
+add_executable(bmoe_planner_test planner_test.cpp)
+target_link_libraries(bmoe_planner_test PRIVATE bmoe_core)
+add_test(NAME planner COMMAND bmoe_planner_test)

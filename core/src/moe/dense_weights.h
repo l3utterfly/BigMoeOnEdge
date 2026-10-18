@@ -67,12 +67,12 @@ public:
 
     // Apply `mode` for the model files `paths` (per-shard dense `ranges` precomputed via byte_ranges;
     // `tensors` is what Anonymous/Pinned read, and what every mode checks for a tensor too large to
-    // be resident — see hold_back_oversized). `align` is the O_DIRECT block size. Runs once at load,
-    // before the streamer's workers start (Anonymous rebinds tensor->data on the caller's thread).
+    // be resident — see hold_back_oversized). The readers it opens ask each file for its own read
+    // alignment. Runs once at load, before the streamer's workers start (Anonymous rebinds
+    // tensor->data on the caller's thread).
     // Returns false only on a hard Anonymous failure (alloc/read); Mmap and Warmed cannot fail.
     bool init(DenseWeightsMode mode,
               const std::vector<std::string> & paths,
-              size_t align,
               std::vector<std::vector<std::pair<uint64_t, uint64_t>>> ranges,
               std::vector<DenseTensorRef> tensors);
 
@@ -105,6 +105,10 @@ public:
     void sample_residency(size_t page);
     double resident_frac() const { return resident_frac_; }
 
+    // Bytes of the dense set that asked for the reclaim-exempt store and were refused it, and so
+    // are held as ordinary memory. 0 when the store granted everything, or was never asked.
+    uint64_t pin_refused_bytes() const { return pin_refused_bytes_; }
+
     void shutdown();
 
     static constexpr int sample_pages = 256; // stratified probe points across the dense bytes
@@ -119,7 +123,7 @@ private:
     // Random-access advice on the mmap of every held-back tensor: a fault brings in one page, not a
     // readahead window the gather will never touch.
     void advise_random_mapped();
-    bool read_anonymous(size_t align);
+    bool read_anonymous();
     void warm();
     void drop_mmap_copies(size_t page);
     void sample_anon(size_t page);
@@ -130,12 +134,11 @@ private:
     DenseWeightsMode mode_ = DenseWeightsMode::Warmed;
     std::vector<std::string> paths_;     // one per shard, in shard order
     std::vector<std::string> basenames_; // what /proc/self/maps entries are matched against
-    size_t align_ = 4096;
 
     // Anonymous/Pinned: our own readers (one per shard; FileReader is not movable, hence the
     // unique_ptr), the tensors we read, and the buffers backing them. `bases_` is what the sensor
-    // probes and is filled by both modes; `bufs_` and `pinned_` are the two release lists, exactly
-    // one of which is populated for a given run.
+    // probes and is filled by both modes; `bufs_` and `pinned_` are the two release lists. Both
+    // are populated only on a run whose pinned store ran out part way.
     std::vector<std::unique_ptr<FileReader>> readers_;
     std::vector<DenseTensorRef> tensors_;
     std::vector<DenseTensorRef> mapped_; // held back by hold_back_oversized: mmap'd under every mode
@@ -155,6 +158,7 @@ private:
     bool vmas_tried_ = false;
 
     double resident_frac_ = -1.0; // last sampled dense residency; -1 = never/unmeasured
+    uint64_t pin_refused_bytes_ = 0;
 };
 
 } // namespace bmoe

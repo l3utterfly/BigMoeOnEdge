@@ -32,12 +32,19 @@ serial path, and only a single ~25-line hook (with an explicit sunset) for the o
   GPU offload of the streamed experts is not supported (the dense parts can still use the
   GPU). Decode is flash-I/O-bound anyway, so this is rarely the bottleneck.
 - **Shared experts stay resident.** Architectures with an always-on shared expert (e.g.
-  `gemma4`, `deepseek4`) stream the routed experts but keep the shared expert — and any dense layers —
+  `gemma4`, `deepseek4`, `nemotron_h_moe`) stream the routed experts but keep the shared expert — and any dense layers —
   resident (in the page cache, or in the engine's own buffers under `--dense-weights anon`),
   so the streamed fraction (and the memory saving) is smaller than for a purely routed model
   like `qwen3moe`. The same applies to architectures whose first blocks are dense by design
   (`lfm2moe` has a `leading_dense_block_count`): those blocks name no expert tensors, so they
   are never streamed.
+- **The forward expert predictors assume adjacent MoE blocks.** `--predict-log`'s stale predictor,
+  `--predict-prefetch` and `--route-ahead` predict layer `il+1` from layer `il`. `nemotron_h_moe`
+  never puts two MoE blocks next to each other (every one sits between Mamba2 or attention
+  blocks), so on it they have nothing to target: they stay byte-identical and harmless, and do
+  nothing. The probe also ranks the router's raw logits, so on architectures that add a
+  per-expert selection bias before the top-k (`lfm2moe`, `deepseek4`, `bailingmoe3`,
+  `nemotron_h_moe`) its numbers approximate the routing rather than reproduce it.
 - **A resident tensor can be larger than RAM, and then it is only ever mmap'd.** `qwen4exp`
   (Qwen3.8-Flash-Next) carries a 51B n-gram embedding table (`per_layer_token_embd`, ~28.8 GB at
   IQ4_NL) that the graph reads sixteen rows at a time through `get_rows`. It is not indexed by
@@ -63,9 +70,15 @@ serial path, and only a single ~25-line hook (with an explicit sunset) for the o
   fewer reads but the buffered arm's page-cache pollution doubling the compute residual
   (1.22 → 0.60 s/tok) while stall stays flat (0.43 → 0.46 s/tok). The `o_direct` field records
   the open's real outcome on every platform, so a refused or downgraded run reports `0`.
-- **No iOS target.** The core is portable C++ and the streaming path has no Android dependency, but
-  there is no Xcode project here and iOS does not run command-line binaries, so there is no
-  supported way to run or benchmark the engine on an iPhone or iPad.
+  On an internal SSD the gap is small: a 16 GB Apple-silicon laptop, Qwen3.6-35B-A3B Q4_K_M
+  (20.7 GiB), a 4691 MiB cache and 8 threads, same protocol, arms A B B A: 6.66 and 6.97 tok/s
+  against 6.54 and 6.46 buffered, with 23 077 MiB read and an 81.4 % cache hit in all four and
+  the same generated text. Two runs an arm is a direction, not a figure.
+- **iOS is a harness, unvalidated.** `examples/ios` builds `bmoe-cli` into an app, since iOS does
+  not run command-line binaries, and CI compiles it for the simulator. It has not run on an iPhone
+  or iPad: the process's memory share, whether memory can be locked there, and whether a model
+  larger than memory can be mapped are unmeasured, so there is no supported configuration and no
+  benchmark. Devices are probed in-process there, with no second process to isolate a driver in.
 - **Windows throughput.** The cache's reserve-then-commit-per-slice path is heavier on
   Windows than the POSIX lazy-commit path. The gates run on Windows; the throughput
   targets are stated for Android/Linux.

@@ -117,6 +117,7 @@ public:
     // load_layer/generate. Intended for an app's memory-pressure callback (Android onTrimMemory)
     // and exercised by the shrink gate. This is the only thing that moves the budget after init.
     void set_cache_budget(size_t bytes);
+    size_t cache_budget() const { return cache_max_; }
 
     // The cliff from cache-sizing.md, computed at init from model shape alone: the bytes one
     // token's pass over the layer stack demands in the worst case, i.e. every bound layer's top_k
@@ -125,6 +126,11 @@ public:
     // when it sees one. Worst case, not the measured demand: the router picks at runtime, and
     // the measured token_demand_ needs a decode before it exists.
     size_t worst_cycle_bytes(int top_k) const;
+
+    // The floor a pin refusal may not shrink the cache under: one token's worst-case cycle, which
+    // only the caller knows because the routing width is its to resolve. Unset, a part-way refusal
+    // ends pinning and leaves the budget alone.
+    void set_pin_floor(size_t bytes) { pin_floor_ = bytes; }
 
     // ── I/O trace (diagnostics; see bmoe/decode_trace.h) ────────────────────────────
     // When on, every read_slice records one row. Rows are appended under a dedicated leaf mutex
@@ -157,7 +163,7 @@ private:
     // One readiness cell per (projection, expert). A cell is "ready for the layer in flight"
     // exactly when gen == async_gen_; padded to a cache line so the compute threads polling it
     // do not false-share the LRU/job bookkeeping the load thread mutates alongside.
-    struct alignas(64) ReadyFlag {
+    struct alignas(pio::false_sharing_span) ReadyFlag {
         std::atomic<uint32_t> gen{0};
     };
 
@@ -205,6 +211,7 @@ private:
 
     // Commit the pages of one (layer, expert, projection) cache slice so a read can land in it.
     bool commit_proj_pages(int il, int e, int p);
+    void pin_pages(void * p, size_t sz);
 
     // LRU helpers (active only when cache_max_ > 0)
     void lru_unlink(int32_t id);
@@ -221,6 +228,12 @@ private:
 
     bool active_ = false;
     bool load_all_ = false;
+    bool pin_ = false; // pin committed cache pages (MoeStreamConfig::cache_pin); cleared on refusal
+    bool pin_said_ = false;
+    bool pin_fit_ = false;        // step the budget down on a part-way refusal (MoeStreamConfig::cache_pin_fit)
+    size_t pin_floor_ = 0;        // see set_pin_floor
+    size_t pin_refused_at_ = 0;   // cache bytes resident when the platform first refused a pin; 0 = never
+    uint64_t pin_shrunk_gen_ = 0; // the load generation the budget last stepped down in
     bool overlap_ = false;
     bool two_wave_ = false;                  // publish the first projection's jobs before committing the rest (#118)
     bool prefetch_sync_ = false;             // test only: drain prefetch reads synchronously (serial mode)
@@ -245,7 +258,9 @@ private:
     long long drain_wait_ns_ = 0, adopt_wait_ns_ = 0;
     int n_layer_ = 0;
     int n_expert_ = 0;
-    size_t align_ = 4096;
+    // What shared slots are aligned to: the coarsest read granule over the shards' readers, never
+    // less than a page. Settled at init, once the readers have asked the files.
+    size_t buf_align_ = 0;
 
     // The positioned readers that own the fd pools, bounces and O_DIRECT decision — one per shard
     // file, in shard order (a single-file model has exactly one). Expert slices are read through
@@ -264,7 +279,7 @@ private:
 
     // LRU mode (cache on): per-(layer, projection) reserved buffers
     size_t cache_max_ = 0; // live budget in bytes; only an explicit set_cache_budget() moves it
-    size_t page_ = 4096;
+    size_t page_ = pio::vm_page();
 
     // Every expert of every bound layer resident: the ceiling any budget is clamped to, and (under
     // cache_auto) the cap the init-time sizing starts from. Auto sizing derives cache_max_ once at

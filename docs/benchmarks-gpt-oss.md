@@ -14,7 +14,7 @@ whole story here](#why-the-dense-policy-is-the-whole-story-here).
 
 | | |
 |---|---|
-| Device | OnePlus 15R, Android 16, 11.3 GB RAM — same as [benchmarks.md](benchmarks.md) |
+| Device | 12 GB Android phone, Android 16, 11.3 GB usable RAM — same as [benchmarks.md](benchmarks.md) |
 | Model | `gpt-oss-120b-Q4_K_M.gguf` — 58.46 GB, 36 layers, 128 experts, **top-4** default, MXFP4 expert weights |
 | Device path | `/data/local/tmp/shardllm/` — the real `/data` partition, **required** for working O_DIRECT (`/sdcard` is FUSE and silently falls back to buffered) |
 | Fraction of RAM | ≈**5.2×** (58.46 GB / 11.3 GB) — resident load is impossible, so there is no in-RAM baseline, only `mmap` page-cache thrash |
@@ -55,7 +55,7 @@ Raw CSVs, `.metrics`, generated text and the drivers: [`bench-data/2026-07-17/`]
 **In the demo app**, the headline config (cache 2000, 8 lanes, O_DIRECT for both dense and experts,
 k=2) reports **1.91 tok/s** — ~13 % below the 2.191 above. That is the expected protocol gap (short
 turns, co-resident UI, live device state), not an app defect; see the README's
-[What to expect in the app](../README.md#what-to-expect-in-the-app).
+[What to expect in the app](benchmarks.md#what-to-expect-in-the-app).
 
 ## Why the dense policy is the whole story here
 

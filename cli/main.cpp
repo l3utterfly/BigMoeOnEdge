@@ -8,6 +8,8 @@
 // Environment variables are read ONLY here, as overrides for the matching flags, so the
 // engine stays env-free. The flag always wins over the env value.
 #include "bmoe/config.h"
+#include "bmoe/params.h"
+#include "bmoe/auto_plan.h"
 #include "bmoe/runtime.h"
 #include "bmoe/session.h"
 #include "bmoe/recipe.h"
@@ -17,6 +19,7 @@
 #include "bmoe/version.h"
 
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +27,7 @@
 #include <deque>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -38,11 +42,6 @@
 #endif
 
 using namespace bmoe;
-
-static int env_int(const char * k, int dflt) {
-    const char * v = std::getenv(k);
-    return (v && *v) ? std::atoi(v) : dflt;
-}
 
 static std::string json_escape(const std::string & s) {
     std::string o;
@@ -118,8 +117,9 @@ static void emit_progress_line(const TokenMetrics & m, ProgressDelta & st) {
 }
 
 // ── minimal flat-JSON reading for the --session request protocol ──
-// The session request objects are flat (string/int/bool fields only), so a tiny hand-rolled
-// extractor keeps the CLI dependency-free, mirroring the hand-written JSON it already emits.
+// The session request objects are flat (string/int/bool fields, and decide's one array of
+// strings), so a tiny hand-rolled extractor keeps the CLI dependency-free, mirroring the hand-written JSON it already
+// emits.
 
 static std::string json_unescape(const std::string & s) {
     std::string o;
@@ -176,12 +176,12 @@ static size_t json_value_pos(const std::string & line, const char * key) {
     return c + 1;
 }
 
-static bool json_get_string(const std::string & line, const char * key, std::string & out) {
-    size_t p = json_value_pos(line, key);
-    if (p == std::string::npos) return false;
+// Read the JSON string that starts at `p` (at or before its opening quote, after any blanks).
+// Returns the index just past its closing quote, or npos when there is no string there.
+static size_t json_read_string(const std::string & line, size_t p, std::string & out) {
     while (p < line.size() && (line[p] == ' ' || line[p] == '\t'))
         ++p;
-    if (p >= line.size() || line[p] != '"') return false;
+    if (p >= line.size() || line[p] != '"') return std::string::npos;
     ++p;
     std::string raw;
     for (; p < line.size(); ++p) {
@@ -196,7 +196,34 @@ static bool json_get_string(const std::string & line, const char * key, std::str
         }
     }
     out = json_unescape(raw);
-    return true;
+    return p < line.size() ? p + 1 : std::string::npos;
+}
+
+static bool json_get_string(const std::string & line, const char * key, std::string & out) {
+    size_t p = json_value_pos(line, key);
+    if (p == std::string::npos) return false;
+    return json_read_string(line, p, out) != std::string::npos;
+}
+
+// An array of strings, e.g. "choices":["A","B"]. False unless every element is a string.
+static bool json_get_string_array(const std::string & line, const char * key, std::vector<std::string> & out) {
+    size_t p = json_value_pos(line, key);
+    if (p == std::string::npos) return false;
+    while (p < line.size() && (line[p] == ' ' || line[p] == '\t'))
+        ++p;
+    if (p >= line.size() || line[p] != '[') return false;
+    ++p;
+    out.clear();
+    for (;;) {
+        while (p < line.size() && (line[p] == ' ' || line[p] == '\t' || line[p] == ','))
+            ++p;
+        if (p >= line.size()) return false;
+        if (line[p] == ']') return true;
+        std::string item;
+        p = json_read_string(line, p, item);
+        if (p == std::string::npos) return false;
+        out.push_back(std::move(item));
+    }
 }
 
 static int json_get_int(const std::string & line, const char * key, int dflt) {
@@ -214,15 +241,60 @@ static bool json_get_bool(const std::string & line, const char * key, bool dflt)
 }
 
 // A parsed stdin command. cancel is handled inline by the reader thread (it calls
-// Session::cancel directly), so only generate/close travel through the queue.
+// Session::cancel directly), so only generate/decide/close travel through the queue.
 struct SessionCmd {
-    enum Kind { kGenerate, kClose } kind;
+    enum Kind { kGenerate, kDecide, kClose } kind;
     std::string prompt;
     int id = 0;
     int n_predict = 128;
     bool think = true;
     bool clear_kv = true;
+    // decide only (bmoe/decide.h)
+    std::string prefix, suffix;
+    std::vector<std::string> choices;
+    bool reuse_prefix = true;
 };
+
+// Answer one decide request with a BMOE_DECIDE line, or a BMOE_ERROR one. Returns false when the
+// session cannot go on (DecideResult::fatal).
+static bool emit_decide(Session & session, const SessionCmd & cmd) {
+    DecideRequest req;
+    req.prefix = cmd.prefix;
+    req.suffix = cmd.suffix;
+    req.choices = cmd.choices;
+    req.reuse_prefix = cmd.reuse_prefix;
+    const DecideResult r = session.decide(req);
+    if (!r.ok && !r.cancelled) {
+        std::printf("BMOE_ERROR {\"id\":%d,\"fatal\":%s,\"code\":\"%s\",\"msg\":\"%s\"}\n", cmd.id,
+                    r.fatal ? "true" : "false", run_error_name(r.error_kind), json_escape(r.error).c_str());
+        std::fflush(stdout);
+        return !r.fatal;
+    }
+    std::string logp = "[";
+    for (size_t i = 0; i < r.choice_logp.size(); ++i) {
+        char buf[32];
+        // A choice the model gives no mass to is -inf, which JSON cannot carry: send null.
+        if (std::isfinite(r.choice_logp[i]))
+            std::snprintf(buf, sizeof buf, "%s%.6f", i ? "," : "", r.choice_logp[i]);
+        else
+            std::snprintf(buf, sizeof buf, "%snull", i ? "," : "");
+        logp += buf;
+    }
+    logp += "]";
+    const PrefillStats & p = r.prefill;
+    std::printf("BMOE_DECIDE {\"id\":%d,\"cancelled\":%s,\"best\":%d,\"choice_logp\":%s,\"n_tokens\":%d,"
+                "\"n_reused\":%d,\"n_prefilled\":%d,\"restore_s\":%.3f,\"store_s\":%.3f,\"prefill_s\":%.3f,"
+                "\"prefill_cpu_s\":%.3f,\"prefill_read_mib\":%.1f,\"prefill_io_s\":%.3f,\"prefill_stall_s\":%.3f,"
+                "\"prefill_mgmt_s\":%.3f,\"prefill_dev_tokens\":%d,\"prefill_dev_read_mib\":%.1f,"
+                "\"prefill_dev_stall_s\":%.3f,\"prefill_dev_routed\":%lld,\"prefill_dev_demand\":%lld,"
+                "\"prefix_state_mib\":%.1f}\n",
+                cmd.id, r.cancelled ? "true" : "false", r.best, logp.c_str(), r.n_tokens, r.n_reused, r.n_prefilled,
+                r.restore_seconds, r.store_seconds, p.seconds, p.cpu_seconds, p.read_mib, p.io_seconds, p.stall_seconds,
+                p.mgmt_seconds, p.device_tokens, p.device_read_mib, p.device_stall_seconds, p.device_routed,
+                p.device_demand, (double) r.prefix_state_bytes / (1024.0 * 1024.0));
+    std::fflush(stdout);
+    return true;
+}
 
 // Interactive session: keep the model loaded and the expert cache warm across prompts, reading
 // one JSON request per line from stdin and emitting the BMOE_* line protocol on stdout. See
@@ -237,7 +309,8 @@ static int run_session_loop(const RunConfig & cfg,
     std::string error;
     std::unique_ptr<Session> session = Session::open(sc, error, route_trace, compute_trace, io_trace);
     if (!session) {
-        std::printf("BMOE_ERROR {\"id\":0,\"fatal\":true,\"msg\":\"%s\"}\n", json_escape(error).c_str());
+        std::printf("BMOE_ERROR {\"id\":0,\"fatal\":true,\"code\":\"%s\",\"msg\":\"%s\"}\n",
+                    run_error_name(RunError::Failed), json_escape(error).c_str());
         std::fflush(stdout);
         return 1;
     }
@@ -279,6 +352,13 @@ static int run_session_loop(const RunConfig & cfg,
                 c.n_predict = json_get_int(line, "n_predict", cfg.n_predict);
                 c.think = json_get_bool(line, "think", cfg.think);
                 c.clear_kv = json_get_bool(line, "clear_kv", true);
+            } else if (cmd == "decide") {
+                c.kind = SessionCmd::kDecide;
+                c.id = json_get_int(line, "id", 0);
+                json_get_string(line, "prefix", c.prefix);
+                json_get_string(line, "suffix", c.suffix);
+                json_get_string_array(line, "choices", c.choices);
+                c.reuse_prefix = json_get_bool(line, "reuse_prefix", true);
             } else {
                 continue;
             }
@@ -291,7 +371,9 @@ static int run_session_loop(const RunConfig & cfg,
         {
             std::lock_guard<std::mutex> lk(mtx);
             stop.store(true);
-            queue.push_back({SessionCmd::kClose, "", 0, 0, true, true});
+            SessionCmd close;
+            close.kind = SessionCmd::kClose;
+            queue.push_back(std::move(close));
         }
         cv.notify_one();
     });
@@ -306,6 +388,16 @@ static int run_session_loop(const RunConfig & cfg,
             queue.pop_front();
         }
         if (cmd.kind == SessionCmd::kClose) break;
+        if (cmd.kind == SessionCmd::kDecide) {
+            // Framed like a generation, so a front-end's busy state and wake lock need no special case.
+            std::printf("BMOE_BEGIN {\"id\":%d}\n", cmd.id);
+            std::fflush(stdout);
+            if (!emit_decide(*session, cmd)) {
+                rc = 1;
+                break;
+            }
+            continue;
+        }
 
         std::printf("BMOE_BEGIN {\"id\":%d}\n", cmd.id);
         std::fflush(stdout);
@@ -320,12 +412,12 @@ static int run_session_loop(const RunConfig & cfg,
         ProgressDelta pd; // fresh per generation: the first line extends the empty state
         RunResult r = session->generate(req, [&](const TokenMetrics & m) { emit_progress_line(m, pd); }, sink);
         if (!r) {
-            // A bad request (empty prompt, context overflow) leaves the session usable; a decode
-            // failure means the context is compromised, so end the loop.
-            bool recoverable = r.error.find("exceeds the session n_ctx") != std::string::npos ||
-                               r.error.find("empty prompt") != std::string::npos;
-            std::printf("BMOE_ERROR {\"id\":%d,\"fatal\":%s,\"msg\":\"%s\"}\n", cmd.id, recoverable ? "false" : "true",
-                        json_escape(r.error).c_str());
+            // A bad request (empty prompt, a full context) leaves the session usable; a decode
+            // failure means the context is compromised, so end the loop. The kind decides, and it
+            // goes on the line as `code` so a client decides on it too, never on `msg`.
+            const bool recoverable = run_error_recoverable(r.error_kind);
+            std::printf("BMOE_ERROR {\"id\":%d,\"fatal\":%s,\"code\":\"%s\",\"msg\":\"%s\"}\n", cmd.id,
+                        recoverable ? "false" : "true", run_error_name(r.error_kind), json_escape(r.error).c_str());
             std::fflush(stdout);
             if (!recoverable) {
                 rc = 1;
@@ -337,21 +429,25 @@ static int run_session_loop(const RunConfig & cfg,
         std::printf("BMOE_DONE {\"id\":%d,\"cancelled\":%s,\"tokens\":%d,\"tok_s\":%.3f,\"prefill_s\":%.3f,"
                     "\"prefill_tps\":%.2f,\"load_s\":%.3f,\"cache_hit_pct\":%.1f,\"n_prompt\":%d,\"n_past\":%d,"
                     "\"compute_s_tok\":%.4f,\"io_s_tok\":%.4f,\"cache_resident_mib\":%.0f,\"cache_budget_mib\":%.0f,"
-                    "\"read_mib\":%.1f,\"stall_s_tok\":%.4f,\"mgmt_s_tok\":%.4f,\"majflt_tok\":%.2f,\"cpu_s_tok\":%.4f,"
+                    "\"read_mib\":%.1f,\"stall_s_tok\":%.4f,\"flash_wait_s_tok\":%.4f,\"mgmt_s_tok\":%.4f,"
+                    "\"majflt_tok\":%.2f,\"cpu_s_tok\":%.4f,"
                     "\"prefill_cpu_s\":%.3f,\"prefill_read_mib\":%.1f,\"prefill_io_s\":%.3f,"
                     "\"prefill_stall_s\":%.3f,\"prefill_mgmt_s\":%.3f,"
+                    "\"prefill_dev_tokens\":%d,\"prefill_dev_nodes\":%lld,\"prefill_dev_read_mib\":%.1f,"
+                    "\"prefill_dev_stall_s\":%.3f,"
                     "\"token_demand_mib\":%.1f,\"mtp_drafted\":%lld,\"mtp_accepted\":%lld,\"mtp_decodes\":%lld,"
                     "\"mtp_draft_s_tok\":%.4f,\"drafted_steps\":%lld,\"loop_overhead_s_tok\":%.4f,"
                     "\"reasoning\":\"%s\",\"text\":\"%s\"}\n",
                     cmd.id, r.cancelled ? "true" : "false", s.n_generated, s.tokens_per_second, s.prefill_seconds,
                     (s.prefill_seconds > 0 ? s.n_prompt / s.prefill_seconds : 0.0), s.load_seconds, s.cache_hit_pct,
                     s.n_prompt, s.n_past, s.moe_compute_s_per_token, s.moe_io_s_per_token, s.cache_resident_mib,
-                    s.cache_budget_mib, s.moe_read_mib, s.moe_stall_s_per_token, s.moe_mgmt_s_per_token,
-                    s.majflt_per_token, s.cpu_s_per_token, s.prefill_cpu_seconds, s.prefill_read_mib,
-                    s.prefill_io_seconds, s.prefill_stall_seconds, s.prefill_mgmt_seconds, s.token_demand_mib,
-                    s.mtp_drafted, s.mtp_accepted, s.mtp_decodes, s.mtp_draft_s_per_token, s.drafted_steps,
-                    s.loop_overhead_s_per_token, json_escape(r.reasoning_text).c_str(),
-                    json_escape(r.generated_text).c_str());
+                    s.cache_budget_mib, s.moe_read_mib, s.moe_stall_s_per_token, s.moe_flash_wait_s_per_token,
+                    s.moe_mgmt_s_per_token, s.majflt_per_token, s.cpu_s_per_token, s.prefill_cpu_seconds,
+                    s.prefill_read_mib, s.prefill_io_seconds, s.prefill_stall_seconds, s.prefill_mgmt_seconds,
+                    s.prefill_device_tokens, s.prefill_device_nodes, s.prefill_device_read_mib,
+                    s.prefill_device_stall_seconds, s.token_demand_mib, s.mtp_drafted, s.mtp_accepted, s.mtp_decodes,
+                    s.mtp_draft_s_per_token, s.drafted_steps, s.loop_overhead_s_per_token,
+                    json_escape(r.reasoning_text).c_str(), json_escape(r.generated_text).c_str());
         std::fflush(stdout);
     }
 
@@ -373,157 +469,149 @@ static bool console_is_ours_alone() {
 #endif
 }
 
+// Print `text` word-wrapped to `width` columns, every line starting at column `indent`. The first
+// line continues whatever the caller already printed on it, which is `first_col` columns wide.
+static void print_wrapped(const std::string & text, size_t first_col, size_t indent, size_t width) {
+    size_t col = first_col;
+    if (col < indent) {
+        std::printf("%*s", (int) (indent - col), "");
+        col = indent;
+    }
+    bool line_empty = true;
+    size_t i = 0;
+    while (i < text.size()) {
+        while (i < text.size() && text[i] == ' ')
+            ++i;
+        size_t j = text.find(' ', i);
+        if (j == std::string::npos) j = text.size();
+        if (j == i) break;
+        const size_t len = j - i;
+        if (!line_empty && col + 1 + len > width) {
+            std::printf("\n%*s", (int) indent, "");
+            col = indent;
+            line_empty = true;
+        }
+        if (!line_empty) {
+            std::printf(" ");
+            ++col;
+        }
+        std::printf("%.*s", (int) len, text.c_str() + i);
+        col += len;
+        line_empty = false;
+        i = j;
+    }
+    std::printf("\n");
+}
+
+// The engine parameters' part of the usage text, generated from the parameter table so a knob added
+// there is documented here without anyone remembering to.
+static void print_param_usage() {
+    const RunConfig defaults;
+    const size_t indent = 26, width = 100;
+    for (int g = 0; g <= (int) ParamGroup::Diagnostics; ++g) {
+        bool header = false;
+        for (const ParamDesc & d : params()) {
+            if ((int) d.group != g) continue;
+            if (!header) {
+                std::printf("\n  %s:\n", param_group_label((ParamGroup) g));
+                header = true;
+            }
+            std::string spell;
+            if (!d.flag.empty()) {
+                spell = d.short_flag.empty() ? "    " : d.short_flag + ", ";
+                spell += d.flag + (d.value_hint.empty() ? "" : " " + d.value_hint);
+            }
+            for (const ParamSwitch & s : d.switches) {
+                if (s.deprecated) continue;
+                spell += (spell.empty() ? "    " : " | ") + s.flag;
+            }
+            std::string help = d.help;
+            // The help describes the parameter, which for --no-odirect is the thing the flag turns
+            // off; say so rather than print "Bypass the page cache" next to the flag that stops it.
+            if (d.flag.empty() && d.type == ParamType::Bool && !d.switches.empty() && d.switches[0].value == "false")
+                help = "Turns off (on by default): " + help;
+            if (d.lossy) help = "LOSSY: " + help;
+            if (d.level == ParamLevel::Experimental) help = "EXPERIMENTAL: " + help;
+            if (d.level == ParamLevel::Debug) help = "debug: " + help;
+            if (!d.flag.empty() && d.type != ParamType::Path) help += " (default " + d.get(defaults) + ")";
+            for (const ParamSwitch & s : d.switches)
+                if (s.deprecated) help += " Deprecated alias: " + s.flag + " = " + s.value + ".";
+
+            std::printf("  %s", spell.c_str());
+            const size_t col = 2 + spell.size();
+            if (col + 2 > indent) {
+                std::printf("\n");
+                print_wrapped(help, 0, indent, width);
+            } else {
+                print_wrapped(help, col, indent, width);
+            }
+        }
+    }
+}
+
 static void print_usage(const char * argv0) {
-    std::printf(
-        "usage: %s -m <model.gguf> [options]\n"
-        "\n"
-        "  -m, --model PATH        gguf model (required)\n"
-        "  -p, --prompt STR        prompt text\n"
-        "  -n, --n-predict N       tokens to generate (default 128)\n"
-        "  -t, --threads N         compute threads (default 4)\n"
-        "  -c, --ctx-size N        context size (default 2048)\n"
-        "      --ubatch N          widest graph computed at once (0 = as wide as the context).\n"
-        "                          Compute buffers are reserved for it, so a smaller value hands\n"
-        "                          RAM back to the expert cache at the cost of prefill speed;\n"
-        "                          decode is unaffected. Measured: a context of 2048 reserves\n"
-        "                          320 MiB, falling to 80 MiB at 512.\n"
-        "      --chatml            wrap the prompt in the model family's chat turn (gemma/chatml)\n"
-        "      --no-think          render the chat template with reasoning disabled\n"
-        "      --progress          emit machine telemetry (one JSON line per token)\n"
-        "      --session           keep the model loaded and serve JSON prompt requests from stdin\n"
-        "      --csv PATH          also write per-token metrics as CSV\n"
-        "      --route-trace PATH  diagnostics: write the per-step per-layer MoE routing trace\n"
-        "                          (which experts each layer routed, their weight, cache state).\n"
-        "                          Needs --moe-stream; costs speed — not for benchmark runs\n"
-        "      --compute-trace PATH\n"
-        "                          diagnostics: isolate and time EVERY graph node (per-op detail,\n"
-        "                          major faults per node). Serializes the graph — proportions only\n"
-        "      --compute-trace-layers PATH\n"
-        "                          same trace at layer granularity: one barrier per layer, so\n"
-        "                          coalescing and the expert prefetch survive and the numbers stay\n"
-        "                          close to an untraced run. Rows aggregate per layer (op LAYER)\n"
-        "      --io-trace PATH     diagnostics: one row per expert read — its (layer, expert,\n"
-        "                          projection), size and latency. Needs --moe-stream; this is how a\n"
-        "                          flash-bandwidth claim is checked against the reads that made it\n"
-        "      --n-expert-used N   override active MoE experts per token (top-k); lower = faster\n"
-        "                          but changes the output (quality). 0 = model default\n"
-        "  -h, --help              show this text and exit\n"
-        "      --version           print the engine version and exit\n"
-        "\n"
-        "  Sampling (default: greedy/argmax, deterministic):\n"
-        "      --temp F            sampling temperature; <= 0 keeps greedy (default 0). > 0 enables\n"
-        "                          the chain top-k -> top-p -> temp -> dist\n"
-        "      --top-k N           top-k cutoff when sampling (0 disables the stage; default 40)\n"
-        "      --top-p F           nucleus cutoff in (0,1] when sampling (default 0.95)\n"
-        "      --seed N            RNG seed for sampling (default: random per run)\n"
-        "\n"
-        "  Self-speculative decoding (draft a continuation, verify it in one wider decode).\n"
-        "  Greedy verification makes the output token-identical to plain decode; the win is reading\n"
-        "  the weights once per N tokens instead of N times, the risk is that N positions route\n"
-        "  independently and widen the per-layer expert read set. Pick one source; off by default:\n"
-        "      --mtp               draft with the model's own multi-token-prediction head.\n"
-        "                          Needs a gguf with the nextn block (Qwen3.5/3.6)\n"
-        "      --ngram             draft by looking the recent tokens up in the prompt and in what\n"
-        "                          has been generated, proposing whatever followed last time. Costs\n"
-        "                          no compute, no memory and no expert read, works on any model,\n"
-        "                          and drafts NOTHING when it has no confident match — so a step\n"
-        "                          without one costs exactly a plain decode\n"
-        "      --draft N           tokens drafted per verify batch (default 3, max %d)\n"
-        "      --mtp-p-min F       --mtp only: stop drafting when the head's best candidate falls\n"
-        "                          below this probability (0..1, default 0 = draft the full width\n"
-        "                          however unsure it is). Makes the draft width adaptive per step:\n"
-        "                          a draft not made is one fewer MTP-block pass AND one fewer\n"
-        "                          independently routed position in the verify batch\n"
-        "      --ngram-min-match N --ngram only: shortest run of matching tokens allowed to draft\n"
-        "                          (default 3). The confidence gate: raise it for fewer, better\n"
-        "                          drafts, lower it for coverage\n"
-        "\n"
-        "  MoE expert streaming:\n"
-        "      --moe-stream        stream only the routed experts per token (MoE models)\n"
-        "      --cache-mb N|auto   LRU expert cache budget in MiB (0=off, or >=%d); auto=size to device\n"
-        "                          (default: auto whenever --moe-stream is on)\n"
-        "      --cache-floor-mb N  with --cache-mb auto: RAM to leave free (default 1536)\n"
-        "      --cache-ceil-mb N   with --cache-mb auto: upper bound on the budget (0 = no cap)\n"
-        "      --io-threads N      parallel expert-read lanes [1..%d] (default 4)\n"
-        "      --no-odirect        do not bypass the page cache for expert reads\n"
-        "      --dense-weights M   dense (non-expert) weight policy: mmap | warm | anon (default) | ahwb\n"
-        "                          (warm = page-cache them at load, best when the model fits in RAM;\n"
-        "                          anon = read via O_DIRECT into our own buffers and rebind, so a\n"
-        "                          reclaim hits zram not flash — the win on >RAM models;\n"
-        "                          ahwb = as anon, but into dma-buf memory the kernel may not reclaim\n"
-        "                          at all — not even to zram, which is what anon still pays for.\n"
-        "                          Android-only; measured +17.9%% on a long generation, off by default)\n"
-        "                          Deprecated aliases kept for old scripts: --dense-odirect means\n"
-        "                          `--dense-weights anon`, --no-warm-dense means `--dense-weights mmap`\n"
-        "      --row-stream        serve dense tables the graph only GATHERS ROWS from (a token\n"
-        "                          embedding) from flash instead of RAM: the tensor is bound to\n"
-        "                          reserved address space and only the rows a token needs are\n"
-        "                          read. Which tables qualify comes from the graph, not from a\n"
-        "                          name list, so a model that also multiplies by its embedding\n"
-        "                          table is left alone, on any architecture\n"
-        "      --row-stream-mb N   resident window for those tables in MiB (default 64)\n"
-        "      --release-mmap      unmap the model file after load once nothing reads through it\n"
-        "                          (Windows: a live mapping serialises the streamer's concurrent reads;\n"
-        "                          needs --dense-weights anon|ahwb; measured neutral on Android)\n"
-        "      --load-all          debug: read ALL experts each token (A/B baseline)\n"
-        "      --force-cache       allow a cache-mb in the pathological band\n"
-        "      --overlap           overlap async expert reads with FFN compute (needs the fork)\n"
-        "      --io-two-wave       publish a layer's first-projection reads before committing the\n"
-        "                          rest, so the lanes start sooner (needs --overlap and the cache;\n"
-        "                          experimental, off by default pending the on-device A/B)\n"
-        "      --prefetch K        temporally prefetch the next K layers' experts (needs the cache)\n"
-        "      --prefetch-sync     debug/tests only: complete each speculative read on the eval\n"
-        "                          thread before returning. Defeats the point (nothing overlaps) but\n"
-        "                          makes the integrate-then-hit path deterministic for the gates\n"
-        "      --drop-cold-experts F  skip a routed expert that is a cache MISS and carries less than\n"
-        "                          F x (1/top-k) of the routing's weight. F in (0, 1]; 1.0 is the\n"
-        "                          uniform share and the useful maximum. LOSSY and cache-dependent:\n"
-        "                          it changes the output, and not reproducibly. Off by default.\n"
-        "      --expert-substitute L  EXPERIMENTAL, LOSSY: before committing a decode routing, raise\n"
-        "                          the score of every resident expert by L x this token's score range\n"
-        "                          and re-rank. A resident expert wins a slot only when it was within\n"
-        "                          that margin of the one it displaces; weights are the router's own.\n"
-        "                          Runs the same NUMBER of experts, fewer of which cost a read.\n"
-        "                          L in [0, 1]; 0 is off. Needs the LRU cache. Measured best: 0.15\n"
-        "      --ppl FILE          measure teacher-forced perplexity of FILE instead of generating.\n"
-        "                          Every cell scores the SAME fixed token sequence, so the number is\n"
-        "                          a scale: comparing GENERATED text cannot price a lossy setting,\n"
-        "                          because greedy output only moves when a perturbation happens to\n"
-        "                          cross an argmax boundary, whatever its size\n"
-        "      --ppl-skip N        leading tokens evaluated but not scored (default 8)\n"
-        "      --ppl-step          score one token per decode, so a cache-dependent policy (dropping,\n"
-        "                          substitution) is priced in the regime where it acts. A wide batch\n"
-        "                          routes a layer before reading any of it, and finds almost nothing\n"
-        "                          resident. Slower: one decode per token\n"
-        "      --ppl-list FILE     score every text named in FILE (one path per line) in one session,\n"
-        "                          so a benchmark of many short texts loads the model once\n"
-        "      --ppl-choices A,B   after the text, report the log-probability of each choice's first\n"
-        "                          token: the multiple-choice comparison, one pass per question\n"
-        "      --drop-no-renorm    do not rescale the surviving weights after a drop (A/B)\n"
-        "      --drop-in-prefill   drop during prefill too (off: the cold cache makes it expensive)\n"
-        "      --route-ahead N     EXPERIMENTAL, LOSSY: commit decode routing to the prediction made\n"
-        "                          N layers earlier in the same forward pass (each layer's own gate\n"
-        "                          run on the hidden state N layers back). The router still computes\n"
-        "                          and gives the substituted experts their true renormalized weights;\n"
-        "                          a prefetch of a committed layer can then never miss. Changes the\n"
-        "                          output — this flag exists to measure that quality trade [0..8].\n"
-        "                          Excludes --predict-log / --predict-prefetch / --prefetch.\n"
-        "      --predict-log       diagnostics: measure how much of each layer's routing could be\n"
-        "                          known a layer early (the next layer's gate run on this layer's\n"
-        "                          input), scored against the previous-token bet --prefetch makes.\n"
-        "                          Changes nothing that is read; costs a barrier and a GEMV per\n"
-        "                          layer, so a probed run is not a benchmark run.\n"
-        "      --predict-prefetch  act on that prediction: speculatively read predicted expert\n"
-        "                          misses on the idle lanes and LRU-protect predicted residents\n"
-        "                          (needs the cache; excludes --prefetch). Drop-aware: experts\n"
-        "                          predicted below the drop threshold are not speculated.\n"
-        "      --predict-spec-max N  speculated predicted misses per layer [0..8] (default 2;\n"
-        "                          0 = retention only, the prediction spends no flash at all)\n"
-        "      --list-archs        print supported MoE architectures and exit\n"
-        "\n"
-        "  Env overrides (flag wins): BMOE_CACHE_MB, BMOE_IO_THREADS, BMOE_PROGRESS, BMOE_OVERLAP, BMOE_PREFETCH, "
-        "BMOE_N_EXPERT_USED, BMOE_PREDICT_LOG, BMOE_PREDICT_PREFETCH\n",
-        argv0, SpecConfig::draft_max_limit, MoeStreamConfig::cache_min_mb, MoeStreamConfig::io_threads_max);
+    std::printf("usage: %s -m <model.gguf> [options]\n"
+                "\n"
+                "  -p, --prompt STR        prompt text\n"
+                "      --progress          emit machine telemetry (one JSON line per token)\n"
+                "      --describe-params   print every engine parameter (key, type, bounds, default, help) as\n"
+                "                          JSON and exit: the schema a front-end renders its settings from\n"
+                "      --show-config       print the resolved configuration (flags, env overrides and CLI\n"
+                "                          defaults applied) as JSON with its validation result, and exit\n"
+                "      --auto              resolve the streaming knobs from what this machine and this model\n"
+                "                          report (the hardware planner). A knob you also pass by hand is left\n"
+                "                          exactly as you set it, and nothing lossy is ever armed\n"
+                "      --plan              print the plan, the fact behind each choice and the flags that\n"
+                "                          reproduce it, then exit without loading the model (= --plan-only)\n"
+                "      --plan-explain      with --auto: print the plan, then run it\n"
+                "      --probe             --plan, plus the memory probe below\n"
+                "      --no-probe-io       plan without the storage read probe (touches no drive)\n"
+                "      --no-isolated-probes  probe compute devices in this process instead of a child each.\n"
+                "                          The child exists so a driver that crashes or hangs costs the\n"
+                "                          device, not the run\n"
+                "      --probe-device D    internal: probe device D, print its facts, exit (the child above)\n"
+                "      --probe-mem         measure how much memory this machine will let us KEEP, by holding\n"
+                "                          it until the kernel takes some back. The one probe that puts a live\n"
+                "                          machine under real pressure, so it is off unless asked\n"
+                "      --session           keep the model loaded and serve JSON prompt requests from stdin\n"
+                "      --csv PATH          also write per-token metrics as CSV\n"
+                "      --route-trace PATH  diagnostics: write the per-step per-layer MoE routing trace\n"
+                "                          (which experts each layer routed, their weight, cache state).\n"
+                "                          Needs --moe-stream; costs speed — not for benchmark runs\n"
+                "      --compute-trace PATH\n"
+                "                          diagnostics: isolate and time EVERY graph node (per-op detail,\n"
+                "                          major faults per node). Serializes the graph — proportions only\n"
+                "      --compute-trace-layers PATH\n"
+                "                          same trace at layer granularity: one barrier per layer, so\n"
+                "                          coalescing and the expert prefetch survive and the numbers stay\n"
+                "                          close to an untraced run. Rows aggregate per layer (op LAYER)\n"
+                "      --io-trace PATH     diagnostics: one row per expert read — its (layer, expert,\n"
+                "                          projection), size and latency. Needs --moe-stream; this is how a\n"
+                "                          flash-bandwidth claim is checked against the reads that made it\n"
+                "  -h, --help              show this text and exit\n"
+                "      --version           print the engine version and exit\n"
+                "      --list-archs        print supported MoE architectures and exit\n"
+                "\n"
+                "  Perplexity (score a fixed text instead of generating):\n"
+                "      --ppl FILE          measure teacher-forced perplexity of FILE instead of generating.\n"
+                "                          Every cell scores the SAME fixed token sequence, so the number is\n"
+                "                          a scale: comparing GENERATED text cannot price a lossy setting,\n"
+                "                          because greedy output only moves when a perturbation happens to\n"
+                "                          cross an argmax boundary, whatever its size\n"
+                "      --ppl-skip N        leading tokens evaluated but not scored (default 8)\n"
+                "      --ppl-step          score one token per decode, so a cache-dependent policy (dropping,\n"
+                "                          substitution) is priced in the regime where it acts. A wide batch\n"
+                "                          routes a layer before reading any of it, and finds almost nothing\n"
+                "                          resident. Slower: one decode per token\n"
+                "      --ppl-list FILE     score every text named in FILE (one path per line) in one session,\n"
+                "                          so a benchmark of many short texts loads the model once\n"
+                "      --ppl-choices A,B   after the text, report the log-probability of each choice's first\n"
+                "                          token: the multiple-choice comparison, one pass per question\n",
+                argv0);
+    print_param_usage();
+    std::printf("\n  With --moe-stream and no --cache-mb, the cache is sized automatically (--cache-mb auto).\n"
+                "  Env overrides (flag wins): BMOE_CACHE_MB, BMOE_IO_THREADS, BMOE_PROGRESS, BMOE_OVERLAP, "
+                "BMOE_PREFETCH,\n  BMOE_N_EXPERT_USED, BMOE_PREDICT_LOG, BMOE_PREDICT_PREFETCH\n");
 }
 
 // The prediction probe's report (see MoeStreamConfig::predict_log).
@@ -595,16 +683,31 @@ int main(int argc, char ** argv) {
     std::string ppl_list;                 // --ppl-list: one text path per line, scored in one session
     std::vector<std::string> ppl_choices; // --ppl-choices: strings whose first-token log-prob is reported
     std::string compute_trace_path;
+    bool compute_trace_layers = false; // the compute trace's granularity: a property of the sink
     std::string io_trace_path;
     bool session_mode = false;
+    bool progress = false; // the line protocol (docs/telemetry.md) instead of inline text
 
-    // Which flags the user actually typed. The env overrides below consult this rather than
-    // comparing against the default, so passing a flag its default value still wins.
+    bool describe_params = false;
+    bool show_config = false;
+    bool auto_plan = false;
+    bool plan_explain = false;
+    bool plan_only = false;
+    bool probe_io = true;
+    bool probe_mem = false; // off by default: it is the one probe that puts the machine under real pressure
+    // Devices are probed in a child process each, so a driver that ends the process ends the child.
+    // `probe_device` is that child's mode: probe the one device named, print its facts, exit.
+    bool isolated_probes = true;
+    std::string probe_device;
+
+    // Which parameters the user actually typed, by key. The env overrides below consult this rather
+    // than comparing against the default, so passing a flag its default value still wins.
     std::set<std::string> seen;
+    // Parameters whose switches are alternatives (--mtp / --ngram): the switch that set each one.
+    std::map<std::string, std::string> switch_used;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        seen.insert(a);
         auto next = [&](const char * what) -> const char * {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "missing value for %s\n", what);
@@ -612,51 +715,43 @@ int main(int argc, char ** argv) {
             }
             return argv[++i];
         };
-        if (a == "-m" || a == "--model")
-            cfg.model_path = next("-m");
-        else if (a == "-p" || a == "--prompt")
+        // Front-end flags first: outputs, modes and sinks, none of which is part of a run's
+        // configuration. Everything else is an engine parameter and goes through the table.
+        if (a == "-p" || a == "--prompt")
             cfg.prompt = next("-p");
-        else if (a == "-n" || a == "--n-predict")
-            cfg.n_predict = std::atoi(next("-n"));
-        else if (a == "-t" || a == "--threads")
-            cfg.n_threads = std::atoi(next("-t"));
-        else if (a == "-c" || a == "--ctx-size")
-            cfg.n_ctx = std::atoi(next("-c"));
-        else if (a == "--ubatch")
-            cfg.n_ubatch = std::atoi(next("--ubatch"));
-        else if (a == "--n-expert-used")
-            cfg.n_expert_used = std::atoi(next("--n-expert-used"));
-        else if (a == "--temp")
-            cfg.sampling.temp = (float) std::atof(next("--temp"));
-        else if (a == "--top-k")
-            cfg.sampling.top_k = std::atoi(next("--top-k"));
-        else if (a == "--top-p")
-            cfg.sampling.top_p = (float) std::atof(next("--top-p"));
-        else if (a == "--seed")
-            cfg.sampling.seed = (uint32_t) std::strtoul(next("--seed"), nullptr, 10);
-        else if (a == "--mtp" || a == "--ngram") {
-            // Two sources for one loop, so asking for both is a contradiction rather than a
-            // precedence question — say so instead of silently honouring the last flag.
-            const DraftSource want = a == "--mtp" ? DraftSource::mtp : DraftSource::ngram;
-            if (cfg.spec.enabled() && cfg.spec.source != want) {
-                std::fprintf(stderr, "bmoe: --mtp and --ngram are two draft sources for the same verify loop; "
-                                     "choose one.\n");
-                return 2;
-            }
-            cfg.spec.source = want;
-        } else if (a == "--draft")
-            cfg.spec.draft_max = std::atoi(next("--draft"));
-        else if (a == "--mtp-p-min")
-            cfg.spec.draft_p_min = (float) std::atof(next("--mtp-p-min"));
-        else if (a == "--ngram-min-match")
-            cfg.spec.ngram_min_match = std::atoi(next("--ngram-min-match"));
-        else if (a == "--chatml")
-            cfg.chatml = true;
-        else if (a == "--no-think")
-            cfg.think = false;
-        else if (a == "--progress")
-            cfg.progress = true;
-        else if (a == "--session")
+        else if (a == "--progress") {
+            progress = true;
+            seen.insert("progress");
+        } else if (a == "--describe-params")
+            describe_params = true;
+        else if (a == "--show-config")
+            show_config = true;
+        // Three commands over one machinery, because they answer three different questions: look at
+        // the machine, say what you would do, do it. `--plan` prints the plan and the exact command
+        // line that reproduces it, then exits - which is what makes a plan a VALUE that can be
+        // pasted, diffed against a hand-tuned run and dropped into a bench cell.
+        else if (a == "--auto" || a == "--plan-run")
+            auto_plan = true;
+        else if (a == "--plan" || a == "--plan-only") {
+            auto_plan = plan_explain = plan_only = true;
+        } else if (a == "--probe") {
+            auto_plan = plan_explain = plan_only = true;
+            probe_io = probe_mem = true;
+        } else if (a == "--plan-explain")
+            plan_explain = true;
+        else if (a == "--probe-io") {
+            auto_plan = true;
+            probe_io = true;
+        } else if (a == "--no-probe-io")
+            probe_io = false;
+        else if (a == "--probe-device")
+            probe_device = next("--probe-device");
+        else if (a == "--no-isolated-probes")
+            isolated_probes = false;
+        else if (a == "--probe-mem") {
+            auto_plan = true;
+            probe_mem = true;
+        } else if (a == "--session")
             session_mode = true;
         else if (a == "--csv")
             csv_path = next("--csv");
@@ -666,73 +761,21 @@ int main(int argc, char ** argv) {
             compute_trace_path = next("--compute-trace");
         else if (a == "--compute-trace-layers") {
             compute_trace_path = next("--compute-trace-layers");
-            cfg.compute_trace_layers = true;
+            compute_trace_layers = true;
         } else if (a == "--io-trace")
             io_trace_path = next("--io-trace");
-        else if (a == "--moe-stream")
-            cfg.moe.enabled = true;
-        else if (a == "--cache-mb") {
-            const std::string v = next("--cache-mb");
-            if (v == "auto")
-                cfg.moe.cache_auto = true;
-            else
-                cfg.moe.cache_mb = std::atoi(v.c_str());
-        } else if (a == "--cache-floor-mb")
-            cfg.moe.cache_floor_mb = std::atoi(next("--cache-floor-mb"));
-        else if (a == "--cache-ceil-mb")
-            cfg.moe.cache_ceil_mb = std::atoi(next("--cache-ceil-mb"));
-        else if (a == "--io-threads")
-            cfg.moe.io_threads = std::atoi(next("--io-threads"));
-        else if (a == "--no-odirect")
-            cfg.moe.o_direct = false;
-        else if (a == "--release-mmap")
-            cfg.moe.release_mmap = true;
-        else if (a == "--row-stream")
-            cfg.moe.row_stream = true;
-        else if (a == "--row-stream-mb")
-            cfg.moe.row_stream_mb = std::atoi(next("--row-stream-mb"));
-        else if (a == "--dense-weights") {
-            const std::string m = next("--dense-weights");
-            if (m == "mmap")
-                cfg.moe.dense_weights = bmoe::DenseWeightsMode::Mmap;
-            else if (m == "warm")
-                cfg.moe.dense_weights = bmoe::DenseWeightsMode::Warmed;
-            else if (m == "anon")
-                cfg.moe.dense_weights = bmoe::DenseWeightsMode::Anonymous;
-            else if (m == "ahwb")
-                cfg.moe.dense_weights = bmoe::DenseWeightsMode::Pinned;
-            else {
-                std::fprintf(stderr, "bmoe: --dense-weights expects mmap|warm|anon|ahwb, got '%s'\n", m.c_str());
-                return 2;
-            }
-        }
-        // Deprecated aliases, kept so existing scripts and the app keep working: --no-warm-dense is
-        // the Mmap policy, --dense-odirect is Anonymous. Prefer --dense-weights.
-        else if (a == "--no-warm-dense")
-            cfg.moe.dense_weights = bmoe::DenseWeightsMode::Mmap;
-        else if (a == "--dense-odirect")
-            cfg.moe.dense_weights = bmoe::DenseWeightsMode::Anonymous;
-        else if (a == "--load-all")
-            cfg.moe.load_all = true;
-        else if (a == "--force-cache")
-            cfg.moe.force_cache = true;
-        else if (a == "--overlap")
-            cfg.moe.overlap = true;
-        else if (a == "--io-two-wave")
-            cfg.moe.io_two_wave = true;
-        else if (a == "--prefetch")
-            cfg.moe.prefetch_layers = std::atoi(next("--prefetch"));
-        else if (a == "--prefetch-sync") // debug: complete speculative reads synchronously
-            cfg.moe.prefetch_sync = true;
-        else if (a == "--drop-cold-experts")
-            cfg.moe.drop_cold_frac = (float) std::atof(next("--drop-cold-experts"));
-        else if (a == "--expert-substitute")
-            cfg.moe.substitute_lambda = (float) std::atof(next("--expert-substitute"));
         else if (a == "--ppl")
             ppl_path = next("--ppl");
-        else if (a == "--ppl-skip")
-            ppl_skip = std::atoi(next("--ppl-skip"));
-        else if (a == "--ppl-step")
+        else if (a == "--ppl-skip") {
+            const char * v = next("--ppl-skip");
+            long long n = 0;
+            std::string err;
+            if (!parse_int_strict(v, 0, RunConfig::tokens_max, n, err)) {
+                std::fprintf(stderr, "bmoe: --ppl-skip %s\n", err.c_str());
+                return 2;
+            }
+            ppl_skip = (int) n;
+        } else if (a == "--ppl-step")
             ppl_step = true;
         else if (a == "--ppl-list")
             ppl_list = next("--ppl-list");
@@ -745,19 +788,7 @@ int main(int argc, char ** argv) {
                 if (comma == std::string::npos) break;
                 start = comma + 1;
             }
-        } else if (a == "--drop-no-renorm")
-            cfg.moe.drop_renorm = false;
-        else if (a == "--drop-in-prefill")
-            cfg.moe.drop_prefill = true;
-        else if (a == "--route-ahead")
-            cfg.moe.route_ahead = std::atoi(next("--route-ahead"));
-        else if (a == "--predict-log")
-            cfg.moe.predict_log = true;
-        else if (a == "--predict-prefetch")
-            cfg.moe.predict_prefetch = true;
-        else if (a == "--predict-spec-max")
-            cfg.moe.predict_spec_max = std::atoi(next("--predict-spec-max"));
-        else if (a == "--list-archs") {
+        } else if (a == "--list-archs") {
             std::printf("supported MoE architectures:\n");
             for (int k = 0; k < n_moe_recipes(); ++k)
                 std::printf("  %s\n", moe_recipe_at(k)->arch);
@@ -769,31 +800,176 @@ int main(int argc, char ** argv) {
             std::printf("%s\n", bmoe::version());
             return 0;
         } else {
-            std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
-            print_usage(argv[0]);
-            return 1;
+            const char * value = i + 1 < argc ? argv[i + 1] : nullptr;
+            const FlagResult r = apply_flag(cfg, a.c_str(), value);
+            if (!r.matched) {
+                std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
+                print_usage(argv[0]);
+                return 1;
+            }
+            if (!r.error.empty()) {
+                std::fprintf(stderr, "bmoe: %s\n", r.error.c_str());
+                return value || r.via_switch ? 2 : 1;
+            }
+            if (r.consumed_value) ++i;
+            seen.insert(r.param->key);
+            // Two switches that are alternatives for one parameter are a contradiction rather than a
+            // precedence question — say so instead of silently honouring the last one.
+            if (r.via_switch && r.param->exclusive_switches) {
+                auto it = switch_used.find(r.param->key);
+                if (it != switch_used.end() && it->second != r.via_switch->flag) {
+                    std::fprintf(stderr, "bmoe: %s and %s are alternatives (%s); choose one.\n", it->second.c_str(),
+                                 r.via_switch->flag.c_str(), r.param->label.c_str());
+                    return 2;
+                }
+                switch_used[r.param->key] = r.via_switch->flag;
+            }
         }
     }
 
-    // Env overrides (flag wins: only apply when the flag was not passed). Asking whether the flag
-    // was typed, not whether its value still equals the default, is what makes an explicit
-    // --cache-mb 0 (cache off) or --io-threads 4 stick. The defaults below match config.h, so an
-    // unset variable leaves the field alone.
-    if (!seen.count("--cache-mb")) cfg.moe.cache_mb = env_int("BMOE_CACHE_MB", 0);
-    if (!seen.count("--io-threads")) cfg.moe.io_threads = env_int("BMOE_IO_THREADS", 4);
-    if (!seen.count("--progress")) cfg.progress = env_int("BMOE_PROGRESS", 0) != 0;
-    if (!seen.count("--overlap")) cfg.moe.overlap = env_int("BMOE_OVERLAP", 0) != 0;
-    if (!seen.count("--prefetch")) cfg.moe.prefetch_layers = env_int("BMOE_PREFETCH", 0);
-    if (!seen.count("--n-expert-used")) cfg.n_expert_used = env_int("BMOE_N_EXPERT_USED", 0);
-    if (!seen.count("--predict-log")) cfg.moe.predict_log = env_int("BMOE_PREDICT_LOG", 0) != 0;
-    if (!seen.count("--predict-prefetch")) cfg.moe.predict_prefetch = env_int("BMOE_PREDICT_PREFETCH", 0) != 0;
+    if (describe_params) {
+        std::printf("%s\n", params_json(RunConfig{}).c_str());
+        return 0;
+    }
+
+    // Env overrides (flag wins: only apply when the parameter was not typed). Asking whether it was
+    // typed, not whether its value still equals the default, is what makes an explicit --cache-mb 0
+    // (cache off) or --io-threads 4 stick. An unset or empty variable leaves the field alone. A
+    // front-end switch (`front_end`) is not a parameter and is set here directly; it is keyed in
+    // `seen` like one, so its flag wins the same way.
+    struct EnvOverride {
+        const char * var;
+        const char * key;
+        bool * front_end = nullptr;
+    };
+    const EnvOverride kEnvOverrides[] = {
+        {"BMOE_CACHE_MB", "cache-mb"},
+        {"BMOE_IO_THREADS", "io-threads"},
+        {"BMOE_OVERLAP", "overlap"},
+        {"BMOE_PREFETCH", "prefetch"},
+        {"BMOE_N_EXPERT_USED", "n-expert-used"},
+        {"BMOE_PREDICT_LOG", "predict-log"},
+        {"BMOE_PREDICT_PREFETCH", "predict-prefetch"},
+        {"BMOE_PROGRESS", "progress", &progress},
+    };
+    for (const EnvOverride & e : kEnvOverrides) {
+        const char * v = std::getenv(e.var);
+        if (seen.count(e.key) || !v || !*v) continue;
+        if (e.front_end) {
+            *e.front_end = std::atoi(v) != 0; // the reading these switches always had: non-zero is on
+            continue;
+        }
+        const ParamDesc * d = find_param(e.key);
+        // Booleans keep the reading these variables always had: any non-zero integer is on.
+        const std::string val = d->type == ParamType::Bool ? (std::atoi(v) != 0 ? "true" : "false") : v;
+        std::string err;
+        if (!d->set(cfg, val, err)) std::fprintf(stderr, "warning: ignoring %s: %s\n", e.var, err.c_str());
+    }
 
     // A default the CLI resolves rather than the library, so an embedder's explicit 0 keeps meaning
     // "no cache". With streaming on, a budget of 0 re-reads every routed expert from flash every
     // token, which is never what someone who just typed --moe-stream wanted (#186). An explicit
     // --cache-mb or BMOE_CACHE_MB still wins, including an explicit 0.
-    if (cfg.moe.enabled && !cfg.moe.cache_auto && !seen.count("--cache-mb") && std::getenv("BMOE_CACHE_MB") == nullptr)
+    if (cfg.moe.enabled && !cfg.moe.cache_auto && !seen.count("cache-mb") && std::getenv("BMOE_CACHE_MB") == nullptr)
         cfg.moe.cache_auto = true;
+
+    // --auto: resolve the streaming knobs from what the machine and the model report. It runs after
+    // the flags, the env overrides and the CLI's own defaults, so that anything the caller expressed
+    // either way is a pin the planner may not touch: an automatic choice that quietly overruled a
+    // person would be worse than no automation at all. The pinned names are the parameter keys,
+    // which is the name a Decision uses for its knob. See docs/hardware-planning.md.
+    double predicted_s_per_token = 0.0;
+    double predicted_hit_pct = -1.0;
+    if (seen.count("dense-on-device")) auto_plan = true; // a request to the planner, as before
+    // The child of an isolated device probe: one device, its facts on one line, nothing else. If
+    // the driver ends this process, or it never returns, that is the parent's answer about the device.
+    if (!probe_device.empty()) {
+        std::string line;
+        if (!probe_device_child(cfg.model_path.c_str(), probe_device, line)) {
+            std::fprintf(stderr, "bmoe: no such device to probe: %s\n", probe_device.c_str());
+            return 3;
+        }
+        std::printf("%s\n", line.c_str());
+        std::fflush(stdout);
+        return 0;
+    }
+
+    if (auto_plan && !cfg.model_path.empty()) {
+        PlanRequest req;
+        req.pinned.assign(seen.begin(), seen.end());
+        // An env override is the caller speaking too, so it pins the same way a flag does.
+        for (const EnvOverride & e : kEnvOverrides)
+            if (const char * v = std::getenv(e.var); v && *v) req.pinned.push_back(e.key);
+
+        // The probe order is core's (probe_and_plan); what this front-end decides is how intrusive
+        // the probes may be and how it is started again to probe a device in a process of its own.
+        AutoPlanOptions opt;
+        opt.probe_io = probe_io;
+        opt.probe_mem = probe_mem;
+        if (isolated_probes) {
+            const std::string model = cfg.model_path;
+            opt.isolated_probe_args = [model](const std::string & dev) {
+                return std::vector<std::string>{"-m", model, "--probe-device", dev};
+            };
+        }
+        const AutoPlan planned = probe_and_plan(cfg, req, opt);
+        const HardwareProfile & hw = planned.hw;
+        const ModelProfile & mp = planned.model;
+        const Plan & plan = planned.plan;
+        cfg = plan.config;
+        predicted_s_per_token = plan.allocation.seconds_per_token;
+        if (plan.allocation.cache_bytes > 0 && mp.expert_bytes > 0)
+            predicted_hit_pct = 100.0 * (double) plan.allocation.cache_bytes / (double) mp.expert_bytes;
+
+        if (plan_explain) {
+            std::fprintf(stderr, "plan: machine %s\n", hw.label.c_str());
+            // Every device with what it measured, so a decision about one can be checked against
+            // the figures it was made from. 0 is "not measured", never "slow".
+            for (const ComputeDevice & d : hw.devices) {
+                const auto verdict = [](Tri t) {
+                    return t == Tri::Yes ? "same result" : t == Tri::No ? "WRONG result" : "unverified";
+                };
+                if (d.usable == Tri::No) {
+                    std::fprintf(stderr, "plan: device %s: UNUSABLE - %s\n", d.name.c_str(), d.unusable_reason.c_str());
+                    continue;
+                }
+                std::fprintf(stderr, "plan: device %s%s: one token %.0f GiB/s (%s), %u tokens wide %.0f GiB/s (%s)%s\n",
+                             d.name.c_str(), d.is_cpu ? " (host)" : "", d.memory_bandwidth_gibs, verdict(d.identity_ok),
+                             hw.wide_batch, d.wide_matmul_gibs, verdict(d.wide_identity_ok),
+                             d.probed_out_of_process ? ", probed in a process of its own" : "");
+            }
+            if (mp.ok) {
+                std::fprintf(stderr, "plan: model %s, %u experts top-%u over %u of %u blocks\n", mp.arch.c_str(),
+                             mp.n_expert, mp.n_expert_used, mp.n_moe_layer, mp.n_layer);
+                for (int gi = 0; gi < (int) WeightGroup::count; ++gi) {
+                    const GroupDemand & d = mp.groups[gi];
+                    if (d.bytes == 0) continue;
+                    std::fprintf(stderr, "plan:   %-10s %7llu MiB, %7llu MiB/token%s\n", group_name((WeightGroup) gi),
+                                 (unsigned long long) (d.bytes >> 20), (unsigned long long) (d.bytes_per_token >> 20),
+                                 d.row_gatherable ? "  (row-gathered)"
+                                 : d.streamable   ? "  (streamable)"
+                                                  : "");
+                }
+            }
+            std::fputs(plan.explain().c_str(), stderr);
+            // The line that reproduces this plan by hand, printed last so it is what stays on screen.
+            std::fprintf(stderr, "plan: reproduce with\n  bmoe-cli -m %s %s\n", cfg.model_path.c_str(),
+                         plan.to_flags().c_str());
+        }
+        if (plan_only) return 0;
+    }
+
+    // The configuration exactly as a run would get it, and whether validate() accepts it. A
+    // front-end reads this to check a form against the real resolution rules, not a copy of them.
+    if (show_config) {
+        const ValidationResult v = validate(cfg);
+        std::string args;
+        for (const std::string & s : to_args(cfg))
+            args += (args.empty() ? "\"" : ",\"") + json_escape(s) + "\"";
+        std::printf("{\"config\":%s,\"args\":[%s],\"valid\":%s,\"error\":\"%s\"}\n", config_json(cfg).c_str(),
+                    args.c_str(), v.ok ? "true" : "false", json_escape(v.error).c_str());
+        return v.ok ? 0 : 1;
+    }
 
     if (cfg.model_path.empty()) {
         print_usage(argv[0]);
@@ -812,10 +988,15 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "config error: %s\n", vr.error.c_str());
         return 1;
     }
+    // Decide requests only travel through the session protocol; a one-shot run would ignore the flag.
+    if (cfg.decide.enabled && !session_mode) {
+        std::fprintf(stderr, "config error: --decide needs --session\n");
+        return 1;
+    }
 
     std::unique_ptr<IMetricsSink> sink;
     if (!csv_path.empty()) {
-        sink.reset(make_csv_metrics_sink(csv_path));
+        sink = make_csv_metrics_sink(csv_path);
         if (!sink) std::fprintf(stderr, "warning: could not open csv %s\n", csv_path.c_str());
     }
 
@@ -826,7 +1007,7 @@ int main(int argc, char ** argv) {
             // observe, and a header-only trace looks like a model that routed nothing.
             std::fprintf(stderr, "warning: --route-trace needs --moe-stream; no trace will be written\n");
         } else {
-            route_trace.reset(make_csv_route_trace_sink(route_trace_path));
+            route_trace = make_csv_route_trace_sink(route_trace_path);
             if (!route_trace)
                 std::fprintf(stderr, "warning: could not open route trace %s\n", route_trace_path.c_str());
         }
@@ -836,7 +1017,7 @@ int main(int argc, char ** argv) {
     // needs too — so unlike the other two it carries no --moe-stream requirement.
     std::unique_ptr<IComputeTraceSink> compute_trace;
     if (!compute_trace_path.empty()) {
-        compute_trace.reset(make_csv_compute_trace_sink(compute_trace_path));
+        compute_trace = make_csv_compute_trace_sink(compute_trace_path, compute_trace_layers);
         if (!compute_trace)
             std::fprintf(stderr, "warning: could not open compute trace %s\n", compute_trace_path.c_str());
     }
@@ -846,7 +1027,7 @@ int main(int argc, char ** argv) {
         if (!cfg.moe.enabled) {
             std::fprintf(stderr, "warning: --io-trace needs --moe-stream; no trace will be written\n");
         } else {
-            io_trace.reset(make_csv_io_trace_sink(io_trace_path));
+            io_trace = make_csv_io_trace_sink(io_trace_path);
             if (!io_trace) std::fprintf(stderr, "warning: could not open io trace %s\n", io_trace_path.c_str());
         }
     }
@@ -920,14 +1101,15 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    if (!cfg.progress) {
+    if (!progress) {
         std::printf("%s", cfg.prompt.c_str());
         std::fflush(stdout);
     }
 
     ProgressDelta pd; // one generation per one-shot run
-    auto on_token = [&](const TokenMetrics & m) {
-        if (cfg.progress) {
+    RunOutputs outs;
+    outs.on_token = [&](const TokenMetrics & m) {
+        if (progress) {
             emit_progress_line(m, pd);
         } else {
             std::fwrite(m.piece.data(), 1, m.piece.size(), stdout);
@@ -935,20 +1117,37 @@ int main(int argc, char ** argv) {
         }
     };
 
-    RunResult r = run(cfg, on_token, sink.get(), route_trace.get(), compute_trace.get(), io_trace.get());
+    // Only the line protocol reads the per-token answer; the inline path writes `piece` as it goes.
+    outs.render_text = progress;
+    outs.sink = sink.get();
+    outs.route_trace = route_trace.get();
+    outs.compute_trace = compute_trace.get();
+    outs.io_trace = io_trace.get();
+    RunResult r = run(cfg, outs);
     if (!r) {
         std::fprintf(stderr, "\nerror: %s\n", r.error.c_str());
         return 1;
     }
 
     const RunSummary & s = r.summary;
-    if (cfg.progress) {
+    if (progress) {
         std::printf("=== answer ===\n%s\n=== perf ===\n", r.generated_text.c_str());
     } else {
         std::printf("\n\n");
     }
     std::printf("generation: %d tokens, %.3f s/token (%.3f tok/s)\n", s.n_generated, s.s_per_token,
                 s.tokens_per_second);
+
+    // The loop that closes. A plan predicted this run before it started; here is what it got. A cost
+    // model whose error is never printed cannot be corrected, and the term the error is almost always
+    // in is the credited cache hit rate, which is why the two hit figures sit next to each other.
+    if (predicted_s_per_token > 0.0 && s.s_per_token > 0.0) {
+        const double err = 100.0 * (predicted_s_per_token / s.s_per_token - 1.0);
+        std::printf("plan: predicted %.3f s/token, measured %.3f (%+.0f%%)", predicted_s_per_token, s.s_per_token, err);
+        if (predicted_hit_pct >= 0.0 && s.cache_hit_pct >= 0.0)
+            std::printf("; cache hits credited %.0f%%, measured %.1f%%", predicted_hit_pct, s.cache_hit_pct);
+        std::printf("\n");
+    }
     // Compute decomposition (0 s/tok CPU means the platform couldn't measure it — Windows host).
     // occupancy = CPU-time ÷ (wall × threads): ~1 is compute-bound, well under 1 is a throttled or
     // preempted core; major faults/token > 0 means dense weights re-faulted from flash inside decode.
@@ -1002,10 +1201,8 @@ int main(int argc, char ** argv) {
     // that only ever describes streaming let a baseline run read as a measurement of this project
     // (#186). Naming the flag here is cheaper than a doc nobody reaches from a terminal.
     {
-        const char * dense = cfg.moe.dense_weights == DenseWeightsMode::Mmap     ? "mmap"
-                             : cfg.moe.dense_weights == DenseWeightsMode::Warmed ? "warm"
-                             : cfg.moe.dense_weights == DenseWeightsMode::Pinned ? "ahwb"
-                                                                                 : "anon";
+        const std::string dense_name = find_param("dense-weights")->get(cfg);
+        const char * dense = dense_name.c_str();
         if (cfg.moe.enabled) {
             char cache[64];
             if (cfg.moe.cache_auto)

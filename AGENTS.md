@@ -17,11 +17,33 @@ we do not fork llama.cpp. See `docs/architecture.md` and `docs/seam.md`.
   `file_reader` (pooled positioned reader, per-consumer O_DIRECT — used by both the expert stream
   and the dense loader); `mapping_release` (hands the model file's mapping back after load).
 - `core/src/moe/` — `gguf_offsets`, `arch_registry`, `expert_stream_source`, `router_hook`;
-  `dense_weights` (the non-expert weight policy: mmap / warm / anon, plus the residency sensor).
-- `core/src/engine/runtime.cpp` — composition + greedy generation loop.
-- `cli/main.cpp` — `bmoe-cli`; the ONLY place environment variables are read.
-- `third_party/llama.cpp` — stock upstream submodule.
-- `tests/` — byte-identity gates. `examples/android/` — the demo APK.
+  `dense_weights` (the non-expert weight policy: mmap / warm / anon, plus the residency sensor);
+  `tensor_names` (the one place llama.cpp's tensor and node names are parsed: no ad-hoc sscanf or regex).
+- `core/src/engine/` — `session.cpp`, the composition root: one `Session` loads the model, binds
+  the streamer and runs every generation; `runtime.cpp` is the one-shot wrapper over it. Beside it:
+  the prefill device and path, the chat template and parsers, and `decide/` (`docs/decide.md`).
+- `core/src/plan/` — the hardware planner behind `--auto` (`docs/hardware-planning.md`). The rules
+  (`planner`, `allocate`, `plan`) are pure functions over `hardware_profile.h` / `model_profile.h`
+  and name no platform, vendor, device or architecture; the `*_probe` adapters are the only files
+  that may. A rule that needs to know the platform is missing a fact: add the field, not the branch.
+  `auto_plan` (`probe_and_plan`) runs the probes in their order and then the rules; every front-end
+  plans through it rather than calling the probes itself.
+- `core/include/bmoe/params.h` + `core/src/params.cpp` — the parameter table: every tunable of a
+  `RunConfig`, described once. The CLI parses and documents its flags from it; front-ends render
+  their settings from its JSON (`bmoe-cli --describe-params`).
+- `cli/main.cpp`: `bmoe-cli`; the ONLY place engine environment overrides are read.
+- `server/`: `bmoe-server`, the engine behind the desktop web UI (`docs/server-api.md`). A
+  front-end like the CLI: HTTP, files and the platform live here, never in `core/`. Its only env
+  read is the per-user data folder on POSIX, and its only env writes are the two tuning entries the
+  Hexagon backend documents it reads, set before the backend loads (`server/platform.cpp`).
+- `ui/`: the web UI (Svelte + TypeScript). Settings are rendered from `GET /api/params`: never
+  name an engine parameter in the UI. `catalog/models.json`: the model catalog, as data.
+- `third_party/llama.cpp` — the pinned submodule: upstream plus one commit, the expert-ready hook
+  `--overlap` needs (the fork branch hard rule 1 describes; `docs/seam.md`). Everything else builds
+  against stock upstream.
+- `tests/` — byte-identity gates. `examples/android/` — the Android app, a client of `bmoe-server`
+  (shipped in the APK, run as a child process; no engine logic in Kotlin). `examples/ios/` — the iOS
+  harness: `cli/main.cpp` compiled into an app, since an app there may not start a process.
 
 ## Build and test
 
@@ -30,6 +52,9 @@ git submodule update --init --recursive
 scripts/build-host.sh
 cd build && ctest --output-on-failure         # byte-identity gates (needs python3 + gguf)
 ```
+
+Desktop app: `cd ui && npm ci && npm test && npm run build`, then the CMake build above stages
+`ui/dist` and the catalog beside `build/bin/bmoe-server` (run it, open `http://127.0.0.1:8765/`).
 
 Android CLI: `pwsh scripts/build-android.ps1` (needs the NDK), then build the APK in
 `examples/android`.
@@ -40,12 +65,14 @@ Android CLI: `pwsh scripts/build-android.ps1` (needs the NDK), then build the AP
    public gguf/model APIs. If a change seems to need a llama.cpp edit, stop and discuss —
    the fallback is a *separate* 1-commit fork branch on `Helldez/llama.cpp`, never an
    in-tree diff, and only after agreement. Upgrading llama.cpp must stay a submodule bump.
-2. **Repack stays off.** The engine loads with `use_mmap=true, use_extra_bufts=false`.
-   The streamer rebinds `tensor->data` to the native gguf layout; repacking breaks it.
-   This is load-bearing, not a tunable.
+2. **Repack stays off.** The engine loads memory-mapped (`load_mode = LLAMA_LOAD_MODE_MMAP`) with
+   `use_extra_bufts=false`. The streamer rebinds `tensor->data` to the native gguf layout;
+   repacking breaks it. This is load-bearing, not a tunable.
 3. **No env vars in the library.** `core/` never calls `getenv`. Config flows through
    `RunConfig`; the CLI resolves any env overrides before building it.
-4. **No hardcoding.** New architectures are recipe rows in `arch_registry.cpp`; expert
+4. **No hardcoding.** A new tunable is a `RunConfig` field plus one row in `params.cpp` (its flag,
+   bounds from named constants, help); never a hand-written flag, usage line or UI control.
+   New architectures are recipe rows in `arch_registry.cpp`; expert
    counts, strides and offsets are discovered at runtime. No model-specific constants in
    the streaming path.
 5. **Gates must pass before merge.** `bmoe_moe_gates` proves streamed == resident. If you
@@ -92,6 +119,9 @@ Android CLI: `pwsh scripts/build-android.ps1` (needs the NDK), then build the AP
   key from repository secrets, assets attached to the release. Do not hand-upload an APK.
 - **Every released feature bumps the app version**: `versionCode` + `versionName` in the
   Android app's Gradle config, in the same PR as the change being released, matching the tag.
+  The engine's own version (`project(... VERSION ...)` in the top-level `CMakeLists.txt`) moves
+  with it. `scripts/check-version.sh` compares the three with the changelog; CI runs it on every
+  PR and both release workflows run it against the tag before building.
 - **Release title is the bare version** — `vX.Y.Z`, no description after it.
 - **Validate on device before releasing.** The host gates prove correctness, not speed or
   app behaviour; a release that changes the engine or the app gets a run on a real phone

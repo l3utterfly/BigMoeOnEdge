@@ -1,13 +1,25 @@
 # bmoe_core — the streaming engine.
 #
-# Pure-policy sources (config validation, the architecture registry, the n-gram draft
-# matcher) build with no native dependency. The streaming adapters compile only when
-# llama.cpp is present, because they include its public headers (llama.h, ggml.h, gguf.h).
+# Pure-policy sources (config validation, the architecture registry, tensor naming, the n-gram draft
+# matcher, the hardware planner, decide()'s policy) build with no native dependency. The streaming
+# adapters compile only when llama.cpp is present, because they include its public headers
+# (llama.h, ggml.h, gguf.h).
 
 add_library(bmoe_core STATIC
     src/config.cpp
+    src/params.cpp
+    src/log.cpp
     src/moe/arch_registry.cpp
+    src/moe/tensor_names.cpp
     src/engine/ngram_draft.cpp
+    src/plan/plan.cpp
+    src/plan/allocate.cpp
+    src/plan/planner.cpp
+    src/engine/logits.cpp
+    src/engine/decide/prompt_split.cpp
+    src/engine/decide/choice_scorer.cpp
+    src/engine/decide/prefix_cache.cpp
+    src/engine/decide/decider.cpp
 )
 set_target_properties(bmoe_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -28,10 +40,25 @@ if(BMOE_HAVE_LLAMA)
         src/moe/dense_weights.cpp
         src/moe/row_stream.cpp
         src/moe/gguf_offsets.cpp
+        src/plan/hardware_probe.cpp
+        src/plan/headroom_probe.cpp
+        src/plan/bandwidth_probe.cpp
+        src/plan/device_probe.cpp
+        src/plan/isolated_probe.cpp
+        src/plan/storage_probe.cpp
+        src/plan/placement_probe.cpp
+        src/plan/model_probe.cpp
+        src/plan/auto_plan.cpp
         src/moe/expert_stream_source.cpp
         src/moe/router_hook.cpp
+        src/moe/decide_probe.cpp
+        src/moe/device_arena.cpp
         src/engine/session.cpp
+        src/engine/prefill_device.cpp
+        src/engine/prefill_path.cpp
+        src/engine/decide/llama_backend.cpp
         src/engine/chat_parse.cpp
+        src/engine/chat_messages.cpp
         src/engine/thinking_control.cpp
         src/engine/runtime.cpp
         src/metrics/csv_metrics_sink.cpp
@@ -55,8 +82,27 @@ if(BMOE_HAVE_LLAMA)
     # Intra-layer I/O–compute overlap needs the fork's expert-ready hook in ggml-cpu.h. Detect
     # it by inspecting the submodule header rather than the git remote, so any tree carrying the
     # hook (a rebase, a different fork) enables the feature. PUBLIC so cli/ and tests/ see it.
-    set(_ggml_cpu_h "${BMOE_LLAMA_SOURCE_DIR}/ggml/include/ggml-cpu.h")
-    if(EXISTS "${_ggml_cpu_h}")
+    #
+    # It also needs the CPU backend to be LINKED. Under GGML_BACKEND_DL that backend is a module
+    # loaded at runtime and its symbols are not available to link against, so the hook is present in
+    # the header and unresolvable at link time - which is a build that fails rather than a feature
+    # that degrades. A dynamic-backend build therefore ships without overlap, and says so here.
+    # Reaching it in that build would mean exposing the hook through
+    # `ggml_backend_reg_get_proc_address`, the way ggml exposes every other backend-specific
+    # function; that is a change to the fork commit, not to this file.
+    #
+    # Relative to this file, not CMAKE_SOURCE_DIR: as a subproject the top-level source dir is the
+    # parent project, and the header would silently not be found. An embedder that links its own
+    # llama/llama-common targets names that checkout in BMOE_LLAMA_SOURCE_DIR: the nested submodule
+    # is not what gets linked, so its header must not decide.
+    if(BMOE_LLAMA_SOURCE_DIR)
+        set(_ggml_cpu_h "${BMOE_LLAMA_SOURCE_DIR}/ggml/include/ggml-cpu.h")
+    else()
+        set(_ggml_cpu_h "${CMAKE_CURRENT_LIST_DIR}/../third_party/llama.cpp/ggml/include/ggml-cpu.h")
+    endif()
+    if(GGML_BACKEND_DL)
+        message(STATUS "bmoe: dynamic backends - overlap unavailable (the CPU backend is not linked)")
+    elseif(EXISTS "${_ggml_cpu_h}")
         file(READ "${_ggml_cpu_h}" _ggml_cpu_src)
         if(_ggml_cpu_src MATCHES "ggml_cpu_set_expert_ready_hook")
             target_compile_definitions(bmoe_core PUBLIC BMOE_HAVE_EXPERT_READY_HOOK=1)

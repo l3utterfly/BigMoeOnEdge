@@ -1,0 +1,301 @@
+/* The visual language (docs/design.md): the logo's palette, a pixel face for the product's own
+   voice, square boxes with 2 px edges and a hard shadow. Dark by default, light when asked. */
+@font-face {
+  font-family: 'Pixelify Sans';
+  src: url('/fonts/PixelifySans.ttf') format('truetype');
+  font-weight: 400 700;
+  font-display: swap;
+}
+
+:root {
+  --bg: #0a0512;
+  --surface: #160b2a;
+  --surface-2: #2a1150;
+  --text: #f2ecff;
+  --muted: #b9a9e6;
+  --border: #3b2a63;
+  --accent: #21e6ff;
+  --accent-text: #0a0512;
+  --accent-2: #6c5aa8;
+  --ok: #7ce0b0;
+  --ok-bg: #163a2d;
+  --warn: #ffc53d;
+  --warn-bg: #3d2e0c;
+  --err: #ff6b8b;
+  --err-bg: #3f1424;
+  --info-bg: #2a1150;
+  --focus: #21e6ff;
+  --shadow: #000000;
+  --radius: 0;
+  --edge: 2px;
+  --pixel: 'Pixelify Sans', ui-monospace, monospace;
+  --mono: ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', monospace;
+  color-scheme: dark light;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f2ecff;
+    --surface: #ffffff;
+    --surface-2: #e6dcff;
+    --text: #0a0512;
+    --muted: #4b3a7a;
+    --border: #6c5aa8;
+    --accent: #0fa8c2;
+    --accent-text: #ffffff;
+    --ok: #1d7a46;
+    --ok-bg: #dff3e8;
+    --warn: #8a5a00;
+    --warn-bg: #fff3d6;
+    --err: #b42318;
+    --err-bg: #fde8e6;
+    --info-bg: #e6dcff;
+    --focus: #0fa8c2;
+    --shadow: #0a0512;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+a {
+  color: var(--accent);
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--pixel);
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+h1 {
+  font-size: 1.45rem;
+  margin: 0 0 0.75rem;
+}
+h2 {
+  font-size: 1.15rem;
+  margin: 1.25rem 0 0.5rem;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+  border: var(--edge) solid var(--border);
+  background: var(--surface-2);
+  border-radius: 0;
+  padding: 0.35rem 0.8rem;
+  font-family: var(--pixel);
+  font-size: 0.95rem;
+}
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+button:active:not(:disabled) {
+  transform: translate(2px, 2px);
+}
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+button.primary {
+  background: var(--accent);
+  border-color: var(--shadow);
+  color: var(--accent-text);
+  box-shadow: 4px 4px 0 var(--shadow);
+}
+button.primary:active:not(:disabled) {
+  box-shadow: 2px 2px 0 var(--shadow);
+}
+button.danger {
+  color: var(--err);
+}
+button.link {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  text-decoration: underline;
+  font-family: inherit;
+  font-size: inherit;
+  transform: none;
+}
+
+input[type='text'],
+input[type='number'],
+input[type='password'],
+select,
+textarea {
+  background: var(--surface);
+  border: var(--edge) solid var(--border);
+  border-radius: 0;
+  padding: 0.35rem 0.5rem;
+  max-width: 100%;
+}
+input[type='checkbox'] {
+  accent-color: var(--accent);
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+pre,
+code {
+  font-family: var(--mono);
+  font-size: 0.9em;
+}
+pre {
+  background: var(--surface-2);
+  border: var(--edge) solid var(--border);
+  padding: 0.75rem;
+  overflow-x: auto;
+}
+
+.card {
+  background: var(--surface);
+  border: var(--edge) solid var(--border);
+  box-shadow: 4px 4px 0 var(--shadow);
+  padding: 0.9rem 1rem;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.banner {
+  border: var(--edge) solid var(--border);
+  padding: 0.6rem 0.9rem;
+  margin: 0 0 0.75rem;
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.banner.error {
+  background: var(--err-bg);
+  color: var(--err);
+  border-color: var(--err);
+}
+.banner.warn {
+  background: var(--warn-bg);
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.banner.info {
+  background: var(--info-bg);
+}
+.banner.ok {
+  background: var(--ok-bg);
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.badge {
+  display: inline-block;
+  font-family: var(--pixel);
+  font-size: 0.8rem;
+  line-height: 1.4;
+  padding: 0.05rem 0.45rem;
+  border: var(--edge) solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.badge.ok {
+  background: var(--ok-bg);
+  color: var(--ok);
+  border-color: var(--ok);
+}
+.badge.warn {
+  background: var(--warn-bg);
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.badge.err {
+  background: var(--err-bg);
+  color: var(--err);
+  border-color: var(--err);
+}
+.badge.info {
+  background: var(--info-bg);
+  border-color: var(--accent-2);
+  color: var(--text);
+}
+
+meter {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 10px;
+  border: var(--edge) solid var(--border);
+  background: var(--surface-2);
+}
+meter::-webkit-meter-bar {
+  background: var(--surface-2);
+  border: none;
+  border-radius: 0;
+}
+meter::-webkit-meter-optimum-value,
+meter::-webkit-meter-suboptimum-value,
+meter::-webkit-meter-even-less-good-value {
+  background: var(--accent);
+  border-radius: 0;
+}
+meter::-moz-meter-bar {
+  background: var(--accent);
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+th,
+td {
+  text-align: left;
+  padding: 0.4rem 0.6rem;
+  border-bottom: var(--edge) solid var(--border);
+  vertical-align: top;
+}
+th {
+  font-family: var(--pixel);
+  font-weight: 600;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+/* A figure the engine reports, in the product's own face. */
+.figure {
+  font-family: var(--pixel);
+  font-variant-numeric: tabular-nums;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}

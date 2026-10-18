@@ -34,6 +34,11 @@
 #include "bmoe/row_source.h"
 #include "expert_stream_source.h"
 
+namespace bmoe {
+class DeviceExpertArena;
+class DecideProbe;
+} // namespace bmoe
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -81,6 +86,28 @@ public:
     // ahwb exist to prevent. Order is first-seen, so a run is reproducible.
     const std::vector<ggml_tensor *> & captured_weight_objects() const { return captured_weight_objects_; }
 
+    // After capture, the memory module's state tensors the graph read (KV cache, recurrent state):
+    // llama.cpp names them cache_*, and the graph only ever reaches them through views, so they are
+    // found through view_src. A prefill device needs them in memory it can address.
+    const std::vector<ggml_tensor *> & captured_state_objects() const { return captured_state_objects_; }
+
+    // While set, the graph being computed runs on a prefill device fed by `arena`: the hook isolates
+    // each layer's routing node only to pace the arena there, and does nothing else of the streaming
+    // path — the routing lives on the device and the arena, not the streamer, supplies the experts.
+    void set_device_arena(DeviceExpertArena * arena) { device_arena_ = arena; }
+
+    // Experimental decide() probe (decide_probe.h): while it is armed, the routing, weight and layer-output
+    // nodes are offered to it on every graph, host or device. Observes only.
+    void set_probe(DecideProbe * p) { probe_ = p; }
+
+    // After capture, whether the last node of every layer was seen: what paces a dense arena, which
+    // must load a layer's weights before its first node and so waits at the end of the one before.
+    bool learned_layer_ends() const {
+        for (const std::string & n : last_node_)
+            if (n.empty()) return false;
+        return !last_node_.empty();
+    }
+
     // After capture, the subset of those weights the graph only ever GATHERS ROWS from — the shape a
     // token embedding table has, and the one residency policy can exploit (see IRowSource). A name is
     // in this set only if EVERY node that referenced the tensor was a row gather taking it as the
@@ -92,6 +119,13 @@ public:
     // Derived from what the graph did, not from tensor names: no architecture appears in this rule,
     // and a model whose embedding table is multiplied simply never qualifies.
     std::unordered_set<std::string> row_gathered_weights() const;
+
+    // After capture, the weight leaves some node read OTHER than as the matrix of a matmul (src0 of
+    // MUL_MAT / MUL_MAT_ID): a norm's scale, a bias, a per-expert scale broadcast by REPEAT, or any
+    // weight reached through a view or reshape first. A prefill device keeps the rest in its weight
+    // layout; these are plain data every kernel must be able to address (see DeviceExpertArena).
+    // Derived from the graph's ops, so no architecture or tensor name appears in the rule.
+    const std::unordered_set<const ggml_tensor *> & non_matrix_weights() const { return non_matrix_weights_; }
 
     void set_source(IExpertSource * src) { source_ = src; } // non-null → stream mode
 
@@ -203,6 +237,13 @@ public:
     // run, so it cannot ride on begin_trace_batch.
     void set_batch_phase(int phase) { batch_phase_ = phase; }
 
+    // Graph nodes whose output lives in a non-host buffer, i.e. that a device backend computed. The
+    // proof a prefill device ran, as opposed to merely having the weights moved onto it: a backend
+    // allocates the outputs of the ops IT runs in its own compute buffer. Counted only when armed,
+    // since it costs a test per node on every graph.
+    void count_device_nodes(bool on) { count_device_nodes_ = on; }
+    long long device_nodes() const { return device_nodes_; }
+
     long long experts_routed() const { return experts_routed_; }
     long long experts_dropped() const { return experts_dropped_; }
     // Substitution's own ledger. Reranked counts every slot the policy examined (its denominator —
@@ -261,7 +302,14 @@ public:
     std::vector<RouteTraceRow> & trace_rows() { return trace_rows_; }
 
 private:
+    // The eval callback, and the jobs it dispatches to in the order it runs them. Each job is only
+    // reached when its feature is on, so a node no job wants costs the same few tests it always did.
     bool on_eval(ggml_tensor * t, bool ask);
+    void ctrace_observe(const ggml_tensor * t);                 // compute trace, an isolated node
+    void capture_sources(ggml_tensor * t);                      // capture warm-up, every node
+    bool arena_eval(ggml_tensor * t, bool ask, bool probe_ask); // device prefill: the arena's pace
+    void serve_rows(ggml_tensor * t);                           // row-gathered tables, before a node
+    void on_topk(ggml_tensor * t, int il);                      // a routing node, ids materialized
 
     // Row-building state for the layer whose topk we last saw. A layer's weights arrive in a
     // LATER callback than its ids, so its rows can only be built once the whole weight chain has
@@ -295,11 +343,17 @@ private:
     std::unordered_map<std::string, ggml_tensor *> captured_weights_;
     std::vector<ggml_tensor *> captured_weight_objects_; // same leaves, deduplicated by address
     std::unordered_set<const ggml_tensor *> captured_weight_seen_;
+    std::vector<ggml_tensor *> captured_state_objects_;
+    std::unordered_set<const ggml_tensor *> captured_state_seen_;
+    DeviceExpertArena * device_arena_ = nullptr;
+    DecideProbe * probe_ = nullptr;
+    std::vector<std::string> last_node_; // per layer: name of its last node in the capture graph
     // Capture-time evidence for row_gathered_weights(): every weight seen as the TABLE of a row
     // gather, and every weight seen in any way that rules that out. The verdict is the difference.
     std::unordered_set<std::string> row_gathered_;
     std::unordered_set<std::string> row_disqualified_; // non-expert weight leaves (see captured_weights)
-    std::vector<int32_t> gathered_;                    // reused scratch for stream-mode id gather
+    std::unordered_set<const ggml_tensor *> non_matrix_weights_;
+    std::vector<int32_t> gathered_; // reused scratch for stream-mode id gather
 
     // Temporal prefetch: K, and the previous token's routed experts per layer (last-token row
     // during prefill). Empty when prefetch is off or a layer has not been seen yet.
@@ -467,10 +521,10 @@ private:
     // at its topk node undropped, exactly as with the policy off. That costs the first token of a
     // run its dropping and nothing else.
     //
-    // A terminal node is remembered as the INDEX of its name in kWeightNodes, not as the name: the
-    // four chain names are mutually exclusive, so the index identifies it exactly, and recording it
-    // costs neither an allocation nor a string compare on a path that runs for every weight node of
-    // every layer of every token.
+    // A terminal node is remembered as the INDEX of its name in tensor_names::k_weight_nodes, not as
+    // the name: the four chain names are mutually exclusive, so the index identifies it exactly, and
+    // recording it costs neither an allocation nor a string compare on a path that runs for every
+    // weight node of every layer of every token.
     //
     // Once it IS known, only that node is asked for. The rest of the chain exists to identify it,
     // and each extra ask is a graph split plus a compute-thread synchronization — per layer, per
@@ -481,6 +535,8 @@ private:
     bool drop_prefill_ = false;
     int batch_phase_ = 1; // 0 prefill, 1 decode
     long long experts_routed_ = 0, experts_dropped_ = 0;
+    bool count_device_nodes_ = false;
+    long long device_nodes_ = 0;
 
     // Cache-aware substitution. Inert unless sub_lambda_ > 0.
     //

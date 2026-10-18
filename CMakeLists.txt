@@ -18,8 +18,9 @@ cmake_minimum_required(VERSION 3.21)
 
 # The version is declared here and nowhere else in the build: the engine reports it (bmoe-cli
 # --version, and the run-parameter preamble of every metrics CSV), so a committed benchmark file
-# says which engine produced it. Keep it in step with CHANGELOG.md and the app's versionName.
-project(bigmoeonedge VERSION 0.23.0 LANGUAGES CXX)
+# says which engine produced it. Keep it in step with CHANGELOG.md and the app's versionName:
+# scripts/check-version.sh compares the three, in CI and against the tag before a release builds.
+project(bigmoeonedge VERSION 0.30.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,8 +30,16 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# Everything runnable lands beside the libraries it needs. llama.cpp sets this for its own targets
+# but only inside its subdirectory scope, so ours were landing elsewhere - which broke two things
+# that look unrelated and are not. Running a test needed the library directory on PATH by hand; and
+# `ggml_backend_load_all()` looks for dynamically loadable backends NEXT TO THE EXECUTABLE, so a
+# GGML_BACKEND_DL build would have found none of them and reported a machine with no accelerator.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 option(BMOE_BUILD_TESTS "Build byte-identity gates and unit tests" ON)
 option(BMOE_BUILD_CLI   "Build the bmoe-cli host tool"              ON)
+option(BMOE_BUILD_SERVER "Build bmoe-server, the engine behind the local web UI" ON)
 # Off by default: diagnostics, not part of the product. They need no llama.cpp, so they can be
 # configured and cross-compiled on their own without building the engine.
 option(BMOE_BUILD_TOOLS "Build standalone diagnostic tools (bmoe-iobench)" OFF)
@@ -54,14 +63,42 @@ elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/CMakeLists.txt"
     set(LLAMA_BUILD_SERVER  OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_COMMON  ON  CACHE BOOL "" FORCE)
     set(LLAMA_CURL          OFF CACHE BOOL "" FORCE)  # common's model-download path unused
+    # cpp-httplib links whatever OpenSSL the build machine has when this is on, and the release
+    # archives ship no libssl: bmoe-server speaks plain HTTP on loopback, downloads go through
+    # the system curl, so the binary must not depend on a TLS stack (#242).
+    set(LLAMA_OPENSSL       OFF CACHE BOOL "" FORCE)
+    # The prefill-device gate (G16) needs a second device to move weights onto, and the one every
+    # host has is a loopback rpc-server fronting the CPU. A test fixture, not a feature: host test
+    # builds only (releases build without tests), no front-end accepts an RPC endpoint, and it is
+    # not forced: -DGGML_RPC=OFF still wins, and G16 then reports itself skipped.
+    if(BMOE_BUILD_TESTS AND NOT ANDROID)
+        set(GGML_RPC ON CACHE BOOL "ggml: use RPC")
+    endif()
+    # Apple: Metal is in every build. It is what gives the planner a device to measure and
+    # `--prefill-device` one to run on; without it the binary reports a machine with no accelerator,
+    # which on this hardware is never true. Carrying it costs a host-only run nothing, because a
+    # device with nothing placed on it is not handed to llama.cpp (RunConfig::device_use). Said here
+    # rather than left to llama.cpp's own default so that it is this project's decision; not forced,
+    # so -DGGML_METAL=OFF still wins.
+    if(APPLE)
+        set(GGML_METAL ON CACHE BOOL "ggml: use Metal")
+    endif()
     add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL)
-    set(BMOE_LLAMA_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp")
 endif()
 
 add_subdirectory(core)
 
-if(BMOE_BUILD_CLI AND BMOE_HAVE_LLAMA)
+# An app is the only thing that runs on iOS, so there the CLI is built as one: the same main.cpp,
+# inside the harness's bundle, and no command-line binary. BMOE_BUILD_CLI=OFF skips both, which
+# an iOS app embedding bmoe_core needs: it must not configure a second app bundle.
+if(BMOE_BUILD_CLI AND BMOE_HAVE_LLAMA AND IOS)
+    add_subdirectory(examples/ios)
+elseif(BMOE_BUILD_CLI AND BMOE_HAVE_LLAMA)
     add_subdirectory(cli)
+endif()
+
+if(BMOE_BUILD_SERVER AND BMOE_HAVE_LLAMA)
+    add_subdirectory(server)
 endif()
 
 if(BMOE_BUILD_TESTS AND BMOE_HAVE_LLAMA)

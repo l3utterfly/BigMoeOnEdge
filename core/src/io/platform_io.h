@@ -17,7 +17,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <thread>
 #include <vector>
+
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h> // _mm_pause, for cpu_relax
+#endif
 
 namespace bmoe::pio {
 
@@ -51,6 +57,57 @@ uint64_t file_size(fd_t fd);
 // every platform except Apple, where they come apart.
 bool direct_needs_alignment();
 
+// The granule a cache-bypassing read on `fd` must be aligned to - its file offset, its length and
+// its buffer, taken as one value - as the platform states it for the filesystem this file is on.
+// It is a fact about the file, not the platform: one phone formats its data partition with 4 KiB
+// blocks and the next with 16 KiB ones, and O_DIRECT on the second rejects a 4 KiB window. Asked of
+// the descriptor the reads will use, so it answers for the path they actually take:
+//
+//   * Linux/Android: statx(STATX_DIOALIGN), which is the kernel stating exactly this, where the
+//     kernel, the headers and (on Android) the app sandbox all have it; otherwise the filesystem's
+//     fundamental block size. Neither goes below `direct_align_fallback`: a smaller legal granule
+//     is a read-size change that has not been measured, not a correctness gain.
+//   * Apple: the filesystem's fundamental block size. F_NOCACHE imposes no alignment at all (see
+//     direct_needs_alignment), so this is a safe granule to report, not a requirement.
+//   * Windows: the volume's logical sector size and the filesystem's effective physical sector size,
+//     the larger of the two - NO_BUFFERING requires the first and recommends the second for buffers.
+//
+// A power of two, or 0 where the platform does not say; the caller then uses `direct_align_fallback`,
+// and must not report that substitute as a measurement.
+size_t direct_alignment(fd_t fd);
+// What an unprobed file is read at: the block size of every flash and disk this engine has met, and
+// the value every direct read used before the alignment was asked for. A multiple of the 512-byte
+// sector, so it stays correct on storage that wants less.
+constexpr size_t direct_align_fallback = 4096;
+
+// The span two independently written atomics must keep apart so they never share a cache line:
+// 128 bytes on Apple's cores, 64 on x86 and the other arm64 cores this engine has run on. It
+// sizes the padding of the hottest poll in the engine, one flag per expert and projection, so it
+// follows the target rather than taking the widest value everywhere: doubling that array's
+// footprint on a phone is a cost that was not measured. A compile-time value because it sizes
+// `alignas`.
+#if defined(__APPLE__) && defined(__aarch64__)
+constexpr size_t false_sharing_span = 128;
+#else
+constexpr size_t false_sharing_span = 64;
+#endif
+
+// One idle beat of a spin-wait: keep the core out of its siblings' way without entering the
+// scheduler. A pause hint where the ISA has one (single instructions, no syscall); yield elsewhere.
+inline void cpu_relax() {
+#if defined(__aarch64__)
+    __asm__ __volatile__("isb" ::: "memory");
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(_MSC_VER)
+    _mm_pause();
+#else
+    __builtin_ia32_pause();
+#endif
+#else
+    std::this_thread::yield();
+#endif
+}
+
 // Aligned heap allocation for O_DIRECT bounce buffers and shared slots.
 void * alloc_aligned(size_t align, size_t sz);
 void aligned_free(void * p);
@@ -68,8 +125,11 @@ void aligned_free(void * p);
 // mapping, does not occur — and costs a few hundred ms per GiB to allocate. Do not assume the
 // bandwidth result holds on every gralloc; it is one device's.
 //
+// On Darwin it is wired memory: an anonymous mapping the process has locked, granted to any process
+// up to a system-wide total (see lockable_bytes).
+//
 // `pinned_max_bytes()` is the largest single allocation that will succeed: 0 where the platform has
-// no such allocation at all (host builds), and on Android the LOCK boundary rather than the
+// no such allocation at all (Windows and Linux builds), and on Android the LOCK boundary rather than the
 // allocation one — AHardwareBuffer_lock fails with EINVAL at 2^31 bytes even though allocation
 // reaches the 4 GiB format cap, so a larger working set must be split across several buffers.
 struct PinnedAlloc {
@@ -81,10 +141,41 @@ size_t pinned_max_bytes();
 bool pinned_alloc(size_t sz, PinnedAlloc * out);
 void pinned_free(PinnedAlloc * a);
 
+// How much this process may still hold reclaim-exempt in total: `lockable_bytes` through
+// pinned_alloc, `lock_in_place_bytes` through vm_pin. Both are what is LEFT, net of what is already
+// held against the same limit, so they move while the process runs and are read when a plan is
+// made. 0 means the platform grants none; `lock_unbounded` means it publishes no total of its own
+// and the caller must bound it by what the process may hold at all.
+constexpr uint64_t lock_unbounded = ~0ull;
+uint64_t lockable_bytes();
+uint64_t lock_in_place_bytes();
+
+// Run this same executable again as a child, with `args`, and wait at most `timeout_seconds` for
+// it. Its stdout and stderr come back together in `out` (the tail of them, if there is a great
+// deal). This exists for one job: doing something that can end a process - asking a device driver
+// to work - somewhere other than here. A child that outlives its time is killed, and how it ended
+// is reported rather than interpreted.
+//
+// `can_run_self()` is false where this platform has no implementation, and `run_self` then
+// reports CouldNotStart; a caller falls back to doing the work in its own process.
+enum class ChildOutcome { CouldNotStart, Exited, Signalled, TimedOut };
+struct ChildResult {
+    ChildOutcome outcome = ChildOutcome::CouldNotStart;
+    int code = 0; // the exit status, or the signal number
+};
+bool can_run_self();
+ChildResult run_self(const std::vector<std::string> & args, double timeout_seconds, std::string * out);
+
 // Reserved (address-only) region; physical pages appear on commit, vanish on evict.
 size_t vm_page();
 void * vm_reserve(size_t sz);
 bool vm_commit(void * p, size_t sz);
+// Ask the kernel to keep a committed span in RAM: not swapped, not compressed. False where the
+// platform refuses (a locked-memory limit, or no such call), and the span is then ordinary memory.
+// vm_evict releases a pinned span like any other. Whether this is available is the whole
+// difference between platforms: macOS grants it to any process up to most of RAM, Android caps it
+// at 64 KiB, and where it is granted it is what stops a cache hit from paying a decompression.
+bool vm_pin(void * p, size_t sz);
 void vm_evict(void * p, size_t sz);
 void vm_release(void * p, size_t sz);
 
@@ -96,6 +187,14 @@ void vm_release(void * p, size_t sz);
 // resident until reclaim. A no-op where the platform cannot (Windows host: a file view is not
 // VirtualFree-able, and the host build never streams). The range must be page-aligned by the caller.
 void vm_drop_file_pages(void * p, size_t sz);
+
+// Drop the resident pages of an ANONYMOUS range someone else allocated and still owns, keeping the
+// range valid: the next touch maps a zero page instead of faulting. For memory whose contents moved
+// elsewhere but whose allocation cannot be freed from here (a llama.cpp buffer a tensor no longer
+// points at). Unlike vm_evict it never decommits, so a later write by the owner stays legal. A no-op
+// on Windows (MEM_DECOMMIT would make that write fault; nothing moves memory away on the host build).
+// The range must be page-aligned by the caller.
+void vm_drop_anon_pages(void * p, size_t sz);
 
 // Tell the kernel a FILE-BACKED range will be touched at random, so a fault brings in the page that
 // faulted and nothing around it. The default is sequential readahead sized in the hundreds of KiB
@@ -138,6 +237,12 @@ bool file_mapped_regions(const char * basename, std::vector<MappedRegion> & out)
 // size the expert cache to the device (--cache-mb auto); the budget is fixed for the run thereafter.
 uint64_t mem_available_bytes();
 
+// Physical memory this machine has, 0 where it cannot be read. Not a sizing signal on its own -
+// what a process may hold is `mem_available_bytes()` and what it may KEEP is a separate probe - but
+// it bounds both, and it is what a rationale needs to say how much of the machine a plan is asking
+// for. A phone with 12 GB total and 6 GB available is describing two different things.
+uint64_t mem_total_bytes();
+
 // Process-wide compute-decomposition counters, cumulative since process start; the caller deltas
 // them across a single decode to split the per-token "compute" residual into its real causes.
 // Both return 0 when the platform cannot report them (Windows host build), which the metrics treat
@@ -179,6 +284,19 @@ struct DeviceMemory {
     uint64_t available_bytes = 0; // MemAvailable
     uint64_t free_bytes = 0;      // MemFree
     uint64_t swap_free_bytes = 0; // SwapFree
+
+    // What a reclaim could still free by compressing, as two facts. Each is 0 where the machine
+    // does not publish it or the process may not read it, which is "will not say", not "none".
+    //
+    // The anonymous memory nobody has touched lately - the set compressed first. Where the
+    // accounting does not split the inactive list by what backs it, this is that list less every
+    // file-backed page: an under-count on purpose, since the available figure above already holds
+    // the file-backed ones and a page counted in both would be promised twice.
+    uint64_t idle_anon_bytes = 0;
+    // What the in-RAM compressor holds, before and after: their ratio is this machine's own
+    // measurement on its own data, not a figure for a compression algorithm in general.
+    uint64_t compressed_stored_bytes = 0;
+    uint64_t compressed_held_bytes = 0;
 };
 bool device_memory(DeviceMemory * out);
 

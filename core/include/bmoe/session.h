@@ -14,10 +14,13 @@
 // so the CLI and tests link it without pulling in the backend headers.
 #pragma once
 
+#include "bmoe/chat.h"
 #include "bmoe/config.h"
+#include "bmoe/decide.h"
 #include "bmoe/metrics.h"
 #include "bmoe/runtime.h"
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -37,6 +40,7 @@ struct LlamaSessionAccess;
 struct SessionConfig {
     std::string model_path;
     int n_threads = 4;
+    int n_threads_batch = 0; // 0 = same as n_threads. See RunConfig::n_threads_batch.
     int n_ctx = 2048;
     int n_batch = 512; // prefill chunk capacity; longer prompts are prefilled in n_batch slices
     // Widest graph actually computed at once. 0 = follow n_batch. Sizing this down trades prefill
@@ -47,15 +51,21 @@ struct SessionConfig {
     // Active-expert (top-k) override applied at load via a kv_override on the arch-prefixed
     // expert_used_count key. 0 = use the model's own count. See RunConfig::n_expert_used.
     int n_expert_used = 0;
-    // Compute-trace granularity: false = a barrier per graph node, true = per layer boundary.
-    // Only read when a compute-trace sink is attached. See RunConfig::compute_trace_layers.
-    bool compute_trace_layers = false;
+    // The first stage's placement, applied at load. See RunConfig::n_gpu_layers.
+    int n_gpu_layers = 0;
+    std::vector<std::string> buft_overrides;
+    // See RunConfig::device_use.
+    DeviceUse device_use = DeviceUse::Auto;
     SamplingConfig sampling; // fixed for the session; greedy by default (temp <= 0)
     MoeStreamConfig moe;
     // Self-speculative decoding, and which source drafts. Fixed for the session: it decides whether
     // open() builds the wider verify batch, and — for the MTP source only — the draft context.
     // See RunConfig::spec.
     SpecConfig spec;
+    // Wide prefill graphs on an accelerator, decode on the CPU. Fixed for the session: the device
+    // joins the scheduler at load. See RunConfig::prefill.
+    PrefillDeviceConfig prefill;
+    DecideConfig decide; // decide()'s prefix-state policy. See RunConfig::decide.
     // Optional native embedding configuration, defined separately in llama_session.h.
     std::shared_ptr<const LlamaSessionConfig> native;
 };
@@ -98,6 +108,20 @@ struct GenerateRequest {
     // default output, and every benchmark run) does not, and should turn it off. Default on so an
     // embedder that does not know about this flag keeps the old behaviour.
     bool render_text = true;
+
+    // The whole conversation, for a front-end that keeps its own record of it (a chat protocol
+    // whose client resends the history on every request, an edited or regenerated turn). When
+    // non-empty it REPLACES the engine-held conversation and `prompt` is not read: the last message
+    // is the one being answered. The KV is not dropped for it - with clear_kv=false the tokens
+    // still matching what the context holds are kept and only the rest is prefilled, so resending
+    // the conversation the session already has costs the new turn alone, and a different one
+    // prefills from its first differing token. Chat mode only.
+    std::vector<ChatMessage> messages;
+    // Functions the model may call this turn, described to it by its own chat template; the calls
+    // come back in RunResult::tool_calls. Read only with `messages`: a tool's answer is a message.
+    std::vector<ChatTool> tools;
+    ToolChoice tool_choice = ToolChoice::Auto;
+
     // Optional embedding hooks. Sampling receives the logits row; it must also accept
     // its chosen token. Custom sampling cannot be combined with speculative decoding.
     std::function<int32_t(int)> sample_token;
@@ -219,6 +243,13 @@ public:
 
     // Score a fixed text under teacher forcing. Clears the KV; leaves no conversation state behind.
     PplResult perplexity(const PplRequest & req);
+
+    // Read one decision (bmoe/decide.h): which of req.choices the model would answer next, from a
+    // single prefill and no decode. Ends any conversation generate() was continuing — a decision is
+    // not a turn — and keeps only the prefix state, which the next decide() may restore.
+    // cancel() stops it between prefill chunks. Refused (not fatal) unless the session was opened
+    // with SessionConfig::decide.enabled.
+    DecideResult decide(const DecideRequest & req);
 
 private:
     friend struct LlamaSessionAccess;

@@ -77,8 +77,12 @@ BMOE_PROGRESS {"step":<int>,"steps":<int>,"wall_ms":<float>,"io_ms":<float>,
   CPU is large enough to matter: compute + flash wait + mgmt can exceed `wall_ms`, and the panel
   clamps the unattributed remainder at 0 in that case instead of displaying the overlap.
   **Flash wait** = `io_ms` (serial) / `stall_ms` (overlap) read as
-  measured in both the live and the end-of-run summary views (`io_s_tok` / `stall_s_tok` in
-  `BMOE_DONE`), **cache mgmt** = `mgmt_ms`, and **unattributed** = the non-negative wall-time
+  measured in both the live and the end-of-run summary views; it arrives already chosen, as
+  `flash_wait_s_tok` in `BMOE_DONE` and in `bmoe-server`'s summary and as `flash_wait_ms` on each of
+  the server's token events, so a UI need not know the mode
+  ([server-api.md](server-api.md#live-events)). The compute bar divides by the session's compute
+  threads and the CPU-busy diagnostic by its busy threads, which the server reports with the loaded
+  model (`compute_threads`, `busy_threads`). **Cache mgmt** = `mgmt_ms`, and **unattributed** = the non-negative wall-time
   remainder — the off-CPU time (zram swap-in, preemption, frequency caps) the residual used to
   paint as compute. The bars are deliberately not rescaled to total 100 %: measurement noise is
   preferred to a fabricated normalization. The CPU-busy diagnostic keeps its own denominator —
@@ -292,6 +296,8 @@ effective top-k after any override. Fields to read carefully:
   number looks against `cache_min_mb`. The engine warns once at load when that is the case. See
   [cache-sizing.md](cache-sizing.md).
 - `predict_log=1`, `prefetch_sync=1` or `compute_trace_layers>0` mean **the run was instrumented**.
+  `compute_trace_layers` is read from the compute trace attached to the session (`1` for
+  `--compute-trace-layers`), so it is `0` on a run with no compute trace at all.
   A probed or traced run is not a benchmark run — see the warning under [Decode
   traces](#decode-traces).
 - `temp>0` means the run was **stochastic**: not comparable token-for-token with a greedy one, and
@@ -359,13 +365,20 @@ units as the `BMOE_DONE` keys of those names (see the protocol notes above), app
 existing readers ignore them. A recorded run can now answer "what did the prompt cost, and in
 what" without the protocol line.
 
+With `--prefill-device`, four more: `prefill_dev_tokens=<int>` (prompt tokens whose graph ran on the
+device), `prefill_dev_nodes=<int>` (graph nodes the device actually computed, i.e. whose output
+landed in a device buffer: the proof it ran, where the token count only says the weights were moved),
+`prefill_dev_read_mib=<f>` (experts the device arena read from flash) and `prefill_dev_stall_s=<s>`
+(wall time the device graph waited at a layer for the arena). All zero when the device is off; the
+last two also without streaming, where there is no arena. Same names in `BMOE_DONE`.
+
 The trailing block is the memory picture, added so a run can be diagnosed from its own file:
 
 | column | meaning |
 | --- | --- |
 | `turn` | which `generate()` this token belongs to (0 for a one-shot run). A session CSV spans every turn; without this the two-turn shape — a fast turn, an idle, then the turn that pays for it — is unreadable. |
 | `majflt_mib` | what those faults moved: `majflt` x page size. The same fact as the count, in the unit the rest of the row uses — directly comparable to `read_bytes`, i.e. the reads we chose against the reads the kernel forced on us. |
-| `cache_budget_mib` | the expert-cache budget in effect. Fixed for the run now (an explicit `--cache-mb`, or what `auto` sized to once at load) — the runtime governor that moved it is retired. |
+| `cache_budget_mib` | the expert-cache budget in effect. Fixed for the run (an explicit `--cache-mb`, or what `auto` sized to once at load) — the runtime governor that moved it is retired — with one exception: where the platform grants locks and stops part way, the budget shrinks once to what was locked, never under one token cycle, and `cache_resizes` counts it. |
 | `rss_anon_mib` | resident anonymous memory — **the expert cache lives here** (and, under `--dense-weights anon`, the dense buffers). Falling while `cache_budget_mib` stays put means the kernel is taking it. |
 | `rss_file_mib` | resident file-backed memory — the mmap'd model. Reclaimed by being dropped, not swapped, so it never shows in `swap_mib`. |
 | `dense_resident_frac` | fraction of the DENSE (non-expert) weights still in RAM, by `mincore` (throttled). Under `--dense-weights anon` it samples our own buffers — is zram holding them? Under mmap/warm the model's VMAs (`/proc/self/maps`) — is the kernel dropping the model? Read with `majflt`. `-1` when unmeasured. |
@@ -491,6 +504,8 @@ Requests (stdin):
 
 ```
 {"cmd":"generate","id":<int>,"prompt":"<string>","n_predict":<int>,"think":<bool>,"clear_kv":<bool>}
+{"cmd":"decide","id":<int>,"prefix":"<string>","suffix":"<string>","choices":["<string>",...],
+ "reuse_prefix":<bool>}   # needs --decide; always rendered with reasoning off; see decide.md
 {"cmd":"cancel"}          # interrupt the in-flight generation; the session stays loaded
 {"cmd":"close"}           # end the session (EOF on stdin does the same)
 ```
@@ -512,14 +527,44 @@ BMOE_DONE  {"id":<int>,"cancelled":<bool>,"tokens":<int>,"tok_s":<float>,
             "prefill_s":<float>,"prefill_tps":<float>,"load_s":<float>,"cache_hit_pct":<float>,
             "n_prompt":<int>,"n_past":<int>,"compute_s_tok":<float>,"io_s_tok":<float>,
             "cache_resident_mib":<float>,"cache_budget_mib":<float>,"read_mib":<float>,
-            "stall_s_tok":<float>,"mgmt_s_tok":<float>,"majflt_tok":<float>,"cpu_s_tok":<float>,
+            "stall_s_tok":<float>,"flash_wait_s_tok":<float>,"mgmt_s_tok":<float>,
+            "majflt_tok":<float>,"cpu_s_tok":<float>,
             "prefill_cpu_s":<float>,"prefill_read_mib":<float>,"prefill_io_s":<float>,
             "prefill_stall_s":<float>,"prefill_mgmt_s":<float>,
+            "prefill_dev_tokens":<int>,"prefill_dev_nodes":<int>,"prefill_dev_read_mib":<float>,
+            "prefill_dev_stall_s":<float>,
             "token_demand_mib":<float>,"mtp_drafted":<int>,"mtp_accepted":<int>,"mtp_decodes":<int>,
             "mtp_draft_s_tok":<float>,"drafted_steps":<int>,"loop_overhead_s_tok":<float>,
             "reasoning":"<string>","text":"<string>"}
-BMOE_ERROR {"id":<int>,"fatal":<bool>,"msg":"<string>"}
+BMOE_DECIDE {"id":<int>,"cancelled":<bool>,"best":<int>,"choice_logp":[<float|null>,...],
+             "n_tokens":<int>,"n_reused":<int>,"n_prefilled":<int>,"restore_s":<float>,
+             "store_s":<float>,"prefill_s":<float>,"prefill_cpu_s":<float>,"prefill_read_mib":<float>,
+             "prefill_io_s":<float>,"prefill_stall_s":<float>,"prefill_mgmt_s":<float>,
+             "prefill_dev_tokens":<int>,"prefill_dev_read_mib":<float>,"prefill_dev_stall_s":<float>,
+             "prefill_dev_routed":<int>,"prefill_dev_demand":<int>,"prefix_state_mib":<float>}
+BMOE_ERROR {"id":<int>,"fatal":<bool>,"code":"<string>","msg":"<string>"}
 ```
+
+`BMOE_ERROR`'s `code` is what a client decides on, `msg` is for a person and may change. The codes
+are the engine's failure kinds (`core/include/bmoe/run_error.h`): `context_full` (the conversation
+leaves no room in `n_ctx`), `empty_prompt`, `template_rejected` (the chat template refused the
+message list), `needs_chat_mode` (a message list to a session opened without the chat template),
+`invalid_request` (a malformed decide request, or decide off) and `failed` (a load, decode or
+expert-stream failure). Every code but `failed` comes with `fatal:false`.
+
+A `decide` request is answered by `BMOE_BEGIN` and then one `BMOE_DECIDE` line, with no per-token
+lines in between: nothing is decoded ([decide.md](decide.md)). `choice_logp[i]` is the log-probability
+of the first token of `choices[i]` over the whole vocabulary, in request order, and `null` where it
+is minus infinity. `best` is the index of the highest. `n_reused` tokens were restored from the kept
+prefix state and `n_prefilled` were prefilled; the `prefill_*` keys read exactly as `BMOE_DONE`'s.
+`prefill_dev_tokens` is how many of the prefilled tokens ran on the prefill device (`0` without
+`--prefill-device`); `prefill_dev_read_mib` and `prefill_dev_stall_s` are its expert arena's reads and
+the time the graph waited on them, as in `BMOE_DONE` and apart from the streamer's `prefill_read_mib`.
+In routed mode (the default), `prefill_dev_routed` counts the (layer, expert) pairs the prefill routed to
+and `prefill_dev_demand` those the prediction missed and the arena read at the routing node (both `0`
+with `--no-prefill-routed`). `prefix_state_mib` is the memory the kept state holds after the call. There is
+no `think` key: a decision is always rendered with reasoning off. `reuse_prefix` defaults to `true`. Colliding choices (two sharing a first token), no choices, a prompt past
+`n_ctx`, or a session opened without `--decide` answer `BMOE_ERROR` with `fatal:false`.
 
 `BMOE_DONE`'s `mtp_*` keys are the self-speculation counters (all `0` without speculation, and the
 same keys whichever source drafted): `mtp_accepted / mtp_drafted` is the acceptance on that turn,
@@ -577,9 +622,12 @@ context is. `prefill_tps` is the prompt prefill rate; `compute_s_tok`/`io_s_tok`
 AVERAGES over the run (so a UI can show an average compute-vs-I/O split, not just the last token).
 `cache_resident_mib`/`cache_budget_mib` track the fixed cache, `read_mib` is the
 total flash streamed this generation, and `stall_s_tok`/`mgmt_s_tok` the per-token overlap stall and
-cache-management cost. `text` is the final answer and `reasoning` the final thinking span (empty
+cache-management cost. `flash_wait_s_tok` is the flash term that adds to wall time, already chosen
+for the run's mode (`io_s_tok` serial, `stall_s_tok` under overlap), so a client need not know the mode. `text` is the final answer and `reasoning` the final thinking span (empty
 unless the model reasoned), same split as the per-token lines. `BMOE_ERROR` with `fatal:false` is a rejected
-request (e.g. the prompt plus `n_predict` exceeds `n_ctx`) and leaves the session usable;
+request (e.g. `code:"context_full"`, a conversation that leaves no room in `n_ctx`: `n_predict` is a
+ceiling, cut to the room the prompt leaves, so only a prompt that fills the context is refused) and
+leaves the session usable;
 `fatal:true` means the process is ending.
 
 ## Decode traces

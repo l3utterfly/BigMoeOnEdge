@@ -35,6 +35,17 @@ warming the cache changes latency, never the bytes.
   With chat mode off, the caller supplies the complete formatted transcript; the same
   prefix comparison reuses its KV without rendering a second chat template.
 
+**A conversation handed over whole.** A front-end that keeps its own record of a chat - a protocol
+whose client resends the history on every request, an edited or regenerated turn - sets
+`GenerateRequest::messages` instead of `prompt`. The list replaces the engine-held conversation and
+its last message is the one answered; with `clear_kv = false` the KV is kept and reused by the
+prefix rule below, so resending what the session already holds costs only the new turn. A turn that
+fails or is cancelled puts the previous conversation back. `GenerateRequest::tools` and
+`tool_choice` describe functions the model may call: they are rendered by the model's own chat
+template and the calls come back in `RunResult::tool_calls`, parsed by llama.cpp's chat layer
+(`core/src/engine/chat_messages.h` is the one adapter between `bmoe/chat.h` and that layer). The
+calls are not grammar-constrained.
+
 **KV prefix reuse.** Re-rendering the full history would re-tokenize the entire conversation, but
 most of it is already decoded into the KV. Each turn the engine diffs the freshly rendered tokens
 against `kv_tokens` (the tokens currently in the KV, in order), keeps the common prefix, removes the
@@ -82,7 +93,8 @@ The optional `bmoe/llama_session.h` adapter exposes a borrowed context for an
 embedding host's sampler and raw-prompt sequence-cache save/restore. Set
 `SessionConfig::native->backend_initialized` when the host owns backend lifetime,
 and use `configure_context` for KV types or attention options. Model loading still
-enforces CPU, mmap, and no repacking. Context/batch sizes remain in `SessionConfig`.
+enforces mmap and no repacking, and devices still follow `SessionConfig`. Context/batch
+sizes remain in `SessionConfig`.
 
 `GenerateRequest::sample_token` replaces sampling and accepts a logits-row index;
 the host must sample and accept the returned token using the borrowed context.
@@ -91,7 +103,8 @@ prefill chunks; `should_stop` can also run from the CPU abort callback and must 
 throw. These callbacks are borrowed only for the duration of `generate()`.
 `stop_generation` is checked after token delivery and ends normally without a
 cancel rollback, allowing the host to implement stop strings. Raw-prompt cache
-restore replaces the current KV, and a failed restore clears it. Token IDs/cache
+restore replaces the current KV, and a failed restore clears it. Both are refused with a
+prefill device, whose moved model state llama.cpp's sequence save does not follow. Token IDs/cache
 files are model and context specific. Never use the borrowed context or cache
 operations concurrently with generation.
 

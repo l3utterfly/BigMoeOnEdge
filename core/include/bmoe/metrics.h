@@ -9,6 +9,7 @@
 #include "bmoe/predict_stats.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,11 @@ struct TokenMetrics {
     double mgmt_ms = 0.0;    // cache-management time (vm commit + evict + LRU bookkeeping) this token
     double compute_ms = 0.0; // residual: serial wall - io - mgmt; overlap wall - stall - mgmt
     double stall_ms = 0.0;   // overlap only: wall time the FFN kernel blocked on flash (0 when serial)
+    // The flash term that is a share of wall_ms, already chosen for the run's mode: io_ms in serial
+    // (the blocking read), stall_ms under overlap (where io_ms is summed lane time and can exceed the
+    // wall). The term the compute residual subtracts, so a consumer never has to know the mode to
+    // pick it, and never recovers it by inverting the clamped residual. 0 when streaming is off.
+    double flash_wait_ms = 0.0;
     // Named eval-thread costs that otherwise hide inside a residual (all 0 when the feature that
     // pays them is off). drain_ms sits inside compute_ms: the async load waiting out the previous
     // layer's batch before reusing its flags. adopt_ms sits inside mgmt_ms: the route-ahead load
@@ -105,6 +111,9 @@ struct RunSummary {
     std::string arch;
 
     int n_generated = 0;
+    // The answer's budget this turn: the request's n_predict, or less when the context had less
+    // room left after the prompt. A run that generated this many tokens stopped on its budget.
+    int n_predict = 0;
     double gen_seconds = 0.0;
     double s_per_token = 0.0;
     double tokens_per_second = 0.0;
@@ -131,6 +140,17 @@ struct RunSummary {
     double prefill_io_seconds = 0.0;
     double prefill_stall_seconds = 0.0;
     double prefill_mgmt_seconds = 0.0;
+    // Of n_prompt, the tokens whose prefill graph ran on the prefill device (RunConfig::prefill).
+    // Zero when that is off, and for a prompt too short to reach it. What proves the device ran.
+    int prefill_device_tokens = 0;
+    // Graph nodes a device backend computed during this turn's prefill: the proof the device RAN,
+    // where prefill_device_tokens only says the weights were moved there. Zero when that is off.
+    long long prefill_device_nodes = 0;
+    // With streaming, the experts the device prefill read through its arena, and the wall time the
+    // graph waited at a layer for them: the flash half of a device prefill, which the streamer's
+    // own prefill_read_mib/prefill_stall_seconds above do not see. Zero without an arena.
+    double prefill_device_read_mib = 0.0;
+    double prefill_device_stall_seconds = 0.0;
 
     // MoE streaming totals (zero when streaming is off)
     double moe_read_mib = 0.0;
@@ -139,7 +159,10 @@ struct RunSummary {
     double moe_io_s_per_token = 0.0;
     double moe_mgmt_s_per_token = 0.0;  // cache-management time per token (commit + evict + LRU)
     double moe_stall_s_per_token = 0.0; // overlap only: per-token wall the kernel waited on flash
-    double cache_hit_pct = -1.0;        // -1 when no cache
+    // Per token, the wall-additive flash term (TokenMetrics::flash_wait_ms): io in serial, stall
+    // under overlap.
+    double moe_flash_wait_s_per_token = 0.0;
+    double cache_hit_pct = -1.0; // -1 when no cache
 
     // Compute decomposition, generation phase only (measured whether or not streaming is on, since
     // dense-weight faults appear in the mmap baseline too). majflt_per_token ≫ 0 flags a residency
@@ -153,7 +176,8 @@ struct RunSummary {
     double loop_overhead_s_per_token = 0.0;
     double cache_resident_mib = 0.0;
     double cache_budget_mib = 0.0; // the fixed cache budget the run used (explicit, or auto-sized at load)
-    long long cache_resizes = 0;   // runtime budget changes — now only an app's explicit set_cache_budget
+    long long cache_resizes =
+        0; // runtime budget changes: an app's explicit set_cache_budget, or a pin refused part way
     // Cache churn (see IExpertSource::Stats): entries the budget forced out, and reads that went
     // to an entry the cache had held before. Any prefetch that raises the byte count while
     // claiming its reads are useful is doing it here.
@@ -361,6 +385,6 @@ public:
 
 // A sink that appends one CSV row per token to `path` (header written on open).
 // Returns nullptr if the file cannot be opened.
-IMetricsSink * make_csv_metrics_sink(const std::string & path);
+std::unique_ptr<IMetricsSink> make_csv_metrics_sink(const std::string & path);
 
 } // namespace bmoe
