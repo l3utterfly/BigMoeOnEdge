@@ -8,9 +8,9 @@ namespace bmoe::detail {
 
 common_chat_parser_params build_parse_params(const common_chat_params & cp) {
     common_chat_parser_params pp(cp);
-    // The converting constructor drops the grammar; load it so the parser can actually match.
-    pp.parser.load(cp.parser);
-    pp.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    // The converting constructor drops the parser arena; copy it so the parser can actually match.
+    // Reasoning is always split out: llama.cpp no longer has a per-parse reasoning format.
+    pp.parser = cp.parser;
     return pp;
 }
 
