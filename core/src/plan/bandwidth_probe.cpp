@@ -19,9 +19,9 @@
 // sweep below answered 2 on a phone whose engine is 58% faster at 4.
 //
 // On the agreement test: cross-backend float reductions do not associate in the same order, so
-// bit-equality is the wrong gate — a correct kernel fails it. The gate is a tight relative
-// tolerance, which a correct kernel passes comfortably and a wrong one misses by orders of
-// magnitude.
+// bit-equality is the wrong gate — a correct kernel fails it. The gate is the one llama.cpp
+// applies to its own matmul kernels, so a device its tests pass is not refused here, and a wrong
+// kernel still misses it by orders of magnitude.
 //
 // Bounded by construction: a buffer sized to outrun any last-level cache and nothing more, a few
 // repetitions, everything released before returning. Where a backend will not allocate or will not
@@ -29,6 +29,9 @@
 // assuming. A zero here is "unmeasured", and it is never to be read as "slow".
 
 #include "bmoe/probe.h"
+
+#include "../io/platform_io.h"
+#include "layer_probe.h"
 
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -55,17 +58,6 @@ namespace {
 constexpr int64_t k_rows = 16384;
 constexpr int64_t k_cols = 4096;
 
-// How long one sample must last, and the cap that keeps a slow device from turning a probe into a
-// benchmark. Sized by DURATION rather than by a repetition count, for the same reason the storage
-// probe is sized by bytes: a fixed count makes the sample shorter as the machine gets faster, and a
-// 4096x4096 Q4_K weight is about 9 MB, so four repetitions is 38 MB - two milliseconds on a phone.
-// A two-millisecond sample on a general-purpose OS reports scheduling noise, and this sample decides
-// the thread count: the ladder takes a rung only if it beats the incumbent by 2%, so noise at that
-// scale made the same binary answer 1, 1, 4 across three runs of the same model. One thread is
-// worth about half this device's throughput.
-constexpr double k_sample_seconds = 0.15;
-constexpr int k_reps_max = 512;
-
 // The second instrument: the same matmul, many tokens wide. A one-token graph is bound by how fast
 // weights can be READ, which is why the figure above is a bandwidth; a wide one multiplies every
 // weight by a whole batch, so it is bound by how fast the engine can COMPUTE, and the two rank
@@ -77,7 +69,7 @@ constexpr int k_reps_max = 512;
 // sits inside the regime it speaks for. The weight is smaller than the bandwidth probe's on
 // purpose: nothing here depends on outrunning a cache, and at the full size a slow machine would
 // spend seconds on a probe.
-constexpr int64_t k_wide_batch = 128;
+constexpr int64_t k_wide_batch = detail::k_wide_batch;
 constexpr int64_t k_wide_rows = 4096;
 
 // The weight type to measure with. The model's own where it has one; falling back to F32 makes the
@@ -122,16 +114,30 @@ bool build_probe(Probe & p, ggml_type wtype, int64_t rows = k_rows, int64_t batc
     const size_t row_bytes = ggml_row_size(wtype, p.cols);
     if (row_bytes == 0) return false;
 
-    std::vector<float> src((size_t) (p.cols * p.rows));
-    for (size_t i = 0; i < src.size(); ++i)
-        src[i] = std::sin((float) (i % 1024) * 0.017f) * 0.5f;
+    // Every row is the same row, so one is encoded and copied down the matrix. The grid formats
+    // search a codebook per block: encoding all 16384 rows took 13-16 s of a laptop core for the
+    // 2- and 3-bit IQ types, paid before every `--auto` run, for bytes identical to the copies.
+    // What the probe measures is reading them, and a copy is read exactly like the original.
+    std::vector<float> src((size_t) p.cols);
+    for (size_t c = 0; c < src.size(); ++c)
+        src[c] = std::sin((float) (c % 1024) * 0.017f) * 0.5f;
+
+    // Some formats (the 1- and 2-bit IQ grids) cannot be encoded without per-column importance, and
+    // ggml asserts rather than declines when it is missing. These bytes are synthetic, so every
+    // column matters equally: a uniform importance is the honest answer, and the kernel the probe
+    // then times is exactly the one the model's own tensors run. Asked of ggml, not listed here.
+    std::vector<float> importance;
+    if (ggml_quantize_requires_imatrix(wtype)) importance.assign((size_t) p.cols, 1.0f);
 
     p.weight.resize(row_bytes * (size_t) p.rows);
     if (wtype == GGML_TYPE_F32) {
-        std::memcpy(p.weight.data(), src.data(), p.weight.size());
-    } else if (ggml_quantize_chunk(wtype, src.data(), p.weight.data(), 0, p.rows, p.cols, nullptr) == 0) {
+        std::memcpy(p.weight.data(), src.data(), row_bytes);
+    } else if (ggml_quantize_chunk(wtype, src.data(), p.weight.data(), 0, 1, p.cols,
+                                   importance.empty() ? nullptr : importance.data()) == 0) {
         return false;
     }
+    for (int64_t r = 1; r < p.rows; ++r)
+        std::memcpy(p.weight.data() + (size_t) r * row_bytes, p.weight.data(), row_bytes);
 
     // Every column differs from its neighbours, so a kernel that computed one token and repeated
     // it across the batch cannot agree with the reference.
@@ -202,8 +208,9 @@ RunResult run_gemv(ggml_backend_dev_t dev, const Probe & p, int n_threads, bool 
             // Our memory, handed to the device. If it really honours host pointers, the graph below
             // reads the values we wrote here without any copy — exactly what the streamer needs in
             // order to rebind a tensor onto a slice it just read from flash.
-            host_copy = p.weight;
-            host_buf = ggml_backend_dev_buffer_from_host_ptr(dev, host_copy.data(), host_copy.size(), 0);
+            host_copy.assign(p.weight.size() + pio::tensor_tail_slack(), 0); // readable past the last block
+            std::memcpy(host_copy.data(), p.weight.data(), p.weight.size());
+            host_buf = ggml_backend_dev_buffer_from_host_ptr(dev, host_copy.data(), p.weight.size(), 0);
             if (host_buf) {
                 w->buffer = host_buf;
                 w->data = host_copy.data();
@@ -230,11 +237,11 @@ RunResult run_gemv(ggml_backend_dev_t dev, const Probe & p, int n_threads, bool 
                 // times. The clock is read each pass rather than a rep count computed up front,
                 // because the rate this is trying to measure is the very thing such a count would
                 // have to assume.
-                while (all_ok && reps < k_reps_max) {
+                while (all_ok && reps < detail::k_reps_max) {
                     all_ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
                     ++reps;
                     if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() >=
-                        k_sample_seconds)
+                        detail::k_sample_seconds)
                         break;
                 }
                 ggml_backend_synchronize(backend);
@@ -262,25 +269,20 @@ RunResult run_gemv(ggml_backend_dev_t dev, const Probe & p, int n_threads, bool 
 
 // Agreement, not bit-equality. See the file header.
 //
-// The bound sits between two populations that are far apart, and it used to sit inside the first.
-// Correct kernels disagree with the host by what their arithmetic differs in - the host multiplies
-// a quantized weight by an activation it has itself quantized, a device typically by the float -
-// and that is measured at 4e-5 on one 4-bit type, 1.9e-4 on a 2-bit one and 3e-4 to 4e-4 at prefill
-// width. A wrong kernel is off by the size of the answer. At 1e-4 the 2-bit type and every wide
-// result were being reported as wrong, which is a tolerance describing one quantization rather
-// than a device. A hundredth is still two orders below "wrong".
-constexpr double k_agreement = 1e-2;
-bool agrees(const std::vector<float> & a, const std::vector<float> & b) {
-    if (a.size() != b.size() || a.empty()) return false;
-    double num = 0, den = 0;
-    for (size_t i = 0; i < a.size(); ++i) {
-        const double d = (double) a[i] - (double) b[i];
-        num += d * d;
-        den += (double) a[i] * (double) a[i];
-    }
-    if (den <= 0) return false;
-    return std::sqrt(num / den) < k_agreement;
-}
+// The measure and the bound are llama.cpp's: normalized mean squared error, sum((a-b)^2) /
+// sum(a^2), against the 5e-4 that tests/test-backend-ops.cpp allows a MUL_MAT. This planner does
+// not decide what precision a backend's kernels should have - upstream does, for every backend it
+// ships - so a stricter private bound only refuses devices llama.cpp considers correct.
+//
+// It did. Correct kernels differ from the host by what their arithmetic differs in - the host
+// multiplies a quantized weight by an activation it has itself quantized, a device typically by
+// the float - measured in this unit at 1.6e-9 on a 4-bit type and 3.6e-8 on a 2-bit one at one
+// token, 0.9e-7 to 1.6e-7 at prefill width. A prefill-width shader that accumulates in half
+// precision sits much higher: an iGPU's Vulkan measured 4.4e-4 (2.1% RMS, every output on the
+// half-precision grid). The previous bound, 1e-4 in this unit, refused it, and both of a phone's
+// GPU backends with it, though upstream's own test passes them. A wrong kernel is still off by the
+// size of the answer, an NMSE near 1.
+using detail::agrees;
 
 } // namespace
 
@@ -360,8 +362,13 @@ void probe_bandwidth(HardwareProfile & hw, const ModelProfile & model) {
     // one-token result: a device that lost there is measured here all the same, because losing
     // there says nothing about here. A device that will not run the wide graph keeps its
     // unmeasured 0 and its Unknown, and no rule arms it.
+    //
+    // The model's own layer answers this, at the prompt's own per-expert batch (layer_probe.cpp),
+    // and decides identity at decode width on its real kernels too. The synthetic matmul below is
+    // what a model whose layer cannot be read is measured with, as before.
+    const bool real_layer = detail::probe_real_layer(hw, model);
     Probe wide;
-    if (build_probe(wide, probe.type, k_wide_rows, k_wide_batch)) {
+    if (!real_layer && build_probe(wide, probe.type, k_wide_rows, k_wide_batch)) {
         std::vector<float> wide_ref;
         for (ComputeDevice & d : hw.devices) {
             if (!d.is_cpu) continue;
@@ -377,7 +384,7 @@ void probe_bandwidth(HardwareProfile & hw, const ModelProfile & model) {
             break;
         }
         for (ComputeDevice & d : hw.devices) {
-            if (d.is_cpu || d.is_host_helper || !d.probe_here() || wide_ref.empty()) continue;
+            if (d.is_cpu || !d.probe_here() || wide_ref.empty()) continue;
             ggml_backend_dev_t dev = ggml_backend_dev_by_name(d.name.c_str());
             if (!dev) continue;
             if (d.has_own_memory() && d.memory_free && d.memory_free < (uint64_t) wide.weight.size() * 4) continue;

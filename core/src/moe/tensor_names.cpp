@@ -12,6 +12,9 @@ constexpr std::string_view k_weight_tail = ".weight";
 // expert projection layout the loader knows.
 constexpr std::string_view k_override_head = "blk\\.";
 constexpr std::string_view k_override_tail = "\\.ffn_(up|down|gate_up|gate)_(ch|)exps";
+// What every per-layer FFN pattern of the fitter's starts with after the index: the whole FFN, a
+// share of it, or the experts alone.
+constexpr std::string_view k_ffn_tail = "\\.ffn_";
 
 // A layer index past this is a runaway digit run, not a layer.
 constexpr int k_layer_max = 1 << 20;
@@ -51,20 +54,14 @@ int block_layer(const char * name, const char ** rest) {
     return il;
 }
 
-int expert_slot(const char * name, const MoeRecipe & recipe, int & il_out) {
+std::string_view weight_suffix(const char * name, int & il_out) {
     const char * rest = nullptr;
     const int il = block_layer(name, &rest);
-    if (il < 0) return -1;
-    for (int p = 0; p < MoeRecipe::max_exps; ++p) {
-        const char * suffix = recipe.exps_suffix[p];
-        if (!suffix) continue; // unused slot (fewer than max_exps expert tensors)
-        const size_t sl = std::strlen(suffix);
-        if (std::strncmp(rest, suffix, sl) == 0 && k_weight_tail == rest + sl) {
-            il_out = il;
-            return p;
-        }
-    }
-    return -1;
+    if (il < 0) return {};
+    const size_t len = std::strlen(rest);
+    if (len <= k_weight_tail.size() || k_weight_tail != rest + (len - k_weight_tail.size())) return {};
+    il_out = il;
+    return std::string_view(rest, len - k_weight_tail.size());
 }
 
 int node_layer(const char * name, std::string_view prefix) {
@@ -100,6 +97,16 @@ int expert_override_layer(const char * pattern) {
         const char * end = nullptr;
         const int il = leading_layer(at + k_override_head.size(), &end);
         if (il >= 0 && starts_with(end, k_override_tail)) return il;
+    }
+    return -1;
+}
+
+int ffn_override_layer(const char * pattern) {
+    for (const char * at = std::strstr(pattern, k_override_head.data()); at;
+         at = std::strstr(at + 1, k_override_head.data())) {
+        const char * end = nullptr;
+        const int il = leading_layer(at + k_override_head.size(), &end);
+        if (il >= 0 && starts_with(end, k_ffn_tail)) return il;
     }
     return -1;
 }

@@ -3,13 +3,28 @@ import { SseParser, isDoneSentinel } from './sse';
 import type { SseEvent } from './sse';
 import { auth } from './auth';
 import { parseChunk } from './chatStream';
-import { isConfig, isDecideResult, isInfo, isModelsResponse, isParamSpecList, isPlan } from './guards';
+import {
+  isConfig,
+  isDecideResult,
+  isHfAdded,
+  isHfFacts,
+  isHfModelsResponse,
+  isHfSearchResponse,
+  isInfo,
+  isModelsResponse,
+  isParamSpecList,
+  isPlan,
+} from './guards';
 import type {
   ChatChunk,
   ChatMessage,
   Config,
   ConfigUpdate,
   DecideResult,
+  HfAdded,
+  HfFacts,
+  HfModelsResponse,
+  HfSearchResponse,
   Info,
   ModelsResponse,
   ParamSpec,
@@ -22,6 +37,8 @@ export const CODE_CONTEXT_FULL = 'context_full';
 export const CODE_NO_MODEL = 'no_model';
 /** This client's own code for an answer that is not the documented shape (never sent by a server). */
 export const CODE_BAD_RESPONSE = 'bad_response';
+/** The text was not a repository id or URL: the UI searches for it instead. */
+export const CODE_NOT_A_REPO = 'not_a_repo';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -61,14 +78,14 @@ async function errorFrom(res: Response): Promise<ApiError> {
 
 // A 401 means the server wants a key this page has not got (or has got wrong): the app asks for
 // one. Every call reports it the same way, so no caller has to.
-async function failed(res: Response): Promise<ApiError> {
+export async function failed(res: Response): Promise<ApiError> {
   if (res.status === 401) auth.unauthorized();
   return errorFrom(res);
 }
 
 // `guard` checks the parts of the answer the UI reads; an answer that fails it is an error here,
 // not an undefined later. Writes whose answer nobody reads have none.
-async function request<T>(method: string, path: string, body?: unknown, guard?: (v: unknown) => v is T): Promise<T> {
+export async function request<T>(method: string, path: string, body?: unknown, guard?: (v: unknown) => v is T): Promise<T> {
   const headers: Record<string, string> = auth.headers();
   // Every write says it is JSON, with or without a body: the server refuses one that does not,
   // which is what keeps an HTML form (it cannot send this type) from calling the API.
@@ -103,8 +120,30 @@ export const api = {
   models: () => request<ModelsResponse>('GET', 'api/models', undefined, isModelsResponse),
   download: (id: string) => request<unknown>('POST', 'api/models/download', { id }),
   cancelDownload: (id: string) => request<unknown>('DELETE', `api/models/download/${encodeURIComponent(id)}`),
-  /** The plan in force; `measure` runs the planner's probes again instead. */
-  plan: (measure = false) => request<Plan>('GET', measure ? 'api/plan?measure=1' : 'api/plan', undefined, isPlan),
+  /** Delete the partial files a stopped download left; by catalog id, never by path. */
+  deletePartial: (id: string) => request<unknown>('DELETE', `api/models/partial/${encodeURIComponent(id)}`),
+  /** Repositories with gguf files whose name matches, the most downloaded first. */
+  hfSearch: (query: string, token?: string) =>
+    request<HfSearchResponse>('POST', 'api/hf/search', token ? { query, token } : { query }, isHfSearchResponse),
+  /** A Hugging Face repository's gguf files, by the server (docs/server-api.md, "Models"). */
+  hfModels: (repo: string, token?: string) =>
+    request<HfModelsResponse>('POST', 'api/hf/models', token ? { repo, token } : { repo }, isHfModelsResponse),
+  /** One model's header against this machine, before any download. */
+  hfInspect: (repo: string, name: string, token?: string) =>
+    request<HfFacts>('POST', 'api/hf/inspect', token ? { repo, name, token } : { repo, name }, isHfFacts),
+  /** The model as a catalog entry; the download is then `download(id)`. */
+  hfAdd: (repo: string, name: string, token?: string) =>
+    request<HfAdded>('POST', 'api/hf/add', token ? { repo, name, token } : { repo, name }, isHfAdded),
+  removeAdded: (id: string) => request<unknown>('DELETE', `api/hf/entry/${encodeURIComponent(id)}`),
+  /** A direct https link to a gguf, as a catalog entry; the download is then `download(id)`. */
+  addUrl: (url: string) => request<HfAdded>('POST', 'api/models/url', { url }, isHfAdded),
+  /** Delete a model from the models folder, named as the listing names it (`folder/name`), never a path. */
+  deleteModel: (name: string) =>
+    request<unknown>('DELETE', `api/models/local/${name.split('/').map(encodeURIComponent).join('/')}`),
+  /** The plan in force, or the last one held (`cached`, never a measurement); `measure` runs the
+   *  planner's probes again instead. */
+  plan: (mode: 'cached' | 'measure' = 'cached') =>
+    request<Plan>('GET', mode === 'measure' ? 'api/plan?measure=1' : 'api/plan?cached=1', undefined, isPlan),
   applyPlan: () => request<Config>('POST', 'api/plan/apply', undefined, isConfig),
   /** A decision: the model picks one of `choices` from a single prefill (docs/decide.md). */
   decide: (body: { prefix: string; suffix: string; choices: string[]; reuse_prefix?: boolean }) =>

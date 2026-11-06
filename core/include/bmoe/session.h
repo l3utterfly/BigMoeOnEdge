@@ -39,6 +39,10 @@ struct LlamaSessionAccess;
 // the longest prompt+generation the session will serve.
 struct SessionConfig {
     std::string model_path;
+    // The multimodal projector that gives this model its image input (an `mmproj` GGUF from the same
+    // conversion), loaded beside the model. Empty: text only, and a request with images is refused.
+    // See RunConfig::mmproj.
+    std::string mmproj;
     int n_threads = 4;
     int n_threads_batch = 0; // 0 = same as n_threads. See RunConfig::n_threads_batch.
     int n_ctx = 2048;
@@ -47,6 +51,10 @@ struct SessionConfig {
     // throughput for resident compute buffers, which on this engine compete with the expert cache.
     // See RunConfig::n_ubatch.
     int n_ubatch = 0;
+    int ctx_checkpoints = 8;                            // See RunConfig::ctx_checkpoints.
+    int checkpoint_min_step = 8192;                     // See RunConfig::checkpoint_min_step.
+    KvCacheType cache_type_k = k_default_kv_cache_type; // See RunConfig::cache_type_k.
+    KvCacheType cache_type_v = k_default_kv_cache_type;
     bool chatml = false;
     // Active-expert (top-k) override applied at load via a kv_override on the arch-prefixed
     // expert_used_count key. 0 = use the model's own count. See RunConfig::n_expert_used.
@@ -54,6 +62,8 @@ struct SessionConfig {
     // The first stage's placement, applied at load. See RunConfig::n_gpu_layers.
     int n_gpu_layers = 0;
     std::vector<std::string> buft_overrides;
+    std::vector<std::pair<std::string, int>> device_split; // See RunConfig::device_split.
+    std::vector<std::string> device_list;                  // See RunConfig::device_list.
     // See RunConfig::device_use.
     DeviceUse device_use = DeviceUse::Auto;
     SamplingConfig sampling; // fixed for the session; greedy by default (temp <= 0)
@@ -65,7 +75,9 @@ struct SessionConfig {
     // Wide prefill graphs on an accelerator, decode on the CPU. Fixed for the session: the device
     // joins the scheduler at load. See RunConfig::prefill.
     PrefillDeviceConfig prefill;
-    DecideConfig decide; // decide()'s prefix-state policy. See RunConfig::decide.
+    DecideConfig decide;          // decide()'s prefix-state policy. See RunConfig::decide.
+    KnobTrialConfig trial;        // lossless knobs measured on the first decodes. See RunConfig::trial.
+    bool llama_debug_log = false; // See RunConfig::llama_debug_log.
     // Optional native embedding configuration, defined separately in llama_session.h.
     std::shared_ptr<const LlamaSessionConfig> native;
 };
@@ -99,7 +111,7 @@ const char * think_control_name(ThinkControl c);
 struct GenerateRequest {
     std::string prompt;
     int n_predict = 32;
-    bool think = true;
+    bool think = false; // RunConfig::think's default
     bool clear_kv = true;
     // Populate TokenMetrics::text / ::reasoning on every token. Building them means parsing the
     // WHOLE generation so far — the chat parser cannot resume — so it is O(n) per token and O(n²)
@@ -108,6 +120,9 @@ struct GenerateRequest {
     // default output, and every benchmark run) does not, and should turn it off. Default on so an
     // embedder that does not know about this flag keeps the old behaviour.
     bool render_text = true;
+    // Serialized JSON Schema for this turn; empty leaves the template unconstrained.
+    // The template builds both the sampling grammar and the response parser from it.
+    std::string json_schema{};
 
     // The whole conversation, for a front-end that keeps its own record of it (a chat protocol
     // whose client resends the history on every request, an edited or regenerated turn). When
@@ -116,11 +131,15 @@ struct GenerateRequest {
     // still matching what the context holds are kept and only the rest is prefilled, so resending
     // the conversation the session already has costs the new turn alone, and a different one
     // prefills from its first differing token. Chat mode only.
-    std::vector<ChatMessage> messages;
+    std::vector<ChatMessage> messages{};
     // Functions the model may call this turn, described to it by its own chat template; the calls
     // come back in RunResult::tool_calls. Read only with `messages`: a tool's answer is a message.
-    std::vector<ChatTool> tools;
+    std::vector<ChatTool> tools{};
     ToolChoice tool_choice = ToolChoice::Auto;
+    // The images `prompt` places with image_marker(), in order (the raw-prompt path; a message list
+    // carries each message's own). Needs a session opened with a projector. Right after tool_choice,
+    // so a request written as a positional aggregate before images existed still reads the same.
+    std::vector<ChatImage> images{};
 
     // Optional embedding hooks. Sampling receives the logits row; it must also accept
     // its chosen token. Custom sampling cannot be combined with speculative decoding.
@@ -231,10 +250,27 @@ public:
     // 1/top-k. 0 when the model is not MoE or the count could not be read.
     int n_expert_used() const;
 
+    // The routing this session recorded so far (MoeStreamConfig::routing_record_tokens), as a value
+    // for the front-end to keep against the model's fingerprint and hand to the next plan
+    // (AutoPlanOptions::routing): the hit curve the cache is priced on (bmoe/routing.h). Empty
+    // without streaming or with the record off. Call it between generations.
+    RoutingTrace routing_record() const;
+
+    // What the knob trial (SessionConfig::trial) has settled so far, as a value for the front-end to
+    // keep against the model's fingerprint, stamped with this machine's hardware_fingerprint and the
+    // engine version (bmoe/measured_knobs.h), and hand to the next plan (AutoPlanOptions::knobs).
+    // Each knob appears once its verdict is in; empty with no trial or before the first verdict.
+    // Call it between generations.
+    MeasuredKnobs measured_knobs() const;
+
     // Which thinking-off mechanism this model supports (probed at open()). Report it to the user
     // rather than leaving a Thinking toggle that silently does nothing. Always Template when chat
     // mode is off, where no template is rendered and the question does not arise.
     ThinkControl think_control() const;
+
+    // Whether this session reads images: a projector was given at open() and it has a vision
+    // encoder. What a front-end asks before offering an image control.
+    bool vision() const;
 
     // Set the expert-cache budget in MiB and evict down to it now. PRECONDITION: no generate() in
     // flight — call it between generations (e.g. from an app's memory-pressure callback). A no-op

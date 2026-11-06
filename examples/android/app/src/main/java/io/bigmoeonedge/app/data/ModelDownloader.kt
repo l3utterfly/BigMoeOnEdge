@@ -1,7 +1,6 @@
 package io.bigmoeonedge.app.data
 
 import android.content.Context
-import android.net.Uri
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.ExistingWorkPolicy
@@ -53,52 +52,6 @@ object ModelDownloader {
     }
 
     /**
-     * Start a download. Returns the unique-work id (the filename), or an error if the URL doesn't
-     * name a .gguf file or the model cannot fit. No model names or hosts are assumed — for a pasted
-     * URL the filename comes from the URL itself.
-     *
-     * [fileName] overrides that for catalog downloads, where the on-disk name is known upfront and
-     * must not depend on redirects or query strings. [expectedBytes] (when > 0) is checked against
-     * free space before enqueuing so the user isn't left waiting for a transfer that can't fit.
-     */
-    fun enqueue(
-        ctx: Context,
-        rawUrl: String,
-        fileName: String? = null,
-        expectedBytes: Long = -1L,
-    ): Result<String> = runCatching {
-        val url = rawUrl.trim()
-        val uri = Uri.parse(url)
-        require(uri.scheme == "http" || uri.scheme == "https") { "URL must be http(s)" }
-
-        val name = fileName ?: DownloadWorker.fileNameFromUrl(uri)
-        require(name.endsWith(".gguf")) { "URL must point to a .gguf file" }
-
-        val dir = ModelManager.internalModelsDir(ctx)
-        if (expectedBytes > 0 && expectedBytes > dir.usableSpace) {
-            error("needs ${gbLabel(expectedBytes)}, only ${gbLabel(dir.usableSpace)} free")
-        }
-
-        val req = OneTimeWorkRequestBuilder<DownloadWorker>()
-            .setInputData(
-                workDataOf(
-                    DownloadWorker.KEY_URL to url,
-                    DownloadWorker.KEY_NAME to name,
-                    DownloadWorker.KEY_EXPECTED to expectedBytes,
-                )
-            )
-            .addTag(DownloadWorker.TAG)
-            .addTag(NAME_TAG_PREFIX + name)
-            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-            .build()
-        // Block until the work is persisted (a fast local DB write) so the next events() emission
-        // already carries it — otherwise the row wouldn't show as downloading.
-        WorkManager.getInstance(ctx).enqueueUniqueWork(name, ExistingWorkPolicy.KEEP, req).result.get()
-        name
-    }
-
-    /**
      * Start a catalog entry's download: one [DownloadWorker] per missing file, CHAINED so they
      * transfer sequentially — the phone's line is the bottleneck, and one file at a time keeps the
      * resume story per file. The chain's unique-work name is the entry's first file, so enqueuing
@@ -113,12 +66,8 @@ object ModelDownloader {
         val dir = ModelManager.internalModelsDir(ctx)
         val missing = entry.files.filter { !File(dir, it.name).isFile }
         if (missing.isEmpty()) return@runCatching entry.fileName // all landed — caller re-scans
-        val needed = missing.sumOf { s ->
-            (s.bytes - File(dir, s.name + DownloadWorker.PART_SUFFIX).length()).coerceAtLeast(0)
-        }
-        if (needed > dir.usableSpace) {
-            error("needs ${gbLabel(needed)}, only ${gbLabel(dir.usableSpace)} free")
-        }
+        val needed = missing.sumOf { s -> bytesStillNeeded(s.bytes, File(dir, s.name + DownloadWorker.PART_SUFFIX).length()) }
+        freeSpaceRefusal(needed, dir.usableSpace)?.let { error(it) }
 
         val requests = missing.map { s ->
             OneTimeWorkRequestBuilder<DownloadWorker>()
@@ -127,6 +76,7 @@ object ModelDownloader {
                         DownloadWorker.KEY_URL to s.url,
                         DownloadWorker.KEY_NAME to s.name,
                         DownloadWorker.KEY_EXPECTED to s.bytes,
+                        DownloadWorker.KEY_SHA256 to s.sha256,
                     )
                 )
                 .addTag(DownloadWorker.TAG)
@@ -167,13 +117,13 @@ object ModelDownloader {
     }
 
     /**
-     * Cancel a catalog entry's download — the whole chain — and delete the leftover .part files.
-     * Files that fully landed stay: a later retry skips them.
+     * Stop a catalog entry's download — the whole chain. The .part files stay, as on the desktop:
+     * Cancel means "stop for now", the row then offers Resume, and deleting the partial file is its
+     * own explicit action ([Engine.deletePartial], through the server, which confines it to the
+     * models directory).
      */
     fun cancelEntry(ctx: Context, e: CatalogEntry) {
         WorkManager.getInstance(ctx).cancelUniqueWork(e.fileName).result.get()
-        val dir = ModelManager.internalModelsDir(ctx)
-        e.files.forEach { File(dir, it.name + DownloadWorker.PART_SUFFIX).delete() }
     }
 
     /**
@@ -230,20 +180,21 @@ object ModelDownloader {
     }
 
     /**
-     * Finish a successful download by renaming `<name>.gguf.part` to `<name>.gguf`. The worker
-     * already does this on success, so this is an idempotent safety net: if the final file exists
-     * it is returned as-is; otherwise a leftover .part is renamed.
+     * The landed file of a successful download, or null. The worker renames `<name>.gguf.part` to
+     * `<name>.gguf` itself, after the size and digest checks, and succeeds only once it has; a
+     * `.part` found here is never renamed, since it is unchecked (or a later download's, still in
+     * flight, under a succeeded row WorkManager replays).
      */
     fun finalizeDownload(ctx: Context, name: String): File? {
-        val dir = ModelManager.internalModelsDir(ctx)
-        val finalFile = File(dir, name)
-        if (finalFile.isFile) return finalFile
-        val part = File(dir, name + DownloadWorker.PART_SUFFIX)
-        if (!part.isFile) return null
-        return if (part.renameTo(finalFile)) finalFile else null
+        val finalFile = File(ModelManager.internalModelsDir(ctx), name)
+        return if (finalFile.isFile) finalFile else null
     }
 
-    /** Cancel a download and delete its leftover .part file. */
+    /**
+     * Cancel a pasted-link download and delete its leftover .part file. Unlike a catalog entry, a
+     * pasted link has no row that would show the partial file and offer to resume or delete it, so
+     * keeping it would leave gigabytes on the phone that nothing lists.
+     */
     fun cancel(ctx: Context, name: String) {
         // Block until the cancellation is persisted, so the next events() emission reports the work
         // as finished instead of racing it back in as still-active.

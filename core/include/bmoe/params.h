@@ -34,12 +34,14 @@ namespace bmoe {
 // Path and Text are both free strings; the difference is only how a form presents them.
 enum class ParamType { Bool, Int, Float, Choice, Path, Text };
 
-// Groups in the order a settings form shows them.
+// Groups in the order a settings form shows them: the enum order IS the form order, sent as
+// `group_order` so a form does not depend on where a group's first row sits in the table.
 enum class ParamGroup {
     Model,
     Generation,
     Sampling,
     Streaming,
+    Prefill,
     Cache,
     Memory,
     Prefetch,
@@ -75,6 +77,13 @@ struct ParamSwitch {
     bool deprecated = false;
 };
 
+// A value of a numeric parameter that means something other than its number: 0 = off, 0 = the
+// model's own, 4294967295 = random. A form shows the label in place of the number.
+struct ParamSpecial {
+    std::string value; // as get() renders it
+    std::string label; // "off", "as wide as the context"
+};
+
 struct ParamDesc {
     std::string key;   // stable identifier: the long flag without dashes
     std::string label; // short name for a form
@@ -82,7 +91,14 @@ struct ParamDesc {
     ParamGroup group = ParamGroup::Generation;
     ParamLevel level = ParamLevel::Advanced;
     ParamScope scope = ParamScope::Session;
+    // A settings form offers it: every basic row and the few deeper ones a person picks rather than
+    // the plan (which devices, drafts, the context's precision, active experts). The rest stay
+    // flags of the CLI: the plan sets them, or they are a value nobody types into a phone.
+    bool form = false;
     std::string help; // one paragraph, in the user's terms
+    // What a form folds under the help, in a sentence or two of plain words: when to change the
+    // setting and what it costs. Every row a form shows has one (#468).
+    std::string details;
 
     std::string flag;       // "--cache-mb": takes a value. Empty when the parameter has only switches
     std::string short_flag; // "-m", or empty
@@ -91,10 +107,21 @@ struct ParamDesc {
     std::vector<ParamChoice> choices; // Choice only
 
     // What a form offers; validate() decides what a run accepts. Unbounded when bounded is false.
+    // bounded_below: only `min` is a limit, because the only upper one is the type's, which is no
+    // range to show a person.
     bool bounded = false;
+    bool bounded_below = false;
     double min = 0.0;
     double max = 0.0;
     std::string unit; // "MiB", "tokens", "" ...
+
+    // What a person usually sets, for a form to show as the guide. Not a limit: a value outside it
+    // is accepted, it is just unusual. Absent where the right value depends on the model or the
+    // machine, and the plan is the guide instead.
+    bool has_typical = false;
+    double typical_min = 0.0;
+    double typical_max = 0.0;
+    std::vector<ParamSpecial> specials;
 
     bool lossy = false;              // changes the output: a quality trade, not an optimisation
     bool accepts_auto = false;       // an Int that also takes the literal "auto"
@@ -114,7 +141,11 @@ const ParamDesc * find_param(const std::string & key);
 
 const char * param_type_name(ParamType t);
 const char * param_group_name(ParamGroup g);  // stable identifier, as in params_json()
-const char * param_group_label(ParamGroup g); // section title for a form or a usage text
+const char * param_group_label(ParamGroup g); // section title for a form or a usage text: short
+const char * param_group_help(ParamGroup g);  // the group in one line, under its title
+// True for a group a front-end sets with a control of its own (the model file, from a model list):
+// a settings form shows its value and does not edit it. The CLI sets it like any other flag.
+bool param_group_read_only(ParamGroup g);
 const char * param_level_name(ParamLevel l);
 const char * param_scope_name(ParamScope s);
 
@@ -147,6 +178,17 @@ std::vector<std::string> to_args(const RunConfig & cfg);
 // This is what prose that tells a person what to type is built from - the planner's rationale - so
 // renaming a flag in the table cannot leave advice naming one that no longer parses.
 std::string flag_spelling(const std::string & key, const std::string & value = "");
+
+// How a front-end names a parameter in a message the engine wrote. The engine's messages (validate(),
+// a session that will not open) name a setting as `{key}`, or `{key=value}` for one value of it, and
+// never as a flag or a field: the CLI's user types flags, a settings form's user sees labels, and the
+// engine cannot know which one is reading. Each front-end renders once, where the message leaves it.
+//   Flags:  {ubatch} -> --ubatch, {spec=mtp} -> --mtp, {ctx-size=4096} -> --ctx-size 4096
+//   Labels: {ubatch} -> "Batch width", {spec=mtp} -> "Speculative drafts" set to MTP head
+// Braces that do not name a key of the table are left as they are, so a message quoting JSON or a
+// file's own text cannot be mangled.
+enum class ParamNames { Flags, Labels };
+std::string name_params(const std::string & message, ParamNames how);
 
 // The table as a JSON array, one object per parameter, with `default` read from `defaults` — so a
 // front-end that resolves its own defaults (the CLI turns the cache on with streaming) can say so.

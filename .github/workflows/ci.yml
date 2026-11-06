@@ -36,7 +36,7 @@ jobs:
     outputs:
       code: ${{ steps.decide.outputs.code }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: decide
@@ -70,7 +70,7 @@ jobs:
   version:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Versions agree (and match the tag, on a tag build)
         env:
           TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
@@ -81,14 +81,14 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: clang-format (our sources only)
         # Pinned to 18 because AGENTS.md tells contributors to match that version locally. Plain
         # `clang-format` is whatever the runner image ships, which happens to be 18 today: an image
         # bump would silently start failing every PR against a version nobody was told about.
         run: |
           sudo apt-get update && sudo apt-get install -y clang-format-18
-          find core cli server tests -type f \( -name '*.cpp' -o -name '*.h' \) \
+          find core cli server desktop tests -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.mm' \) \
             -print0 | xargs -0 clang-format-18 --dry-run --Werror
 
   host-linux:
@@ -96,18 +96,24 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
+      - name: iOS run-batch status fixtures (no SDK or device)
+        run: python3 tests/ios_runs_test.py
+      # WebKitGTK and the indicator library: bmoe-desktop builds where they are found, so this is
+      # where its Linux code is compiled on every PR.
       - name: Install deps
         run: |
-          sudo apt-get update && sudo apt-get install -y cmake ninja-build
+          sudo apt-get update && sudo apt-get install -y cmake ninja-build libwebkit2gtk-4.1-dev libayatana-appindicator3-dev
           python3 -m pip install --upgrade pip
-          python3 -m pip install gguf numpy
+          python3 -m pip install -r scripts/requirements-ci.txt
+      # This is the job that proves --overlap byte-identical, so the overlap gates may not skip
+      # themselves here: the CPU module this build loads must carry the fork's expert-ready hook.
       - name: Configure & build
         # The diagnostic tools link the I/O layer on their own, so a change to it that only the
         # engine build sees would otherwise leave them broken until someone measures with them.
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBMOE_BUILD_TOOLS=ON && cmake --build build -j
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBMOE_GATES_REQUIRE_HOOK=ON -DBMOE_BUILD_TOOLS=ON && cmake --build build -j
       - name: Byte-identity gates
         run: cd build && ctest --output-on-failure
 
@@ -123,21 +129,17 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install deps
         run: |
           sudo apt-get update && sudo apt-get install -y cmake ninja-build
           python3 -m pip install --upgrade pip
-          python3 -m pip install gguf numpy
+          python3 -m pip install -r scripts/requirements-ci.txt
       - name: Configure & build (ASan + UBSan)
         run: |
-          SAN="-fsanitize=address,undefined -fno-omit-frame-pointer"
-          cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_C_FLAGS="$SAN" -DCMAKE_CXX_FLAGS="$SAN" \
-            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBMOE_SANITIZE=address,undefined
           cmake --build build-asan -j
       - name: Byte-identity gates, sanitized
         env:
@@ -146,6 +148,39 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1:suppressions=${{ github.workspace }}/tests/sanitizers/ubsan.supp
         run: cd build-asan && ctest --output-on-failure
 
+  tsan:
+    # ThreadSanitizer over the tests that run threads: the engine host (loads, turns, cancel and
+    # unload across threads), the agent (runs, approvals, stop, tasks), the server's turn queue and
+    # event fan-out, and the byte-identity gates, which drive the streamer's I/O lanes and
+    # --overlap's expert-ready hook. llama.cpp is
+    # instrumented too (BMOE_SANITIZE is the whole build) and runs on its own threadpool rather than
+    # OpenMP, whose runtime TSan cannot see into.
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake ninja-build
+          python3 -m pip install --upgrade pip
+          python3 -m pip install gguf numpy
+      # The runner kernel's address-space randomisation is wider than TSan's shadow layout allows,
+      # and every instrumented binary then dies at start-up with "unexpected memory mapping".
+      - name: Narrow ASLR for TSan
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure & build (TSan)
+        run: |
+          cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBMOE_SANITIZE=thread \
+            -DGGML_OPENMP=OFF
+          cmake --build build-tsan -j
+      - name: Threaded tests, sanitized
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: cd build-tsan && ctest -j 2 --output-on-failure -R '^(engine_host|server_logic|agent|moe_gates_.*)$'
+
   ui:
     # The web UI's unit tests (ui/src/lib). release-host runs them too, but only once a release is
     # being cut; this is where a PR finds out.
@@ -153,8 +188,8 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
       - name: Web UI unit tests
@@ -176,7 +211,7 @@ jobs:
     if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Configure & build (compile-check the Win32 I/O paths)
@@ -189,25 +224,26 @@ jobs:
     # release is cut, and builds no tests, so this is where F_NOCACHE and the Apple VM paths are
     # proven to stream byte-identically.
     if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       # The runner's own python3 is externally managed (PEP 668), so pip may not install into it.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install deps (the gates' tiny-model generator)
-        run: python3 -m pip install gguf numpy
+        run: python3 -m pip install -r scripts/requirements-ci.txt
       # Keep this in sync with the macos-arm64 release-host configuration, which differs only in
-      # leaving the tests out.
+      # leaving the tests out, and in not failing on a warning: a warning in our own code is an
+      # error here, where the compiler is the one the tree is kept clean on.
       - name: Configure & build (the Apple I/O paths, and the gates)
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DGGML_NATIVE=OFF \
+            -DBMOE_WARNINGS_AS_ERRORS=ON \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
             -DGGML_OPENMP=OFF \
             -DLLAMA_CURL=OFF
           cmake --build build --config Release -j
@@ -217,34 +253,38 @@ jobs:
         run: cd build && ctest --output-on-failure
 
   ios-harness:
-    # Compile-check the iOS paths: the engine and bmoe-cli inside the harness app, for the
-    # simulator, unsigned. Nothing is run; the simulator's kernel and memory are the runner's.
+    # Compile-check the iOS paths: the app (the server library and the SwiftUI screens) and the
+    # harness (bmoe-cli inside an app), for the simulator, unsigned, plus the app's client package
+    # tested on the runner. Nothing is run in a simulator; its kernel and memory are the runner's.
     if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
+      - name: BmoeKit tests (the app's client side, on the host)
+        run: swift test --package-path examples/ios/BmoeKit
       - name: Configure & build (examples/ios, simulator)
         run: scripts/build-ios.sh sim
 
-  # Cross-compiles the arm64 engine (the native compile gate) and packages the example
-  # APK around it, uploading the APK as an artifact — and attaching it to the release on a
-  # tag push. Debug-signed: for on-device validation, not Play distribution.
+  # Cross-compiles the arm64 engine (the native compile gate) with the Vulkan and OpenCL backends
+  # the release APK carries (Hexagon needs its SDK's container and is release-apk.yml's alone),
+  # and packages the example APK around it, uploading the APK as an artifact. It never touches a
+  # release: one created with this workflow's token would fire no release-apk or release-host run.
+  # Debug-signed: for on-device validation, not Play distribution.
   android-apk:
     # The long job (NDK + cross-compile + gradle). Build it on PRs (catch APK breakage before merge)
-    # and on release tags (attach the APK), but not on every main push. Trigger a one-off manually
-    # with the Run workflow button (workflow_dispatch) if you need a fresh main APK between releases.
+    # and on release tags (built, never attached: release-apk publishes the APKs), but not on every
+    # main push. Trigger a one-off manually with the Run workflow button (workflow_dispatch) if you
+    # need a fresh main APK between releases.
     if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    permissions:
-      contents: write   # only used by the tag-triggered release attach step
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
@@ -257,6 +297,10 @@ jobs:
           # r27c == 27.2.12479018, the NDK release-apk.yml builds published APKs with. These two
           # must not drift, or CI validates a build nobody installs.
           ndk-version: r27c
+      - name: Android GPU dependencies (Khronos headers, the OpenCL ICD loader)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: bash scripts/android-gpu-deps.sh build-android/gpu-deps
       - name: Cross-compile bmoe-cli (arm64)
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
@@ -265,8 +309,8 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
             -DCMAKE_BUILD_TYPE=Release -DBMOE_BUILD_TESTS=OFF -DBMOE_BUILD_SERVER=ON \
-            -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_OPENCL=OFF \
-            -DGGML_CPU_ARM_ARCH="armv8.2-a+dotprod+fp16" \
+            -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF \
+            -DGGML_VULKAN=ON -DGGML_OPENCL=ON $(cat build-android/gpu-deps/cmake-flags) \
             -DLLAMA_CURL=OFF
           cmake --build build-android -j
       - name: Stage engine binaries into jniLibs
@@ -277,7 +321,10 @@ jobs:
           mkdir -p "$jni"
           cp build-android/bin/bmoe-cli "$jni/libbmoe-cli.so"
           cp build-android/bin/bmoe-server "$jni/libbmoe-server.so"
-          find build-android \( -name 'libggml*.so' -o -name 'libllama*.so' \) -exec cp {} "$jni/" \;
+          # Everything the build put beside the engine: ggml, llama and one module per backend. The
+          # OpenCL module's link-time libOpenCL.so stays behind: on the phone it resolves to the
+          # system's own, or the module is not loaded.
+          cp build-android/bin/libggml*.so build-android/bin/libllama*.so build-android/bin/libmtmd*.so "$jni/"
           # bmoe-cli links the c++_shared STL; ship its runtime from the NDK sysroot.
           cp "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" "$jni/"
           ls -la "$jni"
@@ -288,15 +335,8 @@ jobs:
         working-directory: examples/android
         run: ./gradlew testDevDebugUnitTest --no-daemon
       - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bmoe-example-dev-debug-apk
           path: examples/android/app/build/outputs/apk/dev/debug/app-dev-debug.apk
           if-no-files-found: error
-      - name: Attach APK to release
-        if: startsWith(github.ref, 'refs/tags/v')
-        # Pinned by commit SHA for the same reason. This step only runs on a tag push, so a
-        # wrong pin would not surface until a release: resolve the SHA, do not hand-edit it.
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
-        with:
-          files: examples/android/app/build/outputs/apk/dev/debug/app-dev-debug.apk

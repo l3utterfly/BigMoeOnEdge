@@ -68,8 +68,10 @@ public:
 
     // Placement of the NEXT graph: the layer weights, the streamed experts and the hook move together.
     // Returns where it actually went: with slots on demand a device that has no room right now
-    // leaves the graph on the host.
-    bool place(bool on_device);
+    // leaves the graph on the host. `hold_slots` keeps slots taken on demand while the weights are
+    // home: a graph of another context in the middle of a prefill (the draft's walk of the same chunk)
+    // reads the host bindings, and the next chunk goes back out without asking for room again.
+    bool place(bool on_device, bool hold_slots = false);
     // The expert cache the slots take turns with (PrefillDeviceConfig::slots_on_demand). Call before
     // open(); null leaves the cache alone.
     void share_memory_with(ExpertStreamSource * cache) { cache_ = cache; }
@@ -77,6 +79,8 @@ public:
     // before and drained after, and a failed expert read fails the decode: the graph would have
     // computed on a slot that never filled.
     int decode(llama_context * ctx, const llama_batch & b);
+    // The same bracket around a batch of embeddings (an image's tokens, media_input.h).
+    int decode_ext(llama_context * ctx, llama_batch_ext * b);
     // For every llama_memory_clear(data) of the target context: llama.cpp clears the buffers it
     // allocated, which the moved model state no longer lives in.
     void clear_state();

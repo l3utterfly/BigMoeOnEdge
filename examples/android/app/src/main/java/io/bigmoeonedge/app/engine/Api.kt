@@ -1,5 +1,7 @@
 package io.bigmoeonedge.app.engine
 
+import io.bigmoeonedge.app.chat.ConversationCreator
+import io.bigmoeonedge.app.chat.ItemReducer
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
@@ -19,6 +21,12 @@ class ApiException(val status: Int, message: String, val code: String = "") : IO
 
         /** The code a turn is refused with when no model is loaded: the fix is on Models. */
         const val CODE_NO_MODEL = "no_model"
+
+        /** The text was not a repository id or URL: the screen searches for it instead. */
+        const val CODE_NOT_A_REPO = "not_a_repo"
+
+        /** A pasted link the server does not take as a gguf link: its message says why. */
+        const val CODE_INVALID_URL = "invalid_url"
     }
 }
 
@@ -36,7 +44,7 @@ class ApiException(val status: Int, message: String, val code: String = "") : IO
  * behind a generation and then a prefill of minutes, wait without one. The event stream has a
  * watchdog instead: the server writes to it at least every [PING_INTERVAL_MS].
  */
-class Api(private val baseUrl: String, private val apiKey: String) {
+class Api(private val baseUrl: String, private val apiKey: String) : ConversationCreator {
 
     // ── server and session ──
 
@@ -65,8 +73,46 @@ class Api(private val baseUrl: String, private val apiKey: String) {
     // ── models and the plan ──
 
     fun models(): JSONObject = getJson("/api/models", QUICK_MS)
-    fun plan(measure: Boolean): JSONObject = getJson(if (measure) "/api/plan?measure=1" else "/api/plan", SLOW_MS)
+
+    // ── a model from a Hugging Face repository (the server lists, inspects and adds; the app downloads) ──
+    fun hfSearch(body: JSONObject): JSONObject = send("POST", "/api/hf/search", body, SLOW_MS)
+    fun hfModels(body: JSONObject): JSONObject = send("POST", "/api/hf/models", body, SLOW_MS)
+    fun hfInspect(body: JSONObject): JSONObject = send("POST", "/api/hf/inspect", body, SLOW_MS)
+    fun hfAdd(body: JSONObject): JSONObject = send("POST", "/api/hf/add", body, SLOW_MS)
+    fun removeAdded(id: String): JSONObject = send("DELETE", "/api/hf/entry/" + java.net.URLEncoder.encode(id, "UTF-8"), null, QUICK_MS)
+    fun deletePartial(id: String): JSONObject = send("DELETE", "/api/models/partial/" + java.net.URLEncoder.encode(id, "UTF-8"), null, QUICK_MS)
+
+    /** A model in the models directory, named as the listing names it (`folder/name` or `name`): every file of it. */
+    fun deleteLocal(name: String): JSONObject =
+        send("DELETE", "/api/models/local/" + name.split('/').joinToString("/") { java.net.URLEncoder.encode(it, "UTF-8").replace("+", "%20") }, null, QUICK_MS)
+
+    /** A direct link to a gguf becomes a catalog entry; the server asks the host for each file's size. */
+    fun addUrl(url: String): JSONObject = send("POST", "/api/models/url", JSONObject().put("url", url), SLOW_MS)
+    fun plan(measure: Boolean): JSONObject = getJson(if (measure) "/api/plan?measure=1" else "/api/plan?cached=1", SLOW_MS)
     fun applyPlan(): JSONObject = send("POST", "/api/plan/apply", null, QUICK_MS)
+
+    // ── conversations (docs/agent.md): held by the server, plain chat under --chat-only ──
+
+    fun conversations(): JSONArray = JSONArray(get("/api/conversations", QUICK_MS))
+    override fun createConversation(body: JSONObject): JSONObject = send("POST", "/api/conversations", body, QUICK_MS)
+    fun conversation(id: String): JSONObject = getJson("/api/conversations/" + seg(id), QUICK_MS)
+    fun patchConversation(id: String, body: JSONObject): JSONObject = send("PATCH", "/api/conversations/" + seg(id), body, QUICK_MS)
+    override fun deleteConversation(id: String) {
+        send("DELETE", "/api/conversations/" + seg(id), null, QUICK_MS)
+    }
+
+    /** Answers `202 {item}` at once; the answer streams on the event stream. */
+    fun sendMessage(id: String, text: String): JSONObject =
+        send("POST", "/api/conversations/" + seg(id) + "/messages", JSONObject().put("text", text), QUICK_MS)
+
+    /** Drops [item] and what follows it, then sends [text] in its place: edit, and Answer again. */
+    fun editMessage(id: String, item: String, text: String): JSONObject =
+        send("POST", "/api/conversations/" + seg(id) + "/edit", ItemReducer.editBody(item, text), QUICK_MS)
+
+    // A stop answers once the run has stopped: a generation ends at its next token.
+    fun stopConversation(id: String): JSONObject = send("POST", "/api/conversations/" + seg(id) + "/stop", null, SLOW_MS)
+
+    private fun seg(s: String) = java.net.URLEncoder.encode(s, "UTF-8").replace("+", "%20")
 
     // ── whose server this is ──
 
@@ -116,7 +162,7 @@ class Api(private val baseUrl: String, private val apiKey: String) {
 
     private fun open(method: String, path: String, write: Boolean, readTimeoutMs: Int): HttpURLConnection {
         val c = URL(baseUrl + path).openConnection() as HttpURLConnection
-        c.requestMethod = method
+        setMethod(c, method)
         c.connectTimeout = CONNECT_MS
         c.readTimeout = readTimeoutMs
         c.useCaches = false
@@ -125,6 +171,21 @@ class Api(private val baseUrl: String, private val apiKey: String) {
         if (write) c.setRequestProperty("Content-Type", "application/json")
         c.setRequestProperty("Authorization", "Bearer $apiKey")
         return c
+    }
+
+    /**
+     * PATCH (a conversation's title) is not in the JDK's list of methods,
+     * though Android's own connection takes it: where the setter refuses it, the field it would
+     * have set is set directly.
+     */
+    private fun setMethod(c: HttpURLConnection, method: String) {
+        try {
+            c.requestMethod = method
+        } catch (e: java.net.ProtocolException) {
+            val f = HttpURLConnection::class.java.getDeclaredField("method")
+            f.isAccessible = true
+            f.set(c, method)
+        }
     }
 
     private fun get(path: String, readTimeoutMs: Int): String {

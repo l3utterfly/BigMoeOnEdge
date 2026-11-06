@@ -18,7 +18,7 @@
 #include "bmoe/config.h"
 #include "bmoe/decode_trace.h"
 #include "stall_union.h"
-#include "bmoe/recipe.h"
+#include "bmoe/expert_layout.h"
 #include "../io/platform_io.h"
 #include "../io/file_reader.h"
 #include "dense_weights.h" // DenseWeights + DenseTensorRef
@@ -45,12 +45,16 @@ struct ExpertTensorRef {
     int file_idx = 0;               // which shard file holds the bytes (0 for a single-file model)
 };
 
-// The expert weight tensors of one MoE layer, one per recipe suffix slot. The split
-// layout fills all three ({gate, up, down}); a fused-gate_up layout fills two and leaves
-// the tail slot empty (tensor == nullptr). Unbound layers (dense, or non-MoE) stay false.
+// The expert weight tensors of one MoE layer, one per layout slot (bmoe/expert_layout.h). The
+// split layout fills all three; a fused or gate-less layout fills two and leaves the tail slot
+// empty (tensor == nullptr). Unbound layers (dense, or non-MoE) stay false.
 struct LayerExperts {
     bool bound = false;
-    ExpertTensorRef proj[MoeRecipe::max_exps];
+    // Some of this layer's experts are on a device. Beside a bound layer that is a split the
+    // streamer cannot serve (the projections it would load with this half are elsewhere), and the
+    // session refuses it by name rather than tripping over the missing tensor.
+    bool on_device = false;
+    ExpertTensorRef proj[ExpertLayout::max_slots];
 };
 
 class ExpertStreamSource final : public IExpertSource {
@@ -103,9 +107,18 @@ public:
     Stats stats() const override;
 
     // Register the process-global expert-ready hook so the CPU matmul blocks per expert
-    // until its slice is resident. Only meaningful in overlap mode; a no-op if the fork
-    // hook was not compiled in. Paired with shutdown(), which unregisters it.
-    void enable_overlap_hook();
+    // until its slice is resident. Only meaningful in overlap mode. The hook is the fork's and
+    // lives in the CPU backend, reached through the backend registry at run time (the CPU
+    // backend may be a module loaded at start-up); false when the backend registered here does
+    // not expose it. Paired with shutdown(), which unregisters it.
+    bool enable_overlap_hook();
+
+    // Switch between serial and overlapped reads with the session open (the knob trial's overlap
+    // arm, docs/measured-planning.md). Between two decodes only, from the eval thread. Turning it
+    // on registers the hook if it is not, and fails, changing nothing, when the CPU backend has
+    // none. Output is identical either way: only who waits for a read, and where, changes.
+    bool set_overlap(bool on);
+    bool overlap() const { return overlap_.load(std::memory_order_relaxed); }
 
     // True once an async read has failed or the source is shutting down. Wired to
     // llama_set_abort_callback so a mid-decode I/O failure aborts the graph cleanly
@@ -118,6 +131,15 @@ public:
     // and exercised by the shrink gate. This is the only thing that moves the budget after init.
     void set_cache_budget(size_t bytes);
     size_t cache_budget() const { return cache_max_; }
+
+    // The share of the cache's resident pages the system has taken back, from one page of each of up
+    // to `n` entries spread over the LRU. What the cache wrote and the kernel then compressed, swapped
+    // or trimmed is gone from RAM by definition, and every platform answers that about a process's own
+    // pages (pio::vm_resident_sample). -1 when nothing could be sampled. Same precondition as
+    // set_cache_budget: no decode in flight.
+    double cache_lost_frac(int n);
+    // The budget a brake may not go under: one token's worst-case cycle (set_pin_floor).
+    size_t cache_floor() const { return pin_floor_; }
 
     // The cliff from cache-sizing.md, computed at init from model shape alone: the bytes one
     // token's pass over the layer stack demands in the worst case, i.e. every bound layer's top_k
@@ -191,6 +213,7 @@ private:
     void maybe_sample_dense();
 
     bool load_layer_async(int il, const int32_t * ids, int n_ids); // overlap path
+    void build_ready_map();                                        // overlap's readiness cells and tensor map
 
     static void c_expert_ready(const ggml_tensor * src0, int expert, void * user_data);
     void on_expert_ready(const ggml_tensor * src0, int expert);
@@ -234,7 +257,8 @@ private:
     size_t pin_floor_ = 0;        // see set_pin_floor
     size_t pin_refused_at_ = 0;   // cache bytes resident when the platform first refused a pin; 0 = never
     uint64_t pin_shrunk_gen_ = 0; // the load generation the budget last stepped down in
-    bool overlap_ = false;
+    // Written by the eval thread only (init, set_overlap); read by a lane on a failed read, hence atomic.
+    std::atomic<bool> overlap_{false};
     bool two_wave_ = false;                  // publish the first projection's jobs before committing the rest (#118)
     bool prefetch_sync_ = false;             // test only: drain prefetch reads synchronously (serial mode)
     bool spec_adopt_ = false;                // route-ahead: staged layers adopt committed spec reads (see quiesce_spec)
@@ -275,7 +299,7 @@ private:
     std::vector<LayerExperts> layers_;
 
     // shared-slot mode (cache off): one full-size slot per projection, reused by layers
-    void * slot_[MoeRecipe::max_exps] = {nullptr, nullptr, nullptr};
+    void * slot_[ExpertLayout::max_slots] = {nullptr, nullptr, nullptr};
 
     // LRU mode (cache on): per-(layer, projection) reserved buffers
     size_t cache_max_ = 0; // live budget in bytes; only an explicit set_cache_budget() moves it
@@ -314,8 +338,8 @@ private:
     size_t layer_demand_accum_ = 0;
     size_t layer_demand_ = 0;
     int last_il_ = -1;
-    std::vector<void *> lbuf_[MoeRecipe::max_exps];
-    std::vector<size_t> lbuf_sz_[MoeRecipe::max_exps];
+    std::vector<void *> lbuf_[ExpertLayout::max_slots];
+    std::vector<size_t> lbuf_sz_[ExpertLayout::max_slots];
     std::vector<uint8_t> cvalid_;
     std::vector<int32_t> cprev_, cnext_;
     std::vector<uint32_t> cstamp_;
@@ -352,7 +376,11 @@ private:
 
     // I/O lane pool
     int io_threads_ = 1;
-    std::vector<std::thread> io_pool_;
+    std::vector<std::thread> io_pool_; // lanes 1..N-1
+    // Lane 0's worker, which runs only under overlap: serially lane 0 is the eval thread itself.
+    // lane0_stop_ (under io_mtx_) hands the lane back without stopping the others.
+    std::thread lane0_worker_;
+    bool lane0_stop_ = false;
     std::vector<IoJob> jobs_;
     std::mutex io_mtx_;
     std::condition_variable io_cv_, io_cv_done_;
@@ -391,6 +419,8 @@ private:
     std::vector<std::pair<const void *, uint32_t>> texp_;
     std::vector<int> staged_; // per-load sorted unique expert scratch
     bool hook_registered_ = false;
+    // The fork's setter, resolved from the CPU backend's registry when the hook is enabled.
+    void (*set_hook_)(void (*)(const ggml_tensor *, int, void *), void *) = nullptr;
 };
 
 } // namespace bmoe

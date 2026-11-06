@@ -27,7 +27,9 @@ bmoe-cli -m MODEL.gguf --moe-stream --cache-mb auto --io-threads 4 -t 4 -n 256 \
   (see [limitations.md](limitations.md)).
 - **Report** `s/token`, the `compute + flash I/O` split from the `moe-stream:` line, and the
   `moe-cache:` hit rate.
-- **Drivers:** `scripts/bench-report.sh` (host, prints a paste-ready block), `scripts/bench-run.sh`
+- **Drivers:** `scripts/bench-report.sh` (host: three `--auto` runs, the first load, the plan on its
+  record and that plan with `--overlap` pinned, each with the plan it chose and its prediction
+  against the measurement, one paste-ready block), `scripts/bench-run.sh`
   (device-side over adb, prompt baked in, also samples peak RSS, the `MemAvailable` floor and CPU
   and battery temperature).
 
@@ -102,7 +104,7 @@ each layer's tail gets longer. Start at `min(8, cores)`; on big.LITTLE try the b
 | `mmap` | leaves them in the page cache; the kernel reclaims mid-decode and the refault is billed to **compute**, so a fault-bound run looks compute-bound | diagnosis only |
 | `anon` | `O_DIRECT` into our own buffers, so a reclaim goes to zram, not flash | default, and the answer past RAM |
 | `warm` | page-cached at load | the model fits in RAM |
-| `ahwb` | memory the kernel may not reclaim at all (a dma-buf on Android, wired memory on macOS) | models where even compressed reclaim hurts |
+| `pinned` | memory the kernel may not reclaim at all (a dma-buf on Android, wired memory on macOS) | models where even compressed reclaim hurts |
 
 `majflt/tok` on the `compute:` line says which regime you are in: hundreds means the dense set is
 thrashing, single digits means it is not.
@@ -133,8 +135,9 @@ against `--n-expert-used` is not overhead-matched.
 ## gpt-oss and other harmony models
 
 The harmony template **always** opens an `analysis` channel before the answer, so a plain run
-spends its whole `-n` budget reasoning. Pass **`--no-think`**: the engine primes the `final`
-channel directly. Without it, a throughput run is timing chain-of-thought.
+spends its whole `-n` budget reasoning. Keep thinking **off** (the default since 0.35; `--no-think`
+states it explicitly): the engine primes the `final` channel directly. With `--think`, a
+throughput run is timing chain-of-thought.
 
 - **`--no-think` is a speed mode, not a free lunch.** It removes the model's scratch space, so
   reasoning-dependent tasks degrade: on `17 x 23` the default top-4 answers *wrong* while k=2/3

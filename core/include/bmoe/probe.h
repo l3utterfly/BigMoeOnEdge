@@ -6,6 +6,7 @@
 // testable against machines nobody here owns.
 #pragma once
 
+#include "bmoe/config.h"
 #include "bmoe/hardware_profile.h"
 #include "bmoe/model_profile.h"
 #include "bmoe/placement.h"
@@ -15,6 +16,8 @@
 #include <vector>
 
 namespace bmoe {
+
+struct SpecConfig;
 
 // Everything this machine will tell us for free: memory accounting, what a reclaim costs, whether a
 // reclaim-exempt allocation exists, the registered compute devices, and whether uncached reads are
@@ -33,6 +36,36 @@ HardwareProfile probe_hardware(const char * model_path);
 // declines on.
 ModelProfile probe_model(const char * model_path);
 
+// The file's header alone: its architecture and expert counts, with ok=false when it is not a
+// gguf that parses. A MoE whose expert layout probe_model refuses to plan still reads here, so a
+// caller can tell "not a gguf" from "a gguf this engine does not stream" without reading an
+// error's words. Only the first shard is read.
+//
+// The rest says what kind of file it is, from the format's own keys, so a caller can tell a model
+// from a companion file (a projector, a draft head) without trusting its name: `general.type`
+// ("" when absent), `<arch>.block_count`, `<arch>.nextn_predict_layers`, and whether the file
+// names `<arch>.target_layers` (layers of another model it reads from).
+struct GgufHeaderFacts {
+    std::string arch;
+    int n_expert = 0;
+    int n_expert_used = 0;
+    std::string type;
+    int n_block = 0;
+    int n_nextn = 0;
+    bool reads_target = false;
+    std::string name; // `general.name`: the base model, shared by the files of one conversion
+    bool ok = false;
+};
+GgufHeaderFacts probe_gguf_header(const char * model_path);
+
+// What a front-end keys the model's own measurements by (its routing trace, bmoe/routing.h): a
+// 64-bit hash of the file's size and of bytes sampled from its content - the header and metadata at
+// the start, and windows across the tensor data - as 16 hex digits. Content, not path or modification
+// time, because what it keys is a property of the model: the same file copied to another folder or
+// another machine keeps it, and two fine-tunes of one base, which share every shape and most of a
+// header, do not share their tensor bytes. A few MiB read; "" when the file cannot be read.
+std::string model_fingerprint(const char * model_path);
+
 // Ask every registered device whether it can execute THIS model's expert matmul on THIS model's
 // quantized layout, and whether placing such a weight there would need a repack. Asking the backend
 // about the real operation is what keeps the answer vendor-neutral and current: a backend that
@@ -43,13 +76,38 @@ ModelProfile probe_model(const char * model_path);
 // asked (no devices registered yet, or an unknown expert type) — which every rule declines on.
 void probe_device_support(HardwareProfile & hw, const ModelProfile & model);
 
-// Make every backend this machine has available for enumeration, including any that ship as
-// separate shared libraries rather than linked in. llama.cpp's own tools do this before they look
-// at devices, and the reason to do it here is the same: a device nobody enumerated is a device no
-// rule can consider, and "there is no accelerator" and "nobody went to look" are different answers.
+// Make every backend this machine has available for enumeration: the ones linked in, and the ones
+// that ship as modules beside the executable, which is how every release of this project is built
+// (docs/backends.md). llama.cpp's own tools do this before they look at devices, and the reason to
+// do it here is the same: a device nobody enumerated is a device no rule can consider, and "there
+// is no accelerator" and "nobody went to look" are different answers.
 //
-// A statically linked build finds nothing and loses nothing. Call it before llama_backend_init().
-void register_backends();
+// Modules are looked for beside the executable and nowhere else - not in the working directory,
+// which llama.cpp's own loader would also search. Idempotent; a front-end calls it once, before
+// anything asks ggml about devices, and before llama_backend_init() (which would otherwise load
+// from both places). A statically linked build finds nothing and loses nothing.
+//
+// `extra_dirs` are more folders to load modules from, after the executable's, in order: where a
+// front-end keeps backends installed after the program (the server's backend packs,
+// docs/backends.md). The library does not know where those are; the front-end that installed them
+// does. Only the first call's folders count.
+void register_backends(const std::vector<std::string> & extra_dirs = {});
+
+// The module files register_backends() loads from `extra_dirs`, given the executable's folder
+// `exe_dir`: in each folder, in order, each file named as ggml names a backend module
+// ([lib]ggml-<backend>[-<variant>] with the platform's module extension) whose backend no folder
+// before it had, the executable's first, and whose file name is not one of the executable's
+// folder (ggml's own base library, say). One file per backend, the one named after it alone where
+// there is one: a folder is not a second place to pick a CPU variant from. Exposed for the front-end that must ready
+// them first (server/platform.h, prepare_backend_modules) and for the tests.
+std::vector<std::string> extra_backend_modules(const std::string & exe_dir,
+                                               const std::vector<std::string> & extra_dirs);
+
+// Whether the CPU backend registered here exposes the fork's expert-ready hook, which `--overlap`
+// needs (docs/seam.md). Asked of the backend at run time rather than decided at compile time, so a
+// front-end's default and its reported capability follow the backend actually loaded. Only
+// meaningful after register_backends().
+bool expert_ready_hook_available();
 
 // What this binary can even see. A backend the build did not compile in, and did not find beside
 // the executable, is a device no probe will ever enumerate — so a plan made on this machine would
@@ -60,6 +118,7 @@ struct BackendInventory {
     uint32_t linked = 0;            // compiled into this binary
     uint32_t loaded_at_runtime = 0; // found as separate shared libraries beside the executable
     bool looked = false;            // register_backends() ran; false means nobody went to look
+    uint32_t placeable = 0; // of those, the ones that could offer a local device (HardwareProfile::backends_placeable)
     std::vector<std::string> names; // every registered backend, for the rationale and the CSV header
 
     uint32_t total() const { return linked + loaded_at_runtime; }
@@ -87,6 +146,12 @@ void probe_device_costs(HardwareProfile & hw, const ModelProfile & model);
 // sweep answered 2 threads - the same wrong answer as the rule it replaced, and the engine is 58%
 // faster at 4. The instrument has to be made of the same material as the workload.
 void probe_bandwidth(HardwareProfile & hw, const ModelProfile & model);
+
+// The router-gate GEMV route-ahead's prediction runs, timed over the gate's float weights and over
+// an int8 mirror of them, on a synthetic gate of this model's shape (gate_gemv::measure, the same
+// kernels the run uses). Fills HardwareProfile::gate_gemv_f32_us / gate_gemv_int8_us; a model whose
+// shape is unknown leaves them 0. See core/src/plan/gate_probe.cpp.
+void probe_gate_gemv(HardwareProfile & hw, const ModelProfile & model);
 
 // ── probing a device where it cannot take the plan down with it ──────────────────────────────
 //
@@ -162,8 +227,23 @@ void probe_storage(HardwareProfile & hw, const char * model_path, uint64_t slice
 // projection of a different run: read at llama.cpp's own default of 512 while the session opened
 // one graph per context, the ledger charged 1.2 GB for what then reserved 8 GB at a 16384 context. The
 // projection is taken at that width and at half of it, which gives the slope a narrower graph is
-// priced with (Placement::at_width).
-Placement probe_placement(
-    const char * model_path, const ModelProfile & model, const HardwareProfile & hw, uint32_t n_ctx, uint32_t n_ubatch);
+// priced with (Placement::at_width). `type_k` / `type_v` are the KV cache's element types
+// (RunConfig::cache_type_k / _v): the KV it projects is the one the run will allocate.
+//
+// `devices`, where the plan chose among backends of one card (bmoe/backend_choice.h), is the list the
+// fitter places on; empty lets it see every device, as llama.cpp would.
+//
+// `spec`, where it drafts with an MTP head, adds the draft context to the fit as the second model
+// that shares the devices (llama.cpp's common_fit_extra_model): it reserves its own state and
+// compute buffers on them, and a placement fitted without it is one the session then cannot open.
+Placement probe_placement(const char * model_path,
+                          const ModelProfile & model,
+                          const HardwareProfile & hw,
+                          uint32_t n_ctx,
+                          uint32_t n_ubatch,
+                          KvCacheType type_k = KvCacheType::F16,
+                          KvCacheType type_v = KvCacheType::F16,
+                          const std::vector<std::string> & devices = {},
+                          const SpecConfig * spec = nullptr);
 
 } // namespace bmoe

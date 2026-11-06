@@ -7,8 +7,13 @@
 // ::abs is not visible (GCC hard-errors; MSVC happened to tolerate it).
 #if defined(_WIN32)
 #include <windows.h>
+#include <psapi.h> // QueryWorkingSetEx: kernel32's K32 export on every supported Windows
 #include <malloc.h>
+#include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <string>
+#include <vector>
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -17,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <cmath>
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
@@ -25,7 +31,9 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/wait.h>
+#include <dirent.h>
 #include <chrono>
+#include <string>
 #include <ctime>
 #ifndef O_DIRECT
 #define O_DIRECT 0
@@ -137,6 +145,9 @@ void vm_drop_file_pages(void * /*p*/, size_t /*sz*/) {
     // File-backed views cannot be decommitted (MEM_DECOMMIT is only valid for VirtualAlloc'd pages),
     // and the host build never mmaps the model for streaming — so there is nothing to drop.
 }
+void drop_file_cache(const char * /*path*/) {
+    // No posix_fadvise; the standby list is the system's to trim.
+}
 void vm_drop_anon_pages(void * /*p*/, size_t /*sz*/) {
     // MEM_DECOMMIT would turn the owner's next write into an access violation, and MEM_RESET is only
     // defined for VirtualAlloc'd regions, which a heap allocation need not be. The host build has no
@@ -147,11 +158,26 @@ void vm_advise_random(void * /*p*/, size_t /*sz*/) {
     // No readahead to tame on a host build that never streams; the gates do not measure I/O.
 }
 
-// Unmeasured on the host build, like the fault counters below and for the same reason: the gates
-// prove byte-identity, they do not size a cache against a phone's reclaim. QueryWorkingSetEx could
-// answer this, but nothing here consumes it.
-bool vm_resident_sample(const void * /*p*/, size_t /*sz*/, size_t * /*sampled*/, size_t * /*resident*/) {
-    return false;
+// The same question mincore answers elsewhere, asked of this process's working set: a page whose
+// entry is Valid is resident. Clipped to whole pages exactly as the POSIX version is, so the two
+// fractions mean the same thing.
+bool vm_resident_sample(const void * p, size_t sz, size_t * sampled, size_t * resident) {
+    const size_t page = vm_page();
+    uintptr_t a0 = ((uintptr_t) p + page - 1) & ~(uintptr_t) (page - 1);
+    uintptr_t a1 = ((uintptr_t) p + sz) & ~(uintptr_t) (page - 1);
+    if (a1 <= a0) return true;
+    PSAPI_WORKING_SET_EX_INFORMATION info[256];
+    for (uintptr_t a = a0; a < a1;) {
+        const size_t want = std::min<size_t>((size_t) (a1 - a) / page, sizeof(info) / sizeof(info[0]));
+        for (size_t i = 0; i < want; ++i)
+            info[i].VirtualAddress = (PVOID) (a + i * page);
+        if (!QueryWorkingSetEx(GetCurrentProcess(), info, (DWORD) (want * sizeof(info[0])))) return false;
+        for (size_t i = 0; i < want; ++i)
+            *resident += (size_t) info[i].VirtualAttributes.Valid;
+        *sampled += want;
+        a += want * page;
+    }
+    return true;
 }
 
 bool file_mapped_regions(const char * /*basename*/, std::vector<MappedRegion> & /*out*/) {
@@ -170,14 +196,22 @@ uint64_t mem_total_bytes() {
     return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullTotalPhys : 0;
 }
 
-// The host build exists for the byte-identity gates, not perf measurement, so these stay
-// unmeasured (0) rather than pulling in the imperfect Windows equivalents (PageFaultCount counts
-// soft faults too; GetProcessTimes would work but there is no consumer for it here).
+// No per-process count of HARD faults is published here: PageFaultCount adds the soft ones, which
+// would read a cheap remap as a flash stall. So this stays unmeasured (0), and the dense residency
+// sensor above is the instrument that sees a refaulting dense set on this platform.
 uint64_t major_faults() {
     return 0;
 }
+bool major_faults_counted() {
+    return false;
+}
 double process_cpu_seconds() {
-    return 0.0;
+    FILETIME created, exited, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0.0;
+    auto secs = [](const FILETIME & f) {
+        return (double) (((uint64_t) f.dwHighDateTime << 32) | f.dwLowDateTime) * 1e-7; // 100 ns ticks
+    };
+    return secs(kernel) + secs(user);
 }
 
 size_t fault_bytes() {
@@ -196,6 +230,24 @@ bool device_memory(DeviceMemory * out) {
     out->free_bytes = (uint64_t) ms.ullAvailPhys; // no separate "free vs reclaimable" here
     out->swap_free_bytes = (uint64_t) ms.ullAvailPageFile;
     return true;
+}
+
+// The commit limit is RAM plus the pagefiles, so a limit above RAM is a pagefile that exists. What
+// the memory manager compresses first is not published to a process, so it is not claimed.
+bool reclaim_facts(ReclaimFacts * out) {
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    if (!GlobalMemoryStatusEx(&ms)) return false;
+    out->swaps = ms.ullTotalPageFile > ms.ullTotalPhys;
+    return true;
+}
+
+uint64_t cgroup_memory_left(const char *, const char *) {
+    return 0; // job objects, not control groups, cap a process here; none is read yet
+}
+
+uint32_t cgroup_cpu_limit(const char *, const char *) {
+    return 0;
 }
 
 #else
@@ -302,6 +354,16 @@ void vm_drop_file_pages(void * p, size_t sz) {
     // touches this range again — the drop just reclaims the double residency, it does not lose data.
     if (sz) madvise(p, sz, MADV_DONTNEED);
 }
+void drop_file_cache(const char * path) {
+#if defined(__APPLE__)
+    (void) path; // no posix_fadvise on Darwin
+#else
+    const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); // advice only: a failure keeps the pages
+    ::close(fd);
+#endif
+}
 void vm_drop_anon_pages(void * p, size_t sz) {
     // On private anonymous memory MADV_DONTNEED frees the pages and leaves the range mapped: a later
     // read sees zeros, a later write faults in a fresh page. Advice only; a failure keeps the pages.
@@ -390,14 +452,19 @@ uint64_t mem_available_bytes() {
     if (host_vm(&vm)) return host_available_pages(vm) * (uint64_t) vm_page();
 #endif
     // Linux/Android: MemAvailable is the kernel's own estimate of what can be allocated without
-    // swapping (it accounts for reclaimable page cache), which is exactly the sizing signal we want.
+    // swapping (it accounts for reclaimable page cache), which is exactly the sizing signal we want,
+    // capped by what this process's control group still lets it take: in a container the machine's
+    // free memory is not this process's to use (a rented box reported 103 GB available inside an
+    // 85 GiB group).
     if (FILE * f = std::fopen("/proc/meminfo", "re")) {
         char line[256];
         while (std::fgets(line, sizeof(line), f)) {
             unsigned long long kb = 0;
             if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
                 std::fclose(f);
-                return (uint64_t) kb * 1024ull;
+                const uint64_t available = (uint64_t) kb * 1024ull;
+                const uint64_t group = cgroup_memory_left();
+                return group ? std::min(available, group) : available;
             }
         }
         std::fclose(f);
@@ -418,6 +485,9 @@ uint64_t major_faults() {
     struct rusage ru;
     return getrusage(RUSAGE_SELF, &ru) == 0 ? (uint64_t) ru.ru_majflt : 0;
 }
+bool major_faults_counted() {
+    return true;
+}
 
 double process_cpu_seconds() {
     // Total CPU consumed across all threads. Divided by wall×threads downstream, this is the
@@ -437,8 +507,9 @@ size_t fault_bytes() {
 }
 
 // Scan a "Key: <n> kB" file for the keys we want in one pass, rather than one open per field.
+// Unused on Apple, which asks the kernel for the same figures (task_info, sysctl).
 namespace {
-bool scan_kb_file(const char * path, const char * const * keys, uint64_t * out, int n) {
+[[maybe_unused]] bool scan_kb_file(const char * path, const char * const * keys, uint64_t * out, int n) {
     FILE * f = std::fopen(path, "re");
     if (!f) return false;
     char line[256];
@@ -461,18 +532,180 @@ bool scan_kb_file(const char * path, const char * const * keys, uint64_t * out, 
 }
 } // namespace
 
+namespace {
+// One number from a cgroup file: a decimal, or "max" (no limit, reported as 0). False if unreadable.
+bool read_cgroup_number(const std::string & path, uint64_t * out) {
+    FILE * f = std::fopen(path.c_str(), "re");
+    if (!f) return false;
+    char buf[64] = {0};
+    const bool got = std::fgets(buf, sizeof(buf), f) != nullptr;
+    std::fclose(f);
+    if (!got) return false;
+    if (std::strncmp(buf, "max", 3) == 0) {
+        *out = 0;
+        return true;
+    }
+    char * end = nullptr;
+    const unsigned long long v = std::strtoull(buf, &end, 10);
+    if (end == buf) return false;
+    *out = (uint64_t) v;
+    return true;
+}
+
+// A key's value in a cgroup memory.stat ("inactive_file 12345"), 0 when absent.
+uint64_t read_cgroup_stat(const std::string & path, const char * key) {
+    FILE * f = std::fopen(path.c_str(), "re");
+    if (!f) return 0;
+    char line[256];
+    const size_t klen = std::strlen(key);
+    uint64_t v = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::strncmp(line, key, klen) == 0 && line[klen] == ' ') {
+            v = (uint64_t) std::strtoull(line + klen + 1, nullptr, 10);
+            break;
+        }
+    }
+    std::fclose(f);
+    return v;
+}
+
+// A v1 limit at or above this is the kernel's "unlimited" (PAGE_COUNTER_MAX rounded to a page),
+// not a cap anyone set.
+constexpr uint64_t k_cgroup_v1_unlimited = 1ull << 62;
+
+// Where this process sits: "0::<path>" for the unified hierarchy, "<n>:<controllers>:<path>" for a
+// v1 hierarchy, of which the one naming `controller` is kept with its mount's directory name.
+struct CgroupPlace {
+    bool v2 = false, v1 = false;
+    std::string v2_path, v1_path, v1_dir;
+};
+CgroupPlace cgroup_place(const char * self, const char * controller) {
+    CgroupPlace c;
+    FILE * f = std::fopen(self, "re");
+    if (!f) return c;
+    char line[1024];
+    while (std::fgets(line, sizeof(line), f)) {
+        std::string l(line);
+        while (!l.empty() && (l.back() == '\n' || l.back() == '\r'))
+            l.pop_back();
+        if (l.rfind("0::", 0) == 0) {
+            c.v2 = true;
+            c.v2_path = l.substr(3);
+        } else {
+            const size_t a = l.find(':'), b = a == std::string::npos ? a : l.find(':', a + 1);
+            if (b == std::string::npos) continue;
+            const std::string controllers = l.substr(a + 1, b - a - 1);
+            if (("," + controllers + ",").find("," + std::string(controller) + ",") != std::string::npos) {
+                c.v1 = true;
+                c.v1_path = l.substr(b + 1);
+                c.v1_dir = controllers; // mounted as "cpu,cpuacct" with "cpu" a link to it
+            }
+        }
+    }
+    std::fclose(f);
+    return c;
+}
+
+// Each directory from the group up to the root of what this namespace shows: a limit anywhere
+// above applies too.
+template <typename F> void cgroup_walk(const std::string & base, std::string path, F && visit) {
+    for (;;) {
+        visit(base + (path == "/" ? "" : path));
+        if (path.empty() || path == "/") break;
+        const size_t slash = path.find_last_of('/');
+        path = slash == 0 || slash == std::string::npos ? "/" : path.substr(0, slash);
+    }
+}
+} // namespace
+
+uint64_t cgroup_memory_left(const char * fs_root, const char * self) {
+    const CgroupPlace place = cgroup_place(self, "memory");
+    const std::string root = fs_root;
+    uint64_t best = 0; // the tightest finite remainder found
+    auto consider = [&](uint64_t limit, uint64_t used, uint64_t reclaimable) {
+        if (limit == 0) return;
+        const uint64_t held = used > reclaimable ? used - reclaimable : 0;
+        const uint64_t left = limit > held ? limit - held : 1; // over the cap: nothing left, but known
+        if (best == 0 || left < best) best = left;
+    };
+    auto walk = [&](const std::string & base, const std::string & path, const char * max_f, const char * cur_f,
+                    const char * stat_key, bool v1_units) {
+        cgroup_walk(base, path, [&](const std::string & dir) {
+            uint64_t limit = 0, used = 0;
+            if (read_cgroup_number(dir + "/" + max_f, &limit) && read_cgroup_number(dir + "/" + cur_f, &used)) {
+                if (v1_units && limit >= k_cgroup_v1_unlimited) limit = 0;
+                consider(limit, used, read_cgroup_stat(dir + "/memory.stat", stat_key));
+            }
+        });
+    };
+    if (place.v2) walk(root, place.v2_path, "memory.max", "memory.current", "inactive_file", false);
+    if (place.v1)
+        walk(root + "/memory", place.v1_path, "memory.limit_in_bytes", "memory.usage_in_bytes", "total_inactive_file",
+             true);
+    return best;
+}
+
+uint32_t cgroup_cpu_limit(const char * fs_root, const char * self) {
+    const CgroupPlace place = cgroup_place(self, "cpu");
+    const std::string root = fs_root;
+    double best = 0.0; // the tightest quota found, in CPUs
+    auto consider = [&](long long quota, long long period) {
+        if (quota <= 0 || period <= 0) return; // "max" or v1's -1: no quota
+        const double cpus = (double) quota / (double) period;
+        if (best == 0.0 || cpus < best) best = cpus;
+    };
+    if (place.v2)
+        cgroup_walk(root, place.v2_path, [&](const std::string & dir) {
+            // "<quota> <period>", the quota "max" where none is set.
+            FILE * f = std::fopen((dir + "/cpu.max").c_str(), "re");
+            if (!f) return;
+            char q[32] = {0};
+            long long period = 0;
+            if (std::fscanf(f, "%31s %lld", q, &period) == 2 && std::strcmp(q, "max") != 0)
+                consider(std::strtoll(q, nullptr, 10), period);
+            std::fclose(f);
+        });
+    if (place.v1)
+        cgroup_walk(root + "/" + place.v1_dir, place.v1_path, [&](const std::string & dir) {
+            long long quota = 0, period = 0;
+            FILE * fq = std::fopen((dir + "/cpu.cfs_quota_us").c_str(), "re");
+            FILE * fp = std::fopen((dir + "/cpu.cfs_period_us").c_str(), "re");
+            if (fq && fp && std::fscanf(fq, "%lld", &quota) == 1 && std::fscanf(fp, "%lld", &period) == 1)
+                consider(quota, period);
+            if (fq) std::fclose(fq);
+            if (fp) std::fclose(fp);
+        });
+    // A fraction of a CPU is still a thread that runs: 1.5 CPUs serve two, throttled.
+    return best > 0.0 ? (uint32_t) std::ceil(best - 1e-9) : 0;
+}
+
 #if defined(__APPLE__)
 // The task's own ledger carries the same split /proc/self/status does: internal pages are the
 // anonymous ones, external the file-backed ones, and what the compressor holds is the anonymous
 // memory already taken back — the role zram plays in VmSwap.
 bool process_memory(ProcessMemory * out) {
-    task_vm_info_data_t ti;
+    task_vm_info_data_t ti{};
     mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
-    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t) &ti, &n) != KERN_SUCCESS) return false;
-    out->rss_bytes = ti.resident_size;
-    out->rss_anon_bytes = ti.internal;
-    out->rss_file_bytes = ti.external;
-    out->swap_bytes = ti.compressed;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t) &ti, &n) != KERN_SUCCESS || n < TASK_VM_INFO_REV0_COUNT)
+        return false;
+    ProcessMemory sample;
+    sample.rss_bytes = ti.resident_size;
+    sample.rss_anon_bytes = ti.internal;
+    sample.rss_file_bytes = ti.external;
+    sample.swap_bytes = ti.compressed;
+    // Older kernels can successfully return an earlier revision of this variable-length reply.
+    if (n >= TASK_VM_INFO_REV1_COUNT) {
+        sample.process_footprint_known = true;
+        sample.process_footprint_bytes = ti.phys_footprint;
+    }
+#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR && !TARGET_OS_MACCATALYST
+    // This build runs in an app on the device. Zero is a real exhausted allowance there; the
+    // simulator has no app limit and must stay unknown. The API also returns zero for non-app
+    // processes, which are not a supported execution context for the device engine.
+    sample.process_headroom_known = true;
+    sample.process_headroom_bytes = (uint64_t) os_proc_available_memory();
+#endif
+    *out = sample;
     return true;
 }
 
@@ -491,15 +724,43 @@ bool device_memory(DeviceMemory * out) {
     out->compressed_held_bytes = (uint64_t) vm.compressor_page_count * (uint64_t) vm_page();
     return true;
 }
+
+bool reclaim_facts(ReclaimFacts * out) {
+#if TARGET_OS_IPHONE
+    // The share's remainder is published only where there is a share: 0 on the simulator, which
+    // runs on the host's kernel and is answered by the host's facts below.
+    out->own_share_left = (uint64_t) os_proc_available_memory();
+#endif
+    vm_statistics64_data_t vm;
+    if (!host_vm(&vm)) return out->own_share_left > 0;
+    // Compressions since boot: a kernel that compresses has done so within seconds of starting.
+    out->compresses = vm.compressions > 0;
+    // Swap files are created on demand, so an empty total says nothing; the switch does.
+    int enabled = 0;
+    size_t len = sizeof(enabled);
+    struct xsw_usage sw;
+    size_t swlen = sizeof(sw);
+    out->swaps = (sysctlbyname("vm.swap_enabled", &enabled, &len, nullptr, 0) == 0 && enabled != 0) ||
+                 (sysctlbyname("vm.swapusage", &sw, &swlen, nullptr, 0) == 0 && sw.xsu_total > 0);
+    return true;
+}
 #else
 bool process_memory(ProcessMemory * out) {
     static const char * const keys[] = {"VmRSS", "RssAnon", "RssFile", "VmSwap"};
     uint64_t v[4] = {0, 0, 0, 0};
     if (!scan_kb_file("/proc/self/status", keys, v, 4)) return false;
-    out->rss_bytes = v[0];
-    out->rss_anon_bytes = v[1];
-    out->rss_file_bytes = v[2];
-    out->swap_bytes = v[3];
+    ProcessMemory sample;
+    sample.rss_bytes = v[0];
+    sample.rss_anon_bytes = v[1];
+    sample.rss_file_bytes = v[2];
+    sample.swap_bytes = v[3];
+    // A control group's limit is the bytes left before the kernel ends this process, the same
+    // fact an app's own share is where the platform keeps one.
+    if (const uint64_t left = cgroup_memory_left()) {
+        sample.process_headroom_known = true;
+        sample.process_headroom_bytes = left;
+    }
+    *out = sample;
     return true;
 }
 
@@ -521,6 +782,41 @@ bool device_memory(DeviceMemory * out) {
         }
         std::fclose(f);
     }
+    return true;
+}
+
+// What the machine reclaims INTO. /proc/swaps would say directly, but an unprivileged process on
+// Android may not read it (nor a zram device's own files). Two things it CAN see suffice: whether a
+// zram block device EXISTS (the directory entry is visible even where its files are not) and
+// whether /proc/meminfo reports any swap at all. A zram device that is swapped to means anonymous
+// memory is compressed in RAM; swap without zram means it is written out.
+//
+// Any zram device, not the first: devices are numbered as they are added, and a machine that
+// removed zram0 or configures several swaps on zram1.. compresses just the same. Where the listing
+// is refused, the device the kernel creates first is still asked for by name.
+bool reclaim_facts(ReclaimFacts * out) {
+    static const char * const keys[] = {"SwapTotal"};
+    uint64_t swap_total = 0;
+    if (!scan_kb_file("/proc/meminfo", keys, &swap_total, 1)) return false;
+    bool has_zram = false;
+    if (DIR * d = ::opendir("/sys/block")) {
+        while (const dirent * e = ::readdir(d)) {
+            if (std::strncmp(e->d_name, "zram", 4) == 0) {
+                has_zram = true;
+                break;
+            }
+        }
+        ::closedir(d);
+    }
+    if (!has_zram) {
+        struct stat st {};
+        has_zram = ::stat("/sys/block/zram0", &st) == 0;
+    }
+    out->swaps = swap_total > 0;
+    out->compresses = has_zram && out->swaps;
+    // A control group with a finite limit ends the process past it, whatever the machine could
+    // still compress or swap: the group's remainder is this process's share.
+    out->own_share_left = cgroup_memory_left();
     return true;
 }
 #endif
@@ -593,11 +889,132 @@ bool file_mapped_regions(const char * basename, std::vector<MappedRegion> & out)
 // ── A second process, for work that can end one ─────────────────────────────────────────
 #if defined(_WIN32)
 
-bool can_run_self() {
-    return false; // not implemented here: a caller does the work in its own process
+std::string self_path() {
+    char buf[4096];
+    const DWORD n = GetModuleFileNameA(nullptr, buf, (DWORD) sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return "";
+    return std::string(buf, n);
 }
-ChildResult run_self(const std::vector<std::string> &, double, std::string *) {
-    return ChildResult{};
+
+bool can_run_self() {
+    return !self_path().empty();
+}
+
+namespace {
+// One argument, quoted the way the C runtime of the child reads it back: a quote is escaped, and
+// backslashes are literal except the run that precedes a quote or the end, which is doubled.
+void append_quoted(std::string & cmd, const std::string & a) {
+    cmd += ' ';
+    cmd += '"';
+    size_t bs = 0;
+    for (char c : a) {
+        if (c == '\\') {
+            ++bs;
+            continue;
+        }
+        if (c == '"') {
+            cmd.append(bs * 2 + 1, '\\');
+        } else {
+            cmd.append(bs, '\\');
+        }
+        bs = 0;
+        cmd += c;
+    }
+    cmd.append(bs * 2, '\\');
+    cmd += '"';
+}
+
+// Whatever the pipe holds right now, appended to the tail kept for the caller.
+bool drain_pipe(HANDLE rd, std::string * out, size_t keep) {
+    for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr)) return false; // the child closed its end
+        if (avail == 0) return true;
+        char buf[8192];
+        DWORD want = avail < (DWORD) sizeof(buf) ? avail : (DWORD) sizeof(buf);
+        DWORD n = 0;
+        if (!ReadFile(rd, buf, want, &n, nullptr) || n == 0) return false;
+        if (out) {
+            out->append(buf, (size_t) n);
+            if (out->size() > 2 * keep) out->erase(0, out->size() - keep);
+        }
+    }
+}
+} // namespace
+
+ChildResult run_self(const std::vector<std::string> & args, double timeout_seconds, std::string * out) {
+    ChildResult r;
+    const std::string path = self_path();
+    if (path.empty()) return r;
+
+    // One pipe carries the child's stdout and stderr; only the parent's end stays uninherited.
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return r;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+    std::string cmd;
+    append_quoted(cmd, path);
+    for (const std::string & a : args)
+        append_quoted(cmd, a);
+    std::vector<char> cmdline(cmd.begin() + 1, cmd.end()); // without the leading space
+    cmdline.push_back(0);
+
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr;
+    si.hStdError = wr;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION pi{};
+    const BOOL started = CreateProcessA(path.c_str(), cmdline.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
+                                        nullptr, &si, &pi);
+    CloseHandle(wr);
+    if (!started) {
+        CloseHandle(rd);
+        return r;
+    }
+
+    // Read until the child closes its end or its time is up. The pipe is polled rather than read
+    // blocking, because a blocking read has no deadline and a child that never answers is the
+    // case this exists for.
+    const size_t keep = 1u << 20;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_seconds);
+    bool timed_out = false;
+    for (;;) {
+        if (!drain_pipe(rd, out, keep)) break;
+        const double left = std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count();
+        if (left <= 0.0) {
+            timed_out = true;
+            break;
+        }
+        const DWORD slice = left * 1000.0 < 100.0 ? (DWORD) (left * 1000.0) + 1 : 100;
+        if (WaitForSingleObject(pi.hProcess, slice) == WAIT_OBJECT_0) {
+            drain_pipe(rd, out, keep); // what it wrote last
+            break;
+        }
+    }
+    CloseHandle(rd);
+    if (timed_out) TerminateProcess(pi.hProcess, 1);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    if (timed_out) {
+        r.outcome = ChildOutcome::TimedOut;
+    } else if (code >= 0xC0000000u) {
+        // An NTSTATUS: the child died of an exception (an access violation is 0xC0000005), which is
+        // this platform's way of saying what a signal says elsewhere.
+        r.outcome = ChildOutcome::Signalled;
+        r.code = (int) code;
+    } else {
+        r.outcome = ChildOutcome::Exited;
+        r.code = (int) code;
+    }
+    return r;
 }
 
 #else
@@ -606,8 +1023,6 @@ ChildResult run_self(const std::vector<std::string> &, double, std::string *) {
 extern char ** environ;
 namespace bmoe::pio {
 
-namespace {
-// The path the kernel started this process from. Not argv[0], which is whatever the caller typed.
 std::string self_path() {
 #if defined(__APPLE__)
     char buf[4096];
@@ -622,7 +1037,6 @@ std::string self_path() {
     return buf;
 #endif
 }
-} // namespace
 
 bool can_run_self() {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -818,13 +1232,33 @@ size_t direct_alignment(fd_t fd) {
 // One section for every platform: Android and Darwin have such a store, everywhere else this
 // reports "unsupported" and callers fall back to an ordinary allocation. Declared in the header with the measured
 // properties and the reason the ceiling is a lock boundary rather than an allocation one.
+LockLimit intersect_lock_limits(LockLimit a, LockLimit b) {
+    if ((a.known && a.bytes == 0) || (b.known && b.bytes == 0)) return {0, true};
+    return {std::min<uint64_t>(a.bytes, b.bytes), a.known && b.known};
+}
+
+LockLimit remaining_lock_limit(LockLimit limit, uint64_t held, bool held_known) {
+    if (limit.known && limit.bytes == 0) return limit;
+    if (limit.bytes == lock_unbounded) return limit;
+    if (!held_known) return {limit.bytes, false};
+    return {limit.bytes > held ? limit.bytes - held : 0, limit.known};
+}
+
+uint64_t lockable_bytes() {
+    return lockable_limit().bytes;
+}
+
+uint64_t lock_in_place_bytes() {
+    return lock_in_place_limit().bytes;
+}
+
 #if !defined(_WIN32)
 namespace {
 // What this process may lock in place, as the kernel's own per-process limit states it.
-uint64_t memlock_limit() {
+LockLimit memlock_limit() {
     struct rlimit r {};
-    if (getrlimit(RLIMIT_MEMLOCK, &r) != 0) return 0;
-    return r.rlim_cur == RLIM_INFINITY ? lock_unbounded : (uint64_t) r.rlim_cur;
+    if (getrlimit(RLIMIT_MEMLOCK, &r) != 0) return {};
+    return {r.rlim_cur == RLIM_INFINITY ? lock_unbounded : (uint64_t) r.rlim_cur, true};
 }
 } // namespace
 #endif
@@ -834,10 +1268,10 @@ uint64_t memlock_limit() {
 // A dma-buf is charged to no limit this process can read: gralloc publishes no total, so the
 // answer is "unbounded here" and the caller bounds it by what the process may hold. Locking in
 // place is a different store with a different answer - the vendor caps it at a few pages.
-uint64_t lockable_bytes() {
-    return lock_unbounded;
+LockLimit lockable_limit() {
+    return {lock_unbounded, true};
 }
-uint64_t lock_in_place_bytes() {
+LockLimit lock_in_place_limit() {
     return memlock_limit();
 }
 
@@ -886,14 +1320,21 @@ void pinned_free(PinnedAlloc * a) {
 
 #elif defined(__APPLE__)
 
+namespace {
+LockLimit wire_limit(const char * name) {
+    uint64_t limit = 0;
+    size_t len = sizeof(limit);
+    if (sysctlbyname(name, &limit, &len, nullptr, 0) != 0) return {};
+    return {limit, true};
+}
+} // namespace
+
 // Darwin's reclaim-exempt store is wired memory: an anonymous mapping the process has locked, which
 // the kernel neither swaps nor compresses. Any process may ask, up to a system-wide limit that is
 // most of RAM, so the limit is read rather than assumed.
 size_t pinned_max_bytes() {
-    uint64_t limit = 0;
-    size_t len = sizeof(limit);
-    if (sysctlbyname("vm.user_wire_limit", &limit, &len, nullptr, 0) != 0) return 0;
-    return (size_t) limit;
+    const LockLimit limit = wire_limit("vm.user_wire_limit");
+    return limit.known ? (size_t) limit.bytes : 0;
 }
 // What is left of that limit, and the limit is GLOBAL: it bounds the wired memory of the whole
 // system, the kernel's own included, not this process's share of it. Measured by locking anonymous
@@ -901,20 +1342,20 @@ size_t pinned_max_bytes() {
 // system's wired count stood at 10368, on a machine whose limit is 12451. So a device that wires
 // its buffers, or any other process that locks memory, shrinks this without this process having
 // allocated anything - which is why it is read each time rather than derived from the limit.
-uint64_t lockable_bytes() {
-    uint64_t global = 0;
-    size_t len = sizeof(global);
-    if (sysctlbyname("vm.global_user_wire_limit", &global, &len, nullptr, 0) != 0) return 0;
-    vm_statistics64_data_t vm;
-    if (!host_vm(&vm)) return 0;
-    const uint64_t wired = (uint64_t) vm.wire_count * (uint64_t) vm_page();
-    const uint64_t left = global > wired ? global - wired : 0;
-    return std::min({left, (uint64_t) pinned_max_bytes(), memlock_limit()});
+LockLimit lockable_limit() {
+    const LockLimit global = wire_limit("vm.global_user_wire_limit");
+    vm_statistics64_data_t vm{};
+    const bool usage_known = host_vm(&vm);
+    const uint64_t wired = usage_known ? (uint64_t) vm.wire_count * (uint64_t) vm_page() : 0;
+    const LockLimit left = remaining_lock_limit(global, wired, usage_known);
+    // These queries can be denied independently. Keep every finite bound that did answer without
+    // turning a denied sysctl into a zero grant; mlock remains the authority on an actual request.
+    return intersect_lock_limits(left, intersect_lock_limits(wire_limit("vm.user_wire_limit"), memlock_limit()));
 }
 // One store: a wired anonymous mapping is the same thing whether it was locked when it was
 // allocated or afterwards.
-uint64_t lock_in_place_bytes() {
-    return lockable_bytes();
+LockLimit lock_in_place_limit() {
+    return lockable_limit();
 }
 bool pinned_alloc(size_t sz, PinnedAlloc * out) {
     if (!sz || !out) return false;
@@ -943,12 +1384,12 @@ size_t pinned_max_bytes() {
 // No reclaim-exempt allocation here, so nothing to total. Locking in place is whatever the
 // process limit says, and on Windows nothing: VirtualLock is bounded by a working-set quota that
 // is not ours to raise, which is why vm_pin declines there.
-uint64_t lockable_bytes() {
-    return 0;
+LockLimit lockable_limit() {
+    return {0, true};
 }
-uint64_t lock_in_place_bytes() {
+LockLimit lock_in_place_limit() {
 #if defined(_WIN32)
-    return 0;
+    return {0, true};
 #else
     return memlock_limit();
 #endif

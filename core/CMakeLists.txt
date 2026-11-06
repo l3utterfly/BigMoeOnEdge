@@ -1,6 +1,6 @@
 # bmoe_core — the streaming engine.
 #
-# Pure-policy sources (config validation, the architecture registry, tensor naming, the n-gram draft
+# Pure-policy sources (config validation, the expert layout read from tensor shapes, tensor naming, the n-gram draft
 # matcher, the hardware planner, decide()'s policy) build with no native dependency. The streaming
 # adapters compile only when llama.cpp is present, because they include its public headers
 # (llama.h, ggml.h, gguf.h).
@@ -9,13 +9,18 @@ add_library(bmoe_core STATIC
     src/config.cpp
     src/params.cpp
     src/log.cpp
-    src/moe/arch_registry.cpp
+    src/moe/expert_layout.cpp
     src/moe/tensor_names.cpp
     src/engine/ngram_draft.cpp
     src/plan/plan.cpp
     src/plan/allocate.cpp
     src/plan/planner.cpp
+    src/plan/backend_choice.cpp
+    src/plan/routing.cpp
     src/engine/logits.cpp
+    src/engine/cache_brake.cpp
+    src/engine/knob_trial.cpp
+    src/plan/measured_knobs.cpp
     src/engine/decide/prompt_split.cpp
     src/engine/decide/choice_scorer.cpp
     src/engine/decide/prefix_cache.cpp
@@ -43,6 +48,8 @@ if(BMOE_HAVE_LLAMA)
         src/plan/hardware_probe.cpp
         src/plan/headroom_probe.cpp
         src/plan/bandwidth_probe.cpp
+        src/plan/layer_probe.cpp
+        src/plan/gate_probe.cpp
         src/plan/device_probe.cpp
         src/plan/isolated_probe.cpp
         src/plan/storage_probe.cpp
@@ -50,10 +57,16 @@ if(BMOE_HAVE_LLAMA)
         src/plan/model_probe.cpp
         src/plan/auto_plan.cpp
         src/moe/expert_stream_source.cpp
+        src/moe/gate_gemv.cpp
         src/moe/router_hook.cpp
         src/moe/decide_probe.cpp
         src/moe/device_arena.cpp
         src/engine/session.cpp
+        src/engine/context_checkpoints.cpp
+        src/engine/prompt_stream.cpp
+        src/engine/media_input.cpp
+        src/engine/image_probe.cpp
+        src/engine/llama_log.cpp
         src/engine/prefill_device.cpp
         src/engine/prefill_path.cpp
         src/engine/decide/llama_backend.cpp
@@ -62,55 +75,44 @@ if(BMOE_HAVE_LLAMA)
         src/engine/thinking_control.cpp
         src/engine/runtime.cpp
         src/metrics/csv_metrics_sink.cpp
+        src/metrics/memory_snapshot.cpp
         src/metrics/route_trace_sink.cpp
         src/metrics/decode_trace_sink.cpp
     )
     # `llama` is the stable public API the streaming seam uses. `llama-common` (llama.cpp's
-    # `common` utils) is linked only for chat-template rendering + reasoning parsing
-    # (common_chat_*); it is not a stable API. It propagates the common/ and vendor/ includes.
-    target_link_libraries(bmoe_core PUBLIC llama llama-common)
+    # `common` utils) supplies chat templates/parsing, speculative decoding and template-generated
+    # grammars; it is not a stable API. It propagates the common/ and vendor/ includes.
+    # `mtmd` (llama.cpp's tools/mtmd) is the multimodal projector library: it reads an mmproj file
+    # and encodes images into the embeddings the model decodes (media_input.cpp). Public API of the
+    # tool, built standalone through upstream's own LLAMA_BUILD_MTMD hook; not patched.
+    target_link_libraries(bmoe_core PUBLIC llama llama-common mtmd)
+    # The image header probe (image_probe.cpp) reads with the same stb_image the library decodes with.
+    target_link_libraries(bmoe_core PRIVATE vendor::stb)
     target_compile_definitions(bmoe_core PUBLIC BMOE_HAVE_LLAMA=1)
     find_package(Threads REQUIRED)
     target_link_libraries(bmoe_core PUBLIC Threads::Threads)
 
-    if(ANDROID)
-        # libandroid carries AHardwareBuffer_*, the reclaim-exempt allocation behind
-        # `--dense-weights ahwb` (pio::pinned_alloc). No other platform has an equivalent.
-        target_link_libraries(bmoe_core PUBLIC android)
+    if(APPLE AND GGML_METAL)
+        target_sources(bmoe_core PRIVATE src/plan/metal_memory_probe.mm)
+        set_source_files_properties(src/plan/metal_memory_probe.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_compile_definitions(bmoe_core PRIVATE BMOE_HAVE_METAL_MEMORY_PROBE=1)
+        target_link_libraries(bmoe_core PUBLIC "-framework Metal" "-framework Foundation")
     endif()
 
-    # Intra-layer I/O–compute overlap needs the fork's expert-ready hook in ggml-cpu.h. Detect
-    # it by inspecting the submodule header rather than the git remote, so any tree carrying the
-    # hook (a rebase, a different fork) enables the feature. PUBLIC so cli/ and tests/ see it.
-    #
-    # It also needs the CPU backend to be LINKED. Under GGML_BACKEND_DL that backend is a module
-    # loaded at runtime and its symbols are not available to link against, so the hook is present in
-    # the header and unresolvable at link time - which is a build that fails rather than a feature
-    # that degrades. A dynamic-backend build therefore ships without overlap, and says so here.
-    # Reaching it in that build would mean exposing the hook through
-    # `ggml_backend_reg_get_proc_address`, the way ggml exposes every other backend-specific
-    # function; that is a change to the fork commit, not to this file.
-    #
-    # Relative to this file, not CMAKE_SOURCE_DIR: as a subproject the top-level source dir is the
-    # parent project, and the header would silently not be found. An embedder that links its own
-    # llama/llama-common targets names that checkout in BMOE_LLAMA_SOURCE_DIR: the nested submodule
-    # is not what gets linked, so its header must not decide.
-    if(BMOE_LLAMA_SOURCE_DIR)
-        set(_ggml_cpu_h "${BMOE_LLAMA_SOURCE_DIR}/ggml/include/ggml-cpu.h")
-    else()
-        set(_ggml_cpu_h "${CMAKE_CURRENT_LIST_DIR}/../third_party/llama.cpp/ggml/include/ggml-cpu.h")
+    if(ANDROID)
+        # libandroid carries AHardwareBuffer_*, Android's reclaim-exempt allocation behind
+        # `--dense-weights pinned` (pio::pinned_alloc; Darwin's needs no extra library).
+        target_link_libraries(bmoe_core PUBLIC android)
     endif()
-    if(GGML_BACKEND_DL)
-        message(STATUS "bmoe: dynamic backends - overlap unavailable (the CPU backend is not linked)")
-    elseif(EXISTS "${_ggml_cpu_h}")
-        file(READ "${_ggml_cpu_h}" _ggml_cpu_src)
-        if(_ggml_cpu_src MATCHES "ggml_cpu_set_expert_ready_hook")
-            target_compile_definitions(bmoe_core PUBLIC BMOE_HAVE_EXPERT_READY_HOOK=1)
-            message(STATUS "bmoe: expert-ready hook present (I/O–compute overlap available)")
-        else()
-            message(STATUS "bmoe: expert-ready hook absent (overlap unavailable)")
-        endif()
-    else()
-        message(STATUS "bmoe: expert-ready hook absent (overlap unavailable)")
+    if(WIN32)
+        # QueryWorkingSetEx, behind the dense residency sensor (pio::vm_resident_sample). Newer SDKs
+        # resolve it from kernel32; the import library covers the ones that do not.
+        target_link_libraries(bmoe_core PUBLIC psapi)
     endif()
+
+    # Intra-layer I/O–compute overlap needs the fork's expert-ready hook in the CPU backend. It is
+    # not detected here: the engine asks the CPU backend's registry for it at run time
+    # (`ggml_backend_reg_get_proc_address`), which is what lets the backend be a module loaded
+    # from beside the executable, and lets a build on stock upstream run with overlap refused
+    # rather than fail to link. See bmoe/probe.h (expert_ready_hook_available) and docs/seam.md.
 endif()

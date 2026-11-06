@@ -1,13 +1,19 @@
 package io.bigmoeonedge.app.engine
 
+import io.bigmoeonedge.app.chat.Chat
+
 import android.content.Context
 import android.content.Intent
 import androidx.core.content.ContextCompat
 import io.bigmoeonedge.app.data.AppPrefs
 import io.bigmoeonedge.app.data.CatalogEntry
+import io.bigmoeonedge.app.data.HfFacts
+import io.bigmoeonedge.app.data.HfModels
+import io.bigmoeonedge.app.data.HfSearch
+import io.bigmoeonedge.app.data.hfSearchBody
+import io.bigmoeonedge.app.data.hfRequestBody
 import io.bigmoeonedge.app.data.MetricsRecorder
 import io.bigmoeonedge.app.data.Telemetry
-import io.bigmoeonedge.app.data.Thermal
 import io.bigmoeonedge.app.data.applyDone
 import io.bigmoeonedge.app.data.applyToken
 import kotlinx.coroutines.CoroutineScope
@@ -42,6 +48,8 @@ data class ModelInfo(
     /** What a CPU figure is read against: the session's compute threads, and every busy thread. */
     val computeThreads: Int,
     val busyThreads: Int,
+    /** The context against what a client of the server sends; null from a server that does not say. */
+    val ctxAdvice: CtxAdvice? = null,
 ) {
     companion object {
         fun of(o: JSONObject?): ModelInfo? {
@@ -50,7 +58,30 @@ data class ModelInfo(
                 o.optString("name"), o.optString("path"), o.optString("arch"), o.optInt("n_ctx"),
                 o.optInt("n_expert_used"), o.optString("think_ctl", "template"), o.optDouble("load_s", 0.0),
                 o.optBoolean("streaming", false), o.optInt("compute_threads", 0), o.optInt("busy_threads", 0),
+                CtxAdvice.of(o.optJSONObject("ctx_advice")),
             )
+        }
+    }
+}
+
+/**
+ * `model.ctx_advice` (docs/server-api.md): the context a client of the server needs, whether the
+ * session's is below it, the parameter that raises it, whether a request was refused for it since
+ * the load, and whether to warn (short, and served on the network or refused). The app shows these
+ * and names neither the number nor the key (engine/ContextAdvice.kt).
+ */
+data class CtxAdvice(
+    val recommended: Int,
+    val short: Boolean,
+    val param: String,
+    val warn: Boolean = false,
+    val refused: Boolean = false,
+) {
+    companion object {
+        fun of(o: JSONObject?): CtxAdvice? {
+            if (o == null || !o.has("recommended") || o.optString("param").isEmpty()) return null
+            return CtxAdvice(o.optInt("recommended"), o.optBoolean("short", false), o.optString("param"),
+                o.optBoolean("warn", false), o.optBoolean("refused", false))
         }
     }
 }
@@ -85,12 +116,29 @@ data class ServerInfo(
     }
 }
 
-data class PlanDecision(val knob: String, val value: String, val source: String, val reason: String) {
+data class PlanDecision(
+    val knob: String,
+    val value: String,
+    val source: String,
+    val reason: String,
+    /** The knob's settings label; empty when it is not a parameter. */
+    val label: String = "",
+    /** set | kept | notes: a setting the plan decided, one it left, a note that is no setting. */
+    val group: String = "",
+    /** The decision in one short line; [reason] is the full account. Empty from an older server. */
+    val brief: String = "",
+    /** [value] as a person reads it ("4.6 GiB", "pinned in memory"). */
+    val valueText: String = "",
+) {
+
     companion object {
         fun list(arr: JSONArray?): List<PlanDecision> = arr?.let { a ->
             (0 until a.length()).map { i ->
                 val d = a.getJSONObject(i)
-                PlanDecision(d.optString("knob"), d.optString("value"), d.optString("source"), d.optString("reason"))
+                PlanDecision(
+                    d.optString("knob"), d.optString("value"), d.optString("source"), d.optString("reason"),
+                    d.optString("label"), d.optString("group"), d.optString("brief"), d.optString("value_text"),
+                )
             }
         }.orEmpty()
     }
@@ -105,6 +153,10 @@ data class ConfigState(
     val reloadRequired: Boolean,
     val plan: List<PlanDecision>?,
     val autoPlan: Boolean,
+    /** The user keys the server was launched with: "reset all my values" leaves them. */
+    val launchKeys: Set<String> = emptySet(),
+    /** The session-scoped parameters whose value differs from the loaded session's, in table order. */
+    val reloadKeys: List<String> = emptyList(),
 ) {
     fun value(key: String): Any? = values[key]
     fun text(key: String): String = values[key]?.toString().orEmpty()
@@ -113,7 +165,8 @@ data class ConfigState(
         fun of(o: JSONObject): ConfigState {
             val v = o.optJSONObject("values") ?: JSONObject()
             val values = v.keys().asSequence().associateWith { k -> if (v.isNull(k)) null else v.get(k) }
-            val uk = o.optJSONArray("user_keys")?.let { a -> (0 until a.length()).map { a.getString(it) } }.orEmpty()
+            fun strings(k: String) = o.optJSONArray(k)?.let { a -> (0 until a.length()).map { a.getString(it) } }.orEmpty()
+            val uk = strings("user_keys")
             return ConfigState(
                 values = values,
                 userKeys = uk.toSet(),
@@ -122,6 +175,8 @@ data class ConfigState(
                 reloadRequired = o.optBoolean("reload_required", false),
                 plan = if (o.isNull("plan")) null else PlanDecision.list(o.optJSONArray("plan")),
                 autoPlan = o.optBoolean("auto_plan", false),
+                launchKeys = strings("launch_keys").toSet(),
+                reloadKeys = strings("reload_keys"),
             )
         }
     }
@@ -132,6 +187,8 @@ data class LocalModel(
     val path: String,
     /** The directory the server found it in: its models directory, or one the app gave it to scan. */
     val dir: String,
+    /** The folder directly inside [dir] it sits in, "" when it is in [dir] itself. */
+    val folder: String = "",
     val bytes: Long,
     val shards: Int,
     /** Every file of the model that is present, in shard order: what a delete removes. */
@@ -139,6 +196,8 @@ data class LocalModel(
     val arch: String,
     val streamable: Boolean,
     val complete: Boolean,
+    /** What the header says it is for: "model", "projector", "draft", "other"; "" when unreadable (data/FileRole.kt). */
+    val role: String = "",
 )
 
 /** `GET /api/models`: the server's directories, and the catalog with the server's view of each entry. */
@@ -162,12 +221,14 @@ data class ModelsList(
                         name = m.optString("name"),
                         path = m.optString("path"),
                         dir = m.optString("dir"),
+                        folder = m.optString("folder", ""),
                         bytes = m.optLong("bytes"),
                         shards = m.optInt("shards", 1),
                         files = strings(m.optJSONArray("files")),
                         arch = m.optString("arch"),
                         streamable = m.optBoolean("streamable", false),
                         complete = m.optBoolean("complete", true),
+                        role = m.optString("role", ""),
                     )
                 }
             }.orEmpty()
@@ -194,9 +255,68 @@ data class PlanResult(
     val warning: String,
     val fromLastLoad: Boolean,
     val explain: String,
+    /** What the plan decided, in one sentence; empty from a server that does not say. */
+    val sentence: String = "",
+    val lanes: List<PlanLane> = emptyList(),
+    /** Decode as the plan priced it: seconds per token (0 = no prediction), cache hits (-1 = none). */
+    val predictedSPerToken: Double = 0.0,
+    val predictedHitPct: Double = -1.0,
+    /** What the loaded model's last turn measured; compared to the prediction only under [fromLastLoad]. */
+    val measured: PlanMeasured? = null,
+    val pools: List<PlanPool> = emptyList(),
+    val devices: List<PlanDevice> = emptyList(),
+    /** Why there is no device beyond the host, in words; empty when there is one. */
+    val devicesNoneText: String = "",
+    /** The server holds no plan yet (`?cached=1`): nothing was measured. */
+    val none: Boolean = false,
+    /** The last plan held, read without measuring. */
+    val cached: Boolean = false,
 ) {
     companion object {
-        fun of(o: JSONObject): PlanResult = PlanResult(
+        private fun strings(a: JSONArray?): List<String> = a?.let { (0 until it.length()).map { i -> it.getString(i) } }.orEmpty()
+        private fun objects(a: JSONArray?): List<JSONObject> = a?.let { (0 until it.length()).map { i -> it.getJSONObject(i) } }.orEmpty()
+
+        fun of(o: JSONObject): PlanResult = base(o).copy(
+            sentence = o.optJSONObject("summary")?.optString("sentence").orEmpty(),
+            lanes = objects(o.optJSONObject("summary")?.optJSONArray("lanes")).map {
+                PlanLane(it.optString("label").ifEmpty { it.optString("phase") }, strings(it.optJSONArray("on")))
+            },
+            predictedSPerToken = o.optJSONObject("predicted")?.optDouble("s_per_token", 0.0) ?: 0.0,
+            predictedHitPct = o.optJSONObject("predicted")?.optDouble("cache_hit_pct", -1.0) ?: -1.0,
+            measured = o.optJSONObject("measured")?.let {
+                PlanMeasured(it.optDouble("s_per_token", 0.0), it.optDouble("cache_hit_pct", -1.0), it.optInt("tokens"))
+            },
+            pools = objects(o.optJSONObject("memory")?.optJSONArray("pools")).map { p ->
+                PlanPool(
+                    label = p.optString("label").ifEmpty { p.optString("name") },
+                    estimated = p.optBoolean("estimated"),
+                    capBytes = p.optLong("cap_bytes"),
+                    lockedBytes = p.optLong("locked_bytes"),
+                    name = p.optString("name"),
+                    heldBytes = p.optLong("held_bytes"),
+                    rows = objects(p.optJSONArray("rows")).map {
+                        PlanRow(it.optString("label").ifEmpty { it.optString("name") }, it.optLong("bytes"), it.optBoolean("locked"), it.optBoolean("in_turn"))
+                    },
+                )
+            },
+            devices = objects(o.optJSONArray("devices")).map {
+                PlanDevice(
+                    name = it.optString("name"),
+                    description = it.optString("description"),
+                    cpu = it.optBoolean("cpu"),
+                    promptRatio = it.optDouble("prompt_ratio", 0.0),
+                    rateText = it.optString("rate_text"),
+                    status = it.optString("status"),
+                    badge = it.optString("badge").ifEmpty { it.optString("status") },
+                    why = it.optString("why"),
+                )
+            },
+            devicesNoneText = o.optString("devices_none_text"),
+            none = o.optBoolean("none", false),
+            cached = o.optBoolean("cached", false),
+        )
+
+        private fun base(o: JSONObject): PlanResult = PlanResult(
             available = o.optBoolean("available", false),
             error = o.optString("error").ifEmpty { o.optString("reason") },
             model = o.optString("model"),
@@ -205,14 +325,52 @@ data class PlanResult(
             declined = o.optBoolean("streaming_declined", false),
             declineReason = o.optString("decline_reason"),
             decisions = PlanDecision.list(o.optJSONArray("decisions")),
-            args = o.optJSONArray("args")?.let { a -> (0 until a.length()).map { a.getString(it) } }.orEmpty(),
-            notApplicable = o.optJSONArray("not_applicable")?.let { a -> (0 until a.length()).map { a.getString(it) } }.orEmpty(),
+            args = strings(o.optJSONArray("args")),
+            notApplicable = strings(o.optJSONArray("not_applicable")),
             warning = o.optString("warning"),
             fromLastLoad = o.optBoolean("from_last_load", false),
             explain = o.optString("explain"),
         )
     }
 }
+
+// The plan as the Plan screen draws it (server/plan_view.h). Every word arrives from the server;
+// a code (`status`) is kept only to pick a colour.
+
+/** Which phase runs where, in words, on these devices by name. */
+data class PlanLane(val label: String, val on: List<String>)
+
+data class PlanMeasured(val sPerToken: Double, val cacheHitPct: Double, val tokens: Int)
+
+/** One line of the memory ledger. `inTurn`: lent by the expert cache while a prompt runs. */
+data class PlanRow(val label: String, val bytes: Long, val locked: Boolean, val inTurn: Boolean)
+
+/** One memory pool: the host's, or a device's that is its own. `estimated`: an even share of a sum. */
+data class PlanPool(
+    val label: String,
+    val estimated: Boolean,
+    val capBytes: Long,
+    val lockedBytes: Long,
+    val rows: List<PlanRow>,
+    /** `host` for what the process may hold, the device's own otherwise. */
+    val name: String = "",
+    val heldBytes: Long = 0,
+)
+
+/** A device the plan saw: its rate and badge in words, its role as a code, and why. */
+data class PlanDevice(
+    val name: String,
+    val description: String,
+    val cpu: Boolean,
+    val promptRatio: Double,
+    val rateText: String,
+    val status: String,
+    val badge: String,
+    val why: String,
+)
+
+/** A `plan_progress` event: a stage of the measurement starting, with its words. */
+data class PlanProgress(val step: String, val label: String, val index: Int, val count: Int)
 
 /** Everything the screens observe about the engine. Immutable snapshots on one StateFlow. */
 data class EngineUi(
@@ -221,6 +379,8 @@ data class EngineUi(
     val serverError: String? = null,
     /** How the running server was started: on the network with the key, or on loopback. */
     val shared: Boolean = false,
+    /** The system refuses this app any socket, loopback included: only the person can fix it (#298). */
+    val networkDenied: Boolean = false,
     val info: ServerInfo? = null,
     val params: List<ParamSpec>? = null,
     val config: ConfigState? = null,
@@ -228,6 +388,17 @@ data class EngineUi(
     val live: Telemetry = Telemetry(),
     val lastDone: JSONObject? = null,
     val cpuTempC: Double? = null,
+    /** The stage a measurement is in; null when none runs. */
+    val planProgress: PlanProgress? = null,
+    /**
+     * The plan the server holds for the chosen model (`GET /api/plan?cached=1`, never a measurement):
+     * read when the server is reached, when a session opens and when a turn ends, so the Plan screen
+     * opens on it at once and its measured figures land when the answer does, whichever screen is open.
+     */
+    val plan: PlanResult? = null,
+    val planError: String = "",
+    /** A measurement asked for (`?measure=1`) is in flight: the person's tap, never automatic. */
+    val measuring: Boolean = false,
 ) {
     val ready get() = serverUp && info?.ready == true
     val generating get() = info?.generating == true
@@ -253,10 +424,8 @@ object Engine {
     @Volatile private var api = Api(ServerProcess.baseUrl(), Api.randomKey())
     @Volatile private var connector: Job? = null
     @Volatile private var idleUnload: Job? = null
-    @Volatile private var thermal: Thermal? = null
     @Volatile private var recorder: MetricsRecorder? = null
     @Volatile private var appContext: Context? = null
-    @Volatile private var lastThermalSampleMs = 0L
 
     // Each start of the server is a launch with its own number; what a process reports about itself
     // (its exit) counts only while it is still the current launch. A stop moves the number on, so
@@ -266,6 +435,9 @@ object Engine {
     // Whether a server this app started should be up: between a stop and the next start the
     // connector waits, rather than reconnect to the process that is still on its way out.
     @Volatile private var serving = false
+    // The model a restart found loaded, to load again once the next server is up: changing the
+    // address or the key is not a person asking to unload. Cleared once used, or by a plain stop.
+    @Volatile private var reloadAfterRestart: String? = null
 
     val current: EngineUi get() = _state.value
 
@@ -275,12 +447,11 @@ object Engine {
         ContextCompat.startForegroundService(app, Intent(app, EngineService::class.java).setAction(EngineService.ACTION_START))
     }
 
-    /** What follows the server from this process: the event stream, the thermal sensor, the recorder. */
+    /** What follows the server from this process: the event stream and the recorder. */
     @Synchronized
     private fun attach(ctx: Context): Context {
         val app = ctx.applicationContext
         appContext = app
-        if (thermal == null) thermal = Thermal(app)
         if (recorder == null) recorder = MetricsRecorder(app)
         if (connector == null) connector = scope.launch { connectForever() }
         return app
@@ -288,6 +459,7 @@ object Engine {
 
     /** Stop the server (and free the model). The next [start] brings it back. */
     fun stop(ctx: Context) {
+        reloadAfterRestart = null
         val app = ctx.applicationContext
         app.startService(Intent(app, EngineService::class.java).setAction(EngineService.ACTION_STOP))
     }
@@ -298,6 +470,7 @@ object Engine {
      * never race for the port.
      */
     fun restart(ctx: Context) {
+        reloadAfterRestart = _state.value.info?.takeIf { it.ready }?.model?.path ?: reloadAfterRestart
         val app = attach(ctx)
         ContextCompat.startForegroundService(app, Intent(app, EngineService::class.java).setAction(EngineService.ACTION_RESTART))
     }
@@ -371,9 +544,16 @@ object Engine {
                     onEvent = { ev ->
                         if (current()) {
                             if (!_state.value.serverUp) {
-                                _state.update { it.copy(serverUp = true, serverError = null) }
+                                _state.update { it.copy(serverUp = true, serverError = null, networkDenied = false) }
                                 backoffMs = 500L
-                                scope.launch { refreshStatic() }
+                                Chat.onServerUp()
+                                scope.launch {
+                                    refreshStatic()
+                                    reloadAfterRestart?.let { path ->
+                                        reloadAfterRestart = null
+                                        if (_state.value.info?.state == "empty") load(path)
+                                    }
+                                }
                             }
                             onEvent(ev)
                         }
@@ -388,9 +568,16 @@ object Engine {
                 // The watchdog: two pings missed, the stream died without closing. Reconnect now.
                 backoffMs = 500L
             } catch (t: Throwable) {
-                // Anything else (a key, a policy, a broken stream) is what a person needs to read.
-                val why = t.message?.takeIf { it.isNotBlank() } ?: t.javaClass.simpleName
-                _state.update { it.copy(serverError = "Engine not reachable: $why") }
+                if (isNetworkDenied(t)) {
+                    // The raw "socket failed: EPERM" says nothing a person can act on, and a retry
+                    // cannot succeed until the switch is turned back on: keep polling, slowly.
+                    _state.update { it.copy(serverError = NETWORK_DENIED, networkDenied = true) }
+                    backoffMs = 5_000L
+                } else {
+                    // Anything else (a key, a policy, a broken stream) is what a person needs to read.
+                    val why = t.message?.takeIf { it.isNotBlank() } ?: t.javaClass.simpleName
+                    _state.update { it.copy(serverError = "Engine not reachable: $why", networkDenied = false) }
+                }
             }
             if (_state.value.serverUp) _state.update { it.copy(serverUp = false) }
             delay(backoffMs)
@@ -403,6 +590,7 @@ object Engine {
         catching { ParamSpec.parse(api.params()) }.onSuccess { p -> _state.update { it.copy(params = p) } }
         catching { ConfigState.of(api.config()) }.onSuccess { c -> _state.update { it.copy(config = c) } }
         refreshModels()
+        refreshPlan()
     }
 
     suspend fun refreshModels() {
@@ -422,6 +610,8 @@ object Engine {
                     // A new session: a fresh metrics file for it, and the models list may have changed.
                     recorder?.sessionOpened(info, _state.value.config)
                     scope.launch { refreshModels() }
+                    // A new session runs a plan of its own (an auto load's, or the settings as they were).
+                    refreshPlan()
                 }
                 if (info.state == "empty" || info.state == "error") recorder?.close()
                 if (info.generating) {
@@ -440,18 +630,25 @@ object Engine {
                 }
                 if (t.step <= 1) t.avgTokensPerSecond = -1.0
                 recorder?.token(o)
-                val now = System.currentTimeMillis()
-                val temp = if (now - lastThermalSampleMs > 1500) {
-                    lastThermalSampleMs = now
-                    thermal?.sampleCelsius()
-                } else null
+                // The server reads the CPU's sensors where the platform has them (`cpu_temp_c`).
+                val temp = o.optDouble("cpu_temp_c", Double.NaN).takeIf { it > 0 }
                 _state.update { it.copy(live = t, cpuTempC = temp ?: it.cpuTempC) }
             }
             "done" -> {
                 val t = _state.value.live.copy().applyDone(o)
                 recorder?.done(o)
                 _state.update { it.copy(live = t, lastDone = o) }
+                // A finished turn is a new measurement beside the plan the model runs with.
+                if (_state.value.info?.model != null) refreshPlan()
             }
+            "plan_progress" -> {
+                val step = o.optString("step")
+                val p = if (step.isEmpty() || step == "done") null
+                else PlanProgress(step, o.optString("label").ifEmpty { step }, o.optInt("index"), o.optInt("count"))
+                _state.update { it.copy(planProgress = p) }
+            }
+            // The conversations travel on the same stream (docs/agent.md).
+            "conversation", "item", "delta" -> Chat.onEvent(ev.event, o)
             else -> {} // downloads are the app's own, not the server's
         }
     }
@@ -484,12 +681,79 @@ object Engine {
         catching { ConfigState.of(api.updateConfig(JSONObject(), emptyList(), on)).also { c -> _state.update { it.copy(config = c) } } }
     }
 
-    suspend fun plan(measure: Boolean): Result<PlanResult> = withContext(Dispatchers.IO) {
-        catching { PlanResult.of(api.plan(measure)) }
+    /** The plan in force or the last one held (never a measurement), or a new measurement. */
+    /** The plan held, without measuring; skipped while a measurement runs, which answers instead. */
+    fun refreshPlan() {
+        if (_state.value.measuring) return
+        scope.launch {
+            catching { PlanResult.of(api.plan(measure = false)) }
+                .onSuccess { p -> _state.update { it.copy(plan = p, planError = "") } }
+                .onFailure { e -> _state.update { it.copy(planError = e.message ?: "no plan") } }
+        }
+    }
+
+    /** Measure the phone for the chosen model: the probes run, and the plan shown is the new one. */
+    fun measurePlan() {
+        if (_state.value.measuring) return
+        _state.update { it.copy(measuring = true, planError = "") }
+        scope.launch {
+            catching { PlanResult.of(api.plan(measure = true)) }
+                .onSuccess { p -> _state.update { it.copy(plan = p, planError = "") } }
+                .onFailure { e -> _state.update { it.copy(planError = e.message ?: "no plan") } }
+            _state.update { it.copy(measuring = false) }
+        }
     }
 
     suspend fun applyPlan(): Result<ConfigState> = withContext(Dispatchers.IO) {
         catching { ConfigState.of(api.applyPlan()).also { c -> _state.update { it.copy(config = c) } } }
+    }
+
+    // ── a model from a Hugging Face repository (data/HfRepo.kt) ──
+    suspend fun hfSearch(query: String, token: String): Result<HfSearch> = withContext(Dispatchers.IO) {
+        catching { HfSearch.of(api.hfSearch(hfSearchBody(query, token))) }
+    }
+
+    suspend fun hfModels(repo: String, token: String): Result<HfModels> = withContext(Dispatchers.IO) {
+        catching { HfModels.of(api.hfModels(hfRequestBody(repo, token = token))) }
+    }
+
+    suspend fun hfInspect(repo: String, name: String, token: String): Result<HfFacts> = withContext(Dispatchers.IO) {
+        catching { HfFacts.of(api.hfInspect(hfRequestBody(repo, name, token))) }
+    }
+
+    /** Adds the model to the catalog and answers its id; the models list is refreshed so the entry shows. */
+    suspend fun hfAdd(repo: String, name: String, token: String): Result<String> = withContext(Dispatchers.IO) {
+        catching { api.hfAdd(hfRequestBody(repo, name, token)).getString("id") }.also { refreshModels() }
+    }
+
+    /**
+     * A direct link to a gguf, made a catalog entry by the server (`POST /api/models/url`): the
+     * entry is answered from the refreshed list, for the app to download its `files` as it does
+     * every entry's.
+     */
+    suspend fun addUrl(url: String): Result<CatalogEntry> = withContext(Dispatchers.IO) {
+        catching {
+            val id = api.addUrl(url.trim()).getString("id")
+            refreshModels()
+            _state.value.models?.catalog?.firstOrNull { it.id == id } ?: error("the server made entry $id but does not list it")
+        }
+    }
+
+    /** A model in the server's models directory, deleted by the server by its listed name (every file of a set). */
+    suspend fun deleteLocal(name: String): Result<Unit> = withContext(Dispatchers.IO) {
+        catching { api.deleteLocal(name); Unit }.also { refreshModels() }
+    }
+
+    suspend fun removeAdded(id: String): Result<Unit> = withContext(Dispatchers.IO) {
+        catching { api.removeAdded(id); Unit }.also { refreshModels() }
+    }
+
+    /**
+     * Delete the partial files a stopped catalog download left. The server does it, by catalog id:
+     * it knows which files the entry names and deletes only those, inside the models directory.
+     */
+    suspend fun deletePartial(id: String): Result<Unit> = withContext(Dispatchers.IO) {
+        catching { api.deletePartial(id); Unit }.also { refreshModels() }
     }
 
     /** The client for a chat stream: the chat runs it on its own thread and owns the connection. */

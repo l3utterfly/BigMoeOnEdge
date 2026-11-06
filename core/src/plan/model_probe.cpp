@@ -1,9 +1,10 @@
 // The model half of the planner's input: everything read from the gguf's own metadata and tensor
 // shapes, with no tensor data touched and the model never loaded.
 //
-// Which tensors are experts comes from the architecture recipe — the one table in the engine that
-// carries architecture knowledge — so a family the registry does not know produces a profile with
-// no experts, and the planner declines rather than guessing at a layout. Every other name this
+// Which tensors are experts is read from the file itself (bmoe/expert_layout.h: a block's 3-D
+// weights indexed by the declared expert count), the same discovery the streamer runs at load, so
+// there is no table of architectures to fall out of date. A MoE whose layout cannot be read that way
+// gets an error, and the planner declines rather than guessing at a layout. Every other name this
 // file matches (`token_embd`, `output`, `blk.N.attn_*`, `blk.N.ffn_*`) is the gguf naming
 // convention itself, shared by every architecture llama.cpp converts: a property of the FORMAT,
 // not of any model. A name matching nothing lands in Other and is priced as read-whole, which is
@@ -11,12 +12,15 @@
 
 #include "bmoe/probe.h"
 
+#include "../io/platform_io.h"
 #include "../moe/gguf_offsets.h"
 #include "../moe/tensor_names.h"
-#include "bmoe/recipe.h"
+#include "bmoe/expert_layout.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <vector>
 #include <map>
 #include <set>
 #include <string>
@@ -36,6 +40,22 @@ bool is_embedding_table(const std::string & name) {
 
 } // namespace
 
+GgufHeaderFacts probe_gguf_header(const char * model_path) {
+    GgufHeaderFacts h;
+    if (!model_path || !*model_path) return h;
+    const GgufModelInfo info = read_gguf_model_info(model_path);
+    h.ok = info.ok;
+    h.arch = info.arch;
+    h.n_expert = info.n_expert;
+    h.n_expert_used = info.n_expert_used;
+    h.type = info.type;
+    h.n_block = info.n_block;
+    h.n_nextn = info.n_nextn;
+    h.reads_target = info.reads_target;
+    h.name = info.name;
+    return h;
+}
+
 ModelProfile probe_model(const char * model_path) {
     ModelProfile m;
     if (!model_path || !*model_path) {
@@ -54,11 +74,13 @@ ModelProfile probe_model(const char * model_path) {
     m.n_expert_used = (uint32_t) std::max(0, meta.info.n_expert_used);
     m.n_embd = (uint32_t) std::max(0, meta.info.n_embd);
 
-    const MoeRecipe * recipe = find_moe_recipe(m.arch.c_str());
-    if (m.n_expert > 1 && !recipe) {
-        // The same refusal the streamer makes: without a recipe the expert tensors cannot be
-        // identified, and a plan that guessed at them would be worse than no plan.
-        m.error = "no MoE recipe for architecture '" + m.arch + "': cannot identify expert tensors";
+    // Which tensors are the routed experts, read off the file's shapes, and the same refusal the
+    // streamer makes: a file whose experts cannot be told apart gets no plan, since a plan that
+    // guessed at them would be worse than none. A dense model is not an error here - it has a plan,
+    // with streaming off - so only a declared expert count that fails the reading is one.
+    const ExpertLayout layout = discover_expert_layout(meta.offsets.extents, (int) m.n_expert);
+    if (m.n_expert > 1 && !layout.ok) {
+        m.error = "not a MoE this engine streams: " + layout.error;
         return m;
     }
     m.ok = true;
@@ -72,6 +94,7 @@ ModelProfile probe_model(const char * model_path) {
     std::map<int, uint64_t> per_file_expert_bytes; // by index into the file's shard list
     std::map<int, uint32_t> projections_per_layer;
     std::map<int, uint64_t> per_layer_dense_bytes; // a block's non-expert tensors
+    std::map<int, uint64_t> expert_bytes_by_type;  // by ggml type id
     std::set<int> blocks;                          // every block index the file carries, MTP excluded
     std::set<int> mtp_layers;                      // blocks that carry a multi-token-prediction head
 
@@ -107,17 +130,17 @@ ModelProfile probe_model(const char * model_path) {
         if (name == "output.weight") saw_output_weight = true;
         if (name == "token_embd.weight") saw_token_embd = true;
 
-        // Only the `.weight` tensors a recipe row names: a scale, a bias or a probs tensor is not an
-        // expert weight however much its name resembles one.
+        // Only the layout's expert weights: a scale, a bias or a probs tensor is not an expert
+        // weight however much its name resembles one, and the layout told them apart by rank.
         int elayer = 0;
-        const bool is_expert =
-            recipe && m.n_expert > 0 && tensor_names::expert_slot(name.c_str(), *recipe, elayer) >= 0;
+        const bool is_expert = layout.slot_of(name.c_str(), elayer) >= 0;
 
         WeightGroup g = WeightGroup::Other;
         if (is_expert) {
             g = WeightGroup::Experts;
         } else if (!in_block && is_embedding_table(name)) {
             g = WeightGroup::Embedding;
+            m.embedding_tensors.push_back(name);
             // A table whose row count the file does not state cannot be turned into a per-token
             // demand, and guessing one is how a plan claims a saving it cannot collect.
             const auto r = meta.offsets.rows_by_name.find(name);
@@ -141,13 +164,25 @@ ModelProfile probe_model(const char * model_path) {
             per_layer_expert_bytes[elayer] += size;
             per_layer_one_expert[elayer] += one;
             projections_per_layer[elayer]++;
-            if (m.expert_type_id < 0) {
-                const auto t = meta.offsets.type_by_name.find(name);
-                if (t != meta.offsets.type_by_name.end()) m.expert_type_id = t->second;
-            }
+            const auto t = meta.offsets.type_by_name.find(name);
+            if (t != meta.offsets.type_by_name.end()) expert_bytes_by_type[t->second] += size;
         } else {
             m.largest_dense_tensor = std::max(m.largest_dense_tensor, size);
             if (in_block) per_layer_dense_bytes[layer] += size;
+        }
+    }
+
+    // The type that carries the most expert bytes is the one a token mostly reads, so it is the one
+    // the bandwidth probe measures; ties go to the lower id so the answer is the same on every
+    // standard library. It used to be the first expert tensor met while walking an unordered map,
+    // so on a mixed quant (a 2-bit gate and up beside a 3-bit down) the format probed was decided
+    // by hash order, and on Linux it was one ggml cannot encode without importance weights.
+    uint64_t most_type_bytes = 0;
+    for (const auto & kv : expert_bytes_by_type) {
+        m.expert_type_ids.push_back(kv.first);
+        if (kv.second > most_type_bytes) {
+            most_type_bytes = kv.second;
+            m.expert_type_id = kv.first;
         }
     }
 
@@ -178,6 +213,8 @@ ModelProfile probe_model(const char * model_path) {
     m.is_moe = m.expert_bytes > 0 && m.n_expert > 0 && m.n_expert_used > 0;
     m.n_layer = (uint32_t) blocks.size();                   // llama.cpp's own layer indices
     m.n_moe_layer = (uint32_t) per_layer_one_expert.size(); // the ones that stream
+    for (const auto & kv : per_layer_one_expert)
+        m.moe_layers.push_back((uint32_t) kv.first);
 
     uint32_t projections_seen = 0;
     for (const auto & kv : projections_per_layer)
@@ -214,6 +251,50 @@ ModelProfile probe_model(const char * model_path) {
     }
 
     return m;
+}
+
+std::string model_fingerprint(const char * model_path) {
+    // Where the samples are taken, as fractions of the file: the start carries the header and the
+    // metadata, the rest the tensor bytes that tell two models of one shape apart.
+    constexpr uint64_t k_head_bytes = 1ull << 20;
+    constexpr uint64_t k_window_bytes = 64ull << 10;
+    constexpr int k_windows = 4;
+
+    const pio::fd_t fd = pio::open_read(model_path, false);
+    if (!pio::fd_ok(fd)) return "";
+    const uint64_t size = pio::file_size(fd);
+    uint64_t h = 1469598103934665603ull; // FNV-1a, 64-bit
+    auto mix = [&h](const unsigned char * p, size_t n) {
+        for (size_t i = 0; i < n; ++i) {
+            h ^= p[i];
+            h *= 1099511628211ull;
+        }
+    };
+    unsigned char size_le[8];
+    for (int i = 0; i < 8; ++i)
+        size_le[i] = (unsigned char) (size >> (8 * i));
+    mix(size_le, sizeof(size_le));
+
+    std::vector<unsigned char> buf(k_head_bytes);
+    bool ok = size > 0;
+    auto sample = [&](uint64_t off, uint64_t len) {
+        if (!ok || off >= size) return;
+        len = std::min(len, size - off);
+        const long long got = pio::pread_at(fd, buf.data(), (size_t) len, off);
+        if (got != (long long) len) {
+            ok = false;
+            return;
+        }
+        mix(buf.data(), (size_t) len);
+    };
+    sample(0, k_head_bytes);
+    for (int i = 1; i <= k_windows; ++i)
+        sample(size > k_window_bytes ? (size - k_window_bytes) / k_windows * i : 0, k_window_bytes);
+    pio::close_fd(fd);
+    if (!ok) return "";
+    char hex[17];
+    std::snprintf(hex, sizeof(hex), "%016llx", (unsigned long long) h);
+    return hex;
 }
 
 } // namespace bmoe

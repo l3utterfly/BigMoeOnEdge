@@ -1,6 +1,6 @@
 // The server's configuration, in layers.
 //
-//   server defaults  <  plan  <  launch flags  <  user
+//   server defaults  <  plan  <  user  <  launch flags
 //
 // Each layer holds parameter values as the strings the parameter table reads, keyed by parameter
 // key, and the config is rebuilt by applying them in that order onto the defaults. Keeping the
@@ -9,7 +9,8 @@
 // pinned set: the launch and user layers are the operator's, and a plan never overrides them.
 //
 // Only the user layer is persisted (settings.json in the data directory). Launch flags hold for
-// the process that was given them; setting the same key from the UI moves it to the user layer.
+// the process that was given them, over a value saved by an earlier run: a model or context typed
+// at start is the one that loads. Setting the same key from the UI moves it to the user layer.
 #pragma once
 
 #include "json_util.h"
@@ -41,13 +42,21 @@ public:
     void apply_plan(std::map<std::string, std::string> values, json decisions);
 
     RunConfig config() const;
-    // The configuration with the plan layer left out (defaults < launch < user): what a plan is
+    // The configuration with the plan layer left out (defaults < user < launch): what a plan is
     // made from and measured against. A plan made from the config that holds the previous plan
     // would see its own earlier choices as already there, leave them out of its values, and
     // apply_plan would then drop them along with the layer it replaces.
     RunConfig planning_config() const;
+    // The configuration an API request starts from. A client that says nothing about thinking gets
+    // it on, the model's own behaviour and what a llama.cpp server answers, unless the person set
+    // `think`: the off default is for the apps' conversations, which do not come through the API
+    // routes, and an agent that never asks would otherwise lose its reasoning (#448).
+    RunConfig api_config() const;
     const RunConfig & defaults() const { return defaults_; }
     std::vector<std::string> operator_keys() const; // launch + user: what a plan must not touch
+    // The keys the server was launched with. A client's "reset everything I set" leaves them: they
+    // are the operator's choice for this run, not a value saved from a form.
+    std::vector<std::string> launch_keys() const;
     json plan_decisions() const;
 
     // Whether every load plans first. A server setting, not an engine parameter, so it lives beside

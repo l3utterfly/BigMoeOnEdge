@@ -43,22 +43,46 @@ prefix rule below, so resending what the session already holds costs only the ne
 fails or is cancelled puts the previous conversation back. `GenerateRequest::tools` and
 `tool_choice` describe functions the model may call: they are rendered by the model's own chat
 template and the calls come back in `RunResult::tool_calls`, parsed by llama.cpp's chat layer
-(`core/src/engine/chat_messages.h` is the one adapter between `bmoe/chat.h` and that layer). The
-calls are not grammar-constrained.
+(`core/src/engine/chat_messages.h` is the one adapter between `bmoe/chat.h` and that layer). Once
+a call opens, sampling is held to the grammar the template ships with its tools
+(`detail::ToolGrammar`, `core/src/engine/chat_parse.h`), outside any reasoning span. A finished
+turn the parser reads as nothing comes back as the raw generation.
 
 **KV prefix reuse.** Re-rendering the full history would re-tokenize the entire conversation, but
 most of it is already decoded into the KV. Each turn the engine diffs the freshly rendered tokens
-against `kv_tokens` (the tokens currently in the KV, in order), keeps the common prefix, removes the
+against the stream currently in the KV (`prompt_stream.h`: the tokens in order, with an image as a
+span of placeholders identified by its content hash), keeps the common prefix, removes the
 divergent tail with `llama_memory_seq_rm`, and prefills only the suffix. So a follow-up turn pays
 for its own tokens, not a full re-prefill — which matters because prefill is the slow phase on
-device. `BMOE_DONE.n_prompt` reports the tokens actually prefilled this turn; `n_past` is the total
-context length after it.
+device. An image is shared whole or not at all, and a cut never lands inside one. Under M-RoPE an
+image takes fewer positions than tokens, so every cut and every batch after one is placed by the
+stream's position map, not by its index. `BMOE_DONE.n_prompt` reports the tokens actually prefilled
+this turn; `n_past` is the total context length after it.
 
-**Fallbacks and costs.** SWA-style memory (e.g. Gemma) can refuse a partial `seq_rm`; the engine
-then clears the KV and re-prefills the whole prompt for that turn (correct, just slower). With
+**Context checkpoints.** Not every memory can be cut at an arbitrary position: a recurrent state
+(Mamba, Gated DeltaNet) holds only its latest step, and a sliding-window cache has already dropped what
+fell out of its window, so `llama_memory_seq_rm` refuses a cut inside them. The engine keeps
+checkpoints the way llama.cpp's server does (`--ctx-checkpoints`, default 8 where the server keeps 32,
+since their memory is the expert cache's; `--checkpoint-min-step`, 8192 as there): the part of the state that cannot be cut is copied out through the public
+state API (`llama_state_seq_get_data_ext` with `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`, into `common`'s own
+`common_prompt_checkpoint`) at the end of every prompt, and every `min_step` tokens inside a prompt
+prefilled in pieces. A refused cut restores the newest checkpoint at or before the divergence and
+prefills from there (`core/src/engine/context_checkpoints.{h,cpp}`, the same position rule as the
+server's). This is what an agent needs: a client resends the model's answer as text, the template
+renders it back into tokens that need not be the ones sampled, and on a hybrid model the prompt then
+diverged inside the recurrent state on most requests. Nothing asks what kind of model this is: a memory
+that cuts anywhere has no partial state, keeps no checkpoint and never needs one. The cost is memory, the
+size of that state per checkpoint; the first one of a session logs it (`context checkpoints: X MiB each`),
+and `--ctx-checkpoints 0` turns them off. The plan charges that memory before it sizes the expert cache
+(`checkpoint-budget`, [hardware-planning.md](hardware-planning.md#the-memory-ledger)), so a chat that
+fills its checkpoints does not take it from what the cache already holds. A restored state is the state the same tokens computed, so it
+is lossless; gate G22 checks it on the three memory kinds the tiny models cover.
+
+**Fallbacks and costs.** With no checkpoint to restore (none taken yet, or off), a memory that refuses
+the cut is cleared and the whole prompt is prefilled again for that turn (correct, just slower). With
 thinking **on**, the template strips the previous turn's reasoning on re-render, so the rendered
 prefix diverges at the last answer and up to one answer's worth of tokens is re-prefilled per turn;
-with thinking **off** (the app default) the re-fed suffix is just the new user turn plus a few
+with thinking **off** (the default) the re-fed suffix is just the new user turn plus a few
 wrapper tokens.
 
 **Reasoning is returned, not discarded.** On a thinking model the Session parses the reasoning span

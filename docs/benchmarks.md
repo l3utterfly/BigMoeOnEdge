@@ -471,6 +471,15 @@ gap is the protocol (short chat replies never fully warm the cache), not the app
 telemetry panel reports the same fields as the CLI, so you can see it directly. Analysis:
 [docs/warmup-analysis.md](warmup-analysis.md).
 
+### iPhone
+
+One run, by a contributor, on a 12 GB iPhone with the iOS app built from the v0.33.0 tag (#235):
+Qwen3.6-35B-A3B Q4_K_M, the default `--auto` plan, thinking on. The plan streams the experts with a
+2.3 GiB cache (iOS gives an app about 6 GiB), prefills on the GPU and decodes on 6 CPU threads, and
+predicts 2.9 tok/s. Two chat turns measured **3.0 and 2.6 tok/s** (147 and 211 tokens). It is below the
+12 GB Android phone because of the per-app memory limit: with a smaller cache, more experts are
+read from flash on each token.
+
 ### Desktop
 
 Measured on fewer machines than the phone. The Windows table below is a configuration set by hand
@@ -493,6 +502,62 @@ campaign, including the cache-auto confound that round 1 had to unwind:
 [docs/bench-data/2026-07-24-desktop-qwen36](bench-data/2026-07-24-desktop-qwen36/findings.md).
 
 On a 16 GB Apple-silicon laptop, the same model at a 16384 context with `--auto` and nothing else:
-22.4 tok/s, and a 10850-token prompt prefilled in 31.8 s. One machine.
+22.4 tok/s, and a 10850-token prompt prefilled in 31.8 s. One machine. Qwen3-Coder-30B-A3B (18.6 GB)
+on the same laptop: 23 tok/s, and 7-9 inside opencode.
 
 If the model fits in RAM, just run it resident.
+
+#### A discrete GPU
+
+Measured on 2026-10-26 on a rented 24 GB desktop card (RTX 4090 class, 31 usable cores, an 89 GiB
+memory control group, NVMe at 1.0 GB/s direct), engine 0.37.x, `--auto` and nothing else, 256
+greedy tokens ([bench-data/2026-10-26-rented-gpu](bench-data/2026-10-26-rented-gpu/README.md)):
+
+| Model | What `--auto` chose | Decode tok/s |
+|---|---|---:|
+| Qwen3.6-35B-A3B Q4_K_M (22 GB) | every layer on the card | **217** |
+| Qwen3.8-Flash-Next 125B Q2_0 (66 GB, 32 GB of experts) | experts in RAM, the 18 GB used most cached on the card | **70** |
+| DeepSeek V4 Flash 0731 UD-IQ2_M (85 GB of experts) | streamed from the drive: 66 GB cache in RAM, 13 GB on the card, 94% hits | **9.3** |
+
+And on a rented 12 GB card (RTX 3060 class, 7.7 usable cores, a 42.6 GiB control group), the class
+most people own, Qwen3.8-Flash-Next Q2_0: `--auto` armed a 6 GB device cache and the run was killed
+by the control group at 43 GB (the tier's host-side memory is not in the ledger, #424); with the
+tier pinned off the fitter put 6 GB of experts on the card and the rest resident in RAM at
+**15.5 tok/s**, and the MTP head drafting on those cores cost more than it saved (9.9 effective).
+Strata quotes 94 tok/s on this class with its experts and its drafting on the card: that gap is the
+work in front of the planner, not a ceiling of the card.
+
+On a rented 16 GB card with 30 GiB of RAM (a 6-core desktop CPU, NVMe at 2.2 GB/s), the class of a
+home PC with a mid-range card, Qwen3.8-Flash-Next Q2_0 streams: `--auto` put the dense part and a
+10 GB cache of the experts used most on the card (#429) and the rest behind a RAM cache
+([bench-data/2026-10-27-rented-16gb](bench-data/2026-10-27-rented-16gb/README.md)). Over 1024 tokens,
+with #431 (the RAM cache takes the RAM the plan left idle, and llama.cpp's load-time read-ahead is
+handed back so the kernel does not swap the cache out): **19.3-20.8 tok/s**, 27 from the 768th token,
+97% hits. On the same box llama.cpp's own offload decoded 16.6-18.9 over 256 tokens, and Strata,
+with its expert profile and its drafting, 36-67 (50-66 over 1024): it computes the experts its card
+does not hold on the CPU, where this engine uploads each one over the bus.
+
+On a rented 96 GB workstation card (RTX PRO 6000 Blackwell class) with a 283 GB memory limit and
+the provider's network file system, DeepSeek V4.1 Flash with its native MXFP4 experts (unsloth's
+UD-Q4_K_XL, 466 GiB) fits neither the card nor the RAM: `--auto` put an 84.5 GB cache of the experts
+used most on the card and 207-215 GB of them in RAM, and decoded **6.2-6.6 tok/s** over 1024 tokens
+from a cold page cache, still climbing at the end (10.6-12.6 over the last 128), against 2.8 for
+llama.cpp's own `llama-completion` on the same file
+([bench-data/2026-10-28-rented-96gb](bench-data/2026-10-28-rented-96gb/README.md)). The published
+files keep a table in MXFP8, a type upstream llama.cpp does not have yet, so the run read it with an
+experimental build that is not the pin. A session of long prompts was killed by the control group:
+the plan's margin does not yet cover a long prefill on this model.
+
+On a rented 192 GB AMD datacenter card (MI300X class) through ROCm, the first run of the HIP
+backend, Qwen3.8-Flash-Next Q2_0 fits the card whole: `--auto` put every layer on it and decoded at
+**53.4 tok/s** over 1024 tokens, against 55.6-55.8 for llama.cpp's own `llama-completion` from the
+same submodule; long prompts prefilled at 2.1-2.3k tok/s
+([bench-data/2026-10-28-rented-rocm](bench-data/2026-10-28-rented-rocm/README.md), which also has the
+build line: ROCm's clang hangs on ggml-cpu's AMX kernels, so the host code builds with gcc). Resident,
+nothing streams, so this measures the backend and the engine's overhead, not the streamer.
+
+On the last file llama.cpp's own offload (`-ngl 99 --n-cpu-moe 43`, every expert on the cores, the
+file memory-mapped) decoded at 18.5 tok/s from the same cold page cache: the whole file fits the
+control group's page cache, so it ran resident where our plan kept a fixed 18 GB margin and
+streamed (#419). A planner rule, not a ceiling of the engine: resident experts on this card are the
+217 and 70 above.

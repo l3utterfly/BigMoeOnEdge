@@ -5,7 +5,7 @@
 //
 //   Capture — during a one-token warm-up decode (experts still mmap-resident), every
 //   graph node is offered to the callback in its "ask" pass. We scan each node's sources
-//   for the recipe's expert weight tensors (named blk.<il>.<suffix>.weight) and record
+//   for the expert layout's weight tensors (named blk.<il>.<suffix>.weight) and record
 //   the live ggml_tensor pointers per (layer, projection). No node is isolated. The
 //   runtime then hands these to ExpertStreamSource::init, which rebinds them.
 //
@@ -27,10 +27,11 @@
 // is wired into the loading path. See bmoe/predict_stats.h.
 #pragma once
 
-#include "bmoe/recipe.h"
+#include "bmoe/expert_layout.h"
 #include "bmoe/route_trace.h"
 #include "bmoe/decode_trace.h"
 #include "bmoe/predict_stats.h"
+#include "bmoe/routing.h"
 #include "bmoe/row_source.h"
 #include "expert_stream_source.h"
 
@@ -56,7 +57,7 @@ namespace bmoe {
 
 class RouterHook {
 public:
-    RouterHook(const MoeRecipe & recipe, int n_layer);
+    RouterHook(const ExpertLayout & layout, int n_layer);
     ~RouterHook(); // joins the prediction worker, if one was started
 
     // Install as ctx_params.cb_eval / cb_eval_user_data before context creation.
@@ -83,7 +84,7 @@ public:
     // embedding table has two ggml_tensor objects carrying the same name over the same file
     // bytes, and a name-keyed map keeps one of them. Rebinding only that one leaves the twin
     // reading the model's mmap for the life of the run, which is what --dense-weights anon and
-    // ahwb exist to prevent. Order is first-seen, so a run is reproducible.
+    // pinned exist to prevent. Order is first-seen, so a run is reproducible.
     const std::vector<ggml_tensor *> & captured_weight_objects() const { return captured_weight_objects_; }
 
     // After capture, the memory module's state tensors the graph read (KV cache, recurrent state):
@@ -171,6 +172,10 @@ public:
     // predicted residents happens at every value — it costs zero bytes.
     void set_predict_prefetch(bool on, int spec_max = 2);
 
+    // Joins the prediction worker. It reads the gate weights, which the source frees when it shuts
+    // down, so the session's teardown stops it before that rather than at ~RouterHook.
+    void predict_worker_stop();
+
     // ── route-ahead: commit to the stale-gate prediction (lossy; see MoeStreamConfig) ─
     // With n > 0, the expert selection of MoE layer L is REPLACED, during decode, by the ranking
     // layer L's own gate matrix produced on the hidden state N layers earlier in the same forward
@@ -182,6 +187,10 @@ public:
     // prefetch of them is never late and never wrong — the 100%-hit regime no honest predictor
     // reaches, bought with a quality perturbation this flag exists to measure.
     void set_route_ahead(int n);
+    // Whether route-ahead's prediction scores against the int8 mirror of the gates (true) or their
+    // own float weights (false). Resolved by the session from MoeStreamConfig::gate_mirror; call
+    // before set_route_ahead arms the worker.
+    void set_gate_mirror(bool on) { gate_mirror_ = on; }
 
     // How hard route-ahead actually bit, and how far the committed choice sat from the router's
     // own: `overridden` routings had their ids rewritten, `passthrough` were eligible (decode,
@@ -301,6 +310,20 @@ public:
 
     std::vector<RouteTraceRow> & trace_rows() { return trace_rows_; }
 
+    // ── routing record (the planner's input; see bmoe/routing.h) ─────────────────────
+    // Unlike the route trace this asks the graph for nothing: it keeps the ids each layer hands
+    // load_layer, which the hook gathers on every routing anyway, so it costs a copy of a few ints per
+    // layer per token and stops by itself. `shape` carries the record's static facts (blocks, experts,
+    // top-k, each block's expert bytes); `max_tokens` bounds the decoded tokens kept and, separately,
+    // the prompt tokens: a prompt longer than that keeps its tail, which is what the cache holds when
+    // the decode starts. 0 records nothing.
+    void set_routing_record(int max_tokens, RoutingTrace shape);
+    // Frame one llama_decode (0 = prompt chunk, 1 = decode), as begin_trace_batch does for the trace;
+    // end_record_batch closes it, so a graph run outside a generation is never recorded.
+    void begin_record_batch(int phase, int n_tokens);
+    void end_record_batch() { rec_on_ = false; }
+    const RoutingTrace & routing_record() const { return rec_; }
+
 private:
     // The eval callback, and the jobs it dispatches to in the order it runs them. Each job is only
     // reached when its feature is on, so a node no job wants costs the same few tests it always did.
@@ -310,6 +333,9 @@ private:
     bool arena_eval(ggml_tensor * t, bool ask, bool probe_ask); // device prefill: the arena's pace
     void serve_rows(ggml_tensor * t);                           // row-gathered tables, before a node
     void on_topk(ggml_tensor * t, int il);                      // a routing node, ids materialized
+    void record_topk(ggml_tensor * t, int il);                  // the same node, recorded only: no streamer
+    // Whether the routing record still wants routing nodes: armed, and not yet full.
+    bool recording() const { return rec_max_ > 0 && rec_.decode_tokens < (uint32_t) rec_max_; }
 
     // Row-building state for the layer whose topk we last saw. A layer's weights arrive in a
     // LATER callback than its ids, so its rows can only be built once the whole weight chain has
@@ -330,11 +356,10 @@ private:
     void close_drop_layer();
     void ctrace_close_segment(int interval_layer, const char * tail_name);
 
-    // Stored by value, not by reference: the caller often constructs us from a temporary
-    // (a `cond ? *ptr : MoeRecipe{}` ternary yields a prvalue even when ptr is non-null),
-    // which would leave a reference member dangling. The struct is just a handful of string
-    // literal pointers, so copying is cheap and keeps the suffixes valid for our lifetime.
-    MoeRecipe recipe_;
+    // Which tensors are the routed experts, and in which slot: read from the file before the load
+    // (bmoe/expert_layout.h). By value, so it outlives whatever the caller read it into; a layout
+    // that is not ok (streaming off, or a file refused) matches no tensor and nothing binds.
+    ExpertLayout layout_;
     int n_layer_ = 0;
     bool capturing_ = false;
     IExpertSource * source_ = nullptr;  // non-null → stream mode
@@ -354,6 +379,7 @@ private:
     std::unordered_set<std::string> row_disqualified_; // non-expert weight leaves (see captured_weights)
     std::unordered_set<const ggml_tensor *> non_matrix_weights_;
     std::vector<int32_t> gathered_; // reused scratch for stream-mode id gather
+    std::vector<char> staged_ids_;  // a device-resident routing node's bytes, copied to the host
 
     // Temporal prefetch: K, and the previous token's routed experts per layer (last-token row
     // during prefill). Empty when prefetch is off or a layer has not been seen yet.
@@ -470,11 +496,15 @@ private:
     // fresh-gate watchdog is already the alarm if a model ever proves otherwise). Built lazily,
     // once per layer, from the same weight leaf the graph uses; ~1 MB per layer of extra RAM.
     // The graph's own routing never touches this — only the prediction does.
+    // Whether commit jobs read the mirror at all: the session's resolved gate_mirror. Set before
+    // route-ahead is armed and never while the worker runs.
+    bool gate_mirror_ = false;
     std::vector<std::vector<int8_t>> ra_gate_q_; // per layer: n_expert rows of n_embd int8
     std::vector<std::vector<float>> ra_gate_s_;  // per layer: one dequant scale per expert
     std::vector<int8_t> ra_qh_;                  // scratch: the activation row, quantized per call
-    bool quantize_gate(int il);                  // build the mirror for layer il; false if unsupported
-    bool gate_scores_q(int il, const std::vector<float> & h, std::vector<float> & out);
+    // Both run on the prediction worker and take layer il's gate from the job, not from gate_w_.
+    bool quantize_gate(int il, const ggml_tensor * w); // build the mirror for layer il; false if unsupported
+    bool gate_scores_q(int il, const ggml_tensor * w, const std::vector<float> & h, std::vector<float> & out);
     std::vector<int32_t> ra_ids_, ra_keep_, ra_spec_; // scratch: the committed future, split by residency
     std::vector<uint8_t> ra_res_;                     // scratch: residency of the committed ids
     void route_ahead_submit(ggml_tensor * ids, int il, int nu, int nt); // watchdog + row copy + job
@@ -485,7 +515,6 @@ private:
 
     bool predict_on() const { return predict_log_ || predict_prefetch_; }
     void predict_reset();
-    void predict_worker_stop();
     void predict_worker_main();
 
     // Rank the top `k` of `scores` into `out`, and score a prediction against a routing.
@@ -572,6 +601,15 @@ private:
     PendingLayer pending_;
     std::vector<RouteTraceRow> trace_rows_;
     std::unordered_set<int32_t> charged_; // per-flush scratch: experts already charged for a read
+
+    // Routing record. Inert unless rec_max_ > 0, and once the decoded tokens reach it.
+    int rec_max_ = 0;
+    bool rec_on_ = false;     // the current llama_decode is being recorded
+    bool rec_decode_ = false; // ... and it is a decode, not a prompt chunk
+    bool rec_in_prompt_ = false;
+    // The prompt chunks of the current prompt: the index of each one's first batch, and its tokens.
+    std::vector<std::pair<size_t, int>> rec_chunks_;
+    RoutingTrace rec_;
 
     // Compute trace. All of this is inert unless ctrace_on_. `ctrace_mark_` is the previous
     // isolation boundary: the node reported by the next callback is charged the wall since it.

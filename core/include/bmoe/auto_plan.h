@@ -18,6 +18,7 @@
 #include "bmoe/hardware_profile.h"
 #include "bmoe/model_profile.h"
 #include "bmoe/plan.h"
+#include "bmoe/routing.h"
 
 #include <functional>
 #include <string>
@@ -48,7 +49,30 @@ struct AutoPlanOptions {
     // probed in this process, as they also are where this platform cannot start a second one.
     std::function<std::vector<std::string>(const std::string & device)> isolated_probe_args;
     double isolated_probe_seconds = k_isolated_probe_seconds;
+
+    // Called as each stage of the sequence starts, with its key (k_plan_steps), its position and
+    // the number of stages, so a front-end can say which probe is running instead of a blind wait.
+    // Called on the planning thread; empty, nothing is reported.
+    std::function<void(const char * step, int index, int count)> on_step;
+
+    // The routing this model recorded on an earlier run (Session::routing_record), kept by the
+    // front-end against the model file's fingerprint (model_fingerprint in bmoe/probe.h). With it the
+    // cache is priced on the model's own hit curve (bmoe/routing.h); without it, or with one that is
+    // not this model's, the plan is the one a first load gets. Not owned; read during the call only.
+    const RoutingTrace * routing = nullptr;
+
+    // What earlier loads of this model measured about its lossless knobs (Session::measured_knobs),
+    // every record the front-end kept for the file, one per machine and engine. The one whose
+    // hardware_fingerprint and engine version are this run's becomes ModelProfile::knobs; the rest
+    // are another machine's or another engine's and are not read. Not owned; read during the call.
+    const std::vector<MeasuredKnobs> * knobs = nullptr;
 };
+
+// The stages probe_and_plan() reports through AutoPlanOptions::on_step, in the order they run. The
+// keys are a protocol for front-ends (the server's `plan_progress` event), not words to display.
+inline constexpr const char * k_plan_steps[] = {"devices", "model",     "compute", "storage",
+                                                "memory",  "placement", "rules"};
+inline constexpr int k_plan_step_count = (int) (sizeof(k_plan_steps) / sizeof(k_plan_steps[0]));
 
 // The plan and the two profiles it was made from: a front-end that explains a plan quotes the
 // facts (every device's figures, the model's weight groups) beside the decisions. The first

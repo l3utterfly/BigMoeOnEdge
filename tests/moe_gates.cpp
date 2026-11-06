@@ -18,7 +18,7 @@
 //
 // If G3 passes, the streamer provably never gathers an unrouted (garbage) slice. If G4
 // passes, the async path gates each expert correctly — compute never races ahead of its read.
-// G4 is compiled only when the fork's expert-ready hook is present (BMOE_HAVE_EXPERT_READY_HOOK).
+// G4, G5b and S2 run only when the CPU backend loaded here exposes the fork's expert-ready hook.
 //
 //   S1  two sequential Session generates (warm cache) == one-shot resident, per prompt
 //   S3  same, with an explicit budget shrink between the two generates (full eviction pass)
@@ -46,7 +46,8 @@
 //   G13 the speculative decode loop, via the n-gram source on a prompt with nothing to match: it
 //       abstains, so every step takes the plain path and the output must be identical
 //   G14 --route-ahead, in two halves: a horizon past every layer overrides nothing and must be
-//       identical, and a horizon of one must commit real routings and still generate
+//       identical, and a horizon of one must commit real routings and still generate, on the int8
+//       gate mirror and on the float gates alike
 ////   G15 --row-stream, the dense tables the graph only gathers rows from: a) served from flash
 //       inside the default window and b) inside a window of one slab, so nearly every gather
 //       evicts what the last one fetched. Both must be byte-identical to the resident reference.
@@ -56,6 +57,24 @@
 //       a session without decide enabled refuses it harmlessly (f), and with a prefill device
 //       decisions (no prefix state kept) and a generate() after them == all CPU (g). G16 and G17 are
 //       the prefill-device gates.
+//   G22 context checkpoints: a follow-up whose prompt diverges from the cached one inside the
+//       previous answer (the client resent it edited) restarts from the checkpoint at the end of the
+//       previous prompt where the memory refuses the cut, and answers exactly as the same pieces
+//       prefilled without any restore (a); with checkpoints off such a memory prefills it all (b).
+//   G23 the KV cache at f16, llama.cpp's type: streaming == resident. q8_0 is the default, so every
+//       other gate runs on a quantized cache; this one keeps the lossless type covered. The cache
+//       type changes the output, never what streaming the experts produces.
+//   G20 the fitter's placement for a model larger than the device: dense parts on a device with
+//       memory of its own, experts streamed from the host, == the same placement resident, serial
+//       (a) and under --overlap (b). The router's ids are then read through a host copy.
+//   G24 the knob trial switches the decode thread count and overlap between timed windows of the
+//       answer it decodes: == resident over one long answer (a) and over four turns that each end
+//       inside a window (b), and the trial must have reached its verdicts.
+//   G25 the device tier: llama.cpp's device-side expert cache over resident experts (a), over
+//       streamed experts (b) and streamed under n-gram speculation (c), each == the resident
+//       placement.
+//   G26 the real-layer probe fills every device's facts and agrees with the host on the layer's
+//       matmuls; it is timed, not gated, on the tiny models.
 //
 // G15 needs no separate "did it do anything" check of the G10 kind: the tensor is bound to
 // RESERVED address space, so a row the policy fails to fetch is not a slightly wrong weight but
@@ -74,12 +93,14 @@
 // and the G9b control still run and must pass.
 #include "bmoe/config.h"
 #include "bmoe/runtime.h"
+#include "bmoe/probe.h"
 #include "bmoe/session.h"
 #include "gguf_offsets.h"
 
 #include "ggml-backend.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -316,6 +337,34 @@ static int check(const char * name, const std::string & a, const std::string & b
     return 1;
 }
 
+// Equal to within `rel`, element by element, where two paths put the same tokens through
+// different batch shapes. The streamed-versus-resident gates stay bit-exact: this is only for a
+// comparison upstream never promised to be bitwise, a wide prefill against one row at a time,
+// whose kernels may accumulate in another order (seen on the ARM CPU backend from the 2026-10
+// base: the three choices' log-probabilities differing by the same 1e-12 relative, the
+// log-softmax normaliser one ulp apart). The bound is nine orders of magnitude below a wrong answer.
+static int check_close(const char * name, const std::vector<double> & a, const std::vector<double> & b, double rel) {
+    bool ok = a.size() == b.size();
+    for (size_t i = 0; ok && i < a.size(); ++i)
+        ok = std::fabs(a[i] - b[i]) <= rel * (std::fabs(a[i]) > std::fabs(b[i]) ? std::fabs(a[i]) : std::fabs(b[i]));
+    if (ok) {
+        std::printf("[PASS] %s\n", name);
+        return 0;
+    }
+    std::string sa, sb;
+    char buf[64];
+    for (double v : a) {
+        std::snprintf(buf, sizeof buf, "%a ", v);
+        sa += buf;
+    }
+    for (double v : b) {
+        std::snprintf(buf, sizeof buf, "%a ", v);
+        sb += buf;
+    }
+    std::printf("[FAIL] %s\n  A: %s\n  B: %s\n", name, sa.c_str(), sb.c_str());
+    return 1;
+}
+
 int main(int argc, char ** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0); // a crash must not swallow the verdicts printed before it
     if (argc < 2) {
@@ -323,6 +372,25 @@ int main(int argc, char ** argv) {
         return 2;
     }
     const std::string model = argv[1];
+    // --require-hook: this build is expected to carry the fork's expert-ready hook, so the overlap
+    // gates must run and their absence is a failure, not a skip. A module build only learns at run
+    // time which CPU backend it loaded; without this, a bump or a stripped module would retire G4,
+    // G5b and S2 without a word and the suite would stay green. CI passes it on the job whose
+    // purpose is to prove --overlap byte-identical (BMOE_GATES_REQUIRE_HOOK).
+    bool require_hook = false;
+    for (int i = 2; i < argc; ++i)
+        if (std::string(argv[i]) == "--require-hook") require_hook = true;
+    // The backends come from beside this executable, loaded the way the engine loads them, and the
+    // hook is judged on what loaded: asked before any backend is registered, the registry has no
+    // CPU device and the answer would be "absent" on every build.
+    register_backends();
+    const bool have_hook = expert_ready_hook_available();
+    int hook_missing = 0;
+    if (require_hook && !have_hook) {
+        std::printf("[FAIL] the CPU backend loaded here has no expert-ready hook, and --require-hook says this build "
+                    "must: G4, G5b and S2 cannot run\n");
+        hook_missing = 1;
+    }
     const bool adjacent_moe = has_adjacent_moe_layers(model);
 
     // resident reference
@@ -411,9 +479,91 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
-    int fails = 0;
+    int fails = hook_missing; // --require-hook with the hook absent: one failure before any gate
     fails += check("G1 resident == streaming(cache off)", s_res, s_s0);
     fails += check("G2 streaming(cache off) == streaming(LRU cache)", s_s0, s_sc);
+
+    // G2r — the routing record the planner prices the cache from is the engine's own: replayed
+    // through the planner's LRU (bmoe/routing.h) at the run's budget, it must give the hit rate the
+    // engine's cache measured, prompt included and decode alone. Bounded by the record's own limit.
+    {
+        RunResult r = run(streamc);
+        const RoutingTrace & rec = r.routing;
+        const ReplayCounts rp = replay_lru(rec, (uint64_t) streamc.moe.cache_mb << 20);
+        RoutingTrace back;
+        std::string perr;
+        const bool round = parse_routing_trace(format_routing_trace(rec), back, perr) &&
+                           replay_lru(back, (uint64_t) streamc.moe.cache_mb << 20).hits == rp.hits;
+        const double cum = 100.0 * rp.hit(), dec = 100.0 * rp.decode_hit();
+        if (!r || rec.empty() || rec.decode_tokens == 0 || rec.decode_tokens > (uint32_t) r.summary.n_generated ||
+            rec.prefill_tokens == 0 || std::fabs(cum - r.summary.cache_hit_pct) > 0.05 ||
+            std::fabs(dec - r.summary.cache_hit_decode_pct) > 0.05 || !round) {
+            std::printf("[FAIL] G2r routing record replays to the measured hit rate: %u prompt + %u decode tokens, "
+                        "replay %.2f%% / %.2f%% decode, engine %.2f%% / %.2f%%%s\n",
+                        rec.prefill_tokens, rec.decode_tokens, cum, dec, r.summary.cache_hit_pct,
+                        r.summary.cache_hit_decode_pct, round ? "" : ", and it does not read back");
+            ++fails;
+        } else {
+            std::printf("[PASS] G2r routing record (%u prompt + %u decode tokens) replays to the engine's "
+                        "%.2f%% (%.2f%% decode)\n",
+                        rec.prefill_tokens, rec.decode_tokens, r.summary.cache_hit_pct, r.summary.cache_hit_decode_pct);
+        }
+        RunConfig capped = streamc;
+        capped.moe.routing_record_tokens = 4;
+        RunConfig off = streamc;
+        off.moe.routing_record_tokens = 0;
+        const RunResult rc = run(capped);
+        const RunResult ro = run(off);
+        if (!rc || !ro || rc.routing.decode_tokens != 4 || !ro.routing.empty() ||
+            rc.generated_text != r.generated_text || ro.generated_text != r.generated_text) {
+            std::printf("[FAIL] G2r' the record stops at its bound, is off at 0, and changes no output (%u decode "
+                        "tokens at a bound of 4, %zu batches off)\n",
+                        rc.routing.decode_tokens, ro.routing.batches.size());
+            ++fails;
+        } else {
+            std::printf("[PASS] G2r' the record stops at its bound, is off at 0, and changes no output\n");
+        }
+    }
+    // G2u — a run that does not stream records its routing only when asked to, and the record is the
+    // same routing a streamed run of the same prompt asked its cache for (routing does not depend on
+    // where an expert lives). Asked or not, the output is the resident run's.
+    {
+        RunConfig plain = base(model);
+        RunConfig asked = plain;
+        asked.moe.record_unstreamed = true;
+        const RunResult rp = run(plain);
+        const RunResult ra = run(asked);
+        const RunResult rs = run(streamc);
+        size_t same = 0, decoded = 0;
+        for (size_t i = 0, j = 0; i < ra.routing.batches.size() && j < rs.routing.batches.size();) {
+            const RoutingBatch & a = ra.routing.batches[i];
+            const RoutingBatch & b = rs.routing.batches[j];
+            if (!a.decode) {
+                ++i;
+                continue;
+            }
+            if (!b.decode) {
+                ++j;
+                continue;
+            }
+            ++decoded;
+            same += a.layer == b.layer && a.experts == b.experts;
+            ++i;
+            ++j;
+        }
+        if (!rp || !ra || !rp.routing.empty() || ra.routing.decode_tokens == 0 ||
+            ra.generated_text != rp.generated_text || decoded == 0 || same != decoded) {
+            std::printf("[FAIL] G2u an unstreamed run records only when asked, the routing a stream asks for, and "
+                        "changes no output (%zu batches unasked, %u decode tokens asked, %zu of %zu decode batches "
+                        "match the stream's)\n",
+                        rp.routing.batches.size(), ra.routing.decode_tokens, same, decoded);
+            ++fails;
+        } else {
+            std::printf("[PASS] G2u an unstreamed run records only when asked (%u decode tokens), the routing a "
+                        "stream asks for, and changes no output\n",
+                        ra.routing.decode_tokens);
+        }
+    }
     fails += check("G3 streaming(selective) == streaming(load-all)", s_s0, s_all);
     // G6: rebinding the dense weights onto O_DIRECT anon buffers must not change a byte — same
     // bytes, same offsets, so identical output to the mmap-resident reference. This is the
@@ -424,64 +574,64 @@ int main(int argc, char ** argv) {
     fails += check("G15a row-stream(row-gathered tables from flash) == resident", s_res, s_rows);
     fails += check("G15b row-stream(one-slab window, evicting) == resident", s_res, s_rows_tight);
 
-#ifdef BMOE_HAVE_EXPERT_READY_HOOK
-    // overlap, cache off
-    RunConfig ov0 = base(model);
-    ov0.moe.enabled = true;
-    ov0.moe.cache_mb = 0;
-    ov0.moe.io_threads = 4;
-    ov0.moe.overlap = true;
+    if (!have_hook) {
+        std::printf("[SKIP] G4 (the CPU backend here has no expert-ready hook)\n");
+    } else {
+        // overlap, cache off
+        RunConfig ov0 = base(model);
+        ov0.moe.enabled = true;
+        ov0.moe.cache_mb = 0;
+        ov0.moe.io_threads = 4;
+        ov0.moe.overlap = true;
 
-    // overlap, small forced cache (same cache config as G2's streamc)
-    RunConfig ovc = base(model);
-    ovc.moe.enabled = true;
-    ovc.moe.cache_mb = 2;
-    ovc.moe.force_cache = true;
-    ovc.moe.io_threads = 4;
-    ovc.moe.overlap = true;
+        // overlap, small forced cache (same cache config as G2's streamc)
+        RunConfig ovc = base(model);
+        ovc.moe.enabled = true;
+        ovc.moe.cache_mb = 2;
+        ovc.moe.force_cache = true;
+        ovc.moe.io_threads = 4;
+        ovc.moe.overlap = true;
 
-    // overlap, cache off, single I/O lane (stress: the compute threads stall on every expert)
-    RunConfig ov1 = base(model);
-    ov1.moe.enabled = true;
-    ov1.moe.cache_mb = 0;
-    ov1.moe.io_threads = 1;
-    ov1.moe.overlap = true;
+        // overlap, cache off, single I/O lane (stress: the compute threads stall on every expert)
+        RunConfig ov1 = base(model);
+        ov1.moe.enabled = true;
+        ov1.moe.cache_mb = 0;
+        ov1.moe.io_threads = 1;
+        ov1.moe.overlap = true;
 
-    // overlap, cache, two-wave publish: the lanes wake on the first projection's jobs and the
-    // batch grows mid-generation. Exercises the grown-batch worker predicate and the split
-    // commit; the wait-per-expert hook must still gate every projection to the same bytes.
-    RunConfig ov2w = base(model);
-    ov2w.moe.enabled = true;
-    ov2w.moe.cache_mb = 2;
-    ov2w.moe.force_cache = true;
-    ov2w.moe.io_threads = 4;
-    ov2w.moe.overlap = true;
-    ov2w.moe.io_two_wave = true;
+        // overlap, cache, two-wave publish: the lanes wake on the first projection's jobs and the
+        // batch grows mid-generation. Exercises the grown-batch worker predicate and the split
+        // commit; the wait-per-expert hook must still gate every projection to the same bytes.
+        RunConfig ov2w = base(model);
+        ov2w.moe.enabled = true;
+        ov2w.moe.cache_mb = 2;
+        ov2w.moe.force_cache = true;
+        ov2w.moe.io_threads = 4;
+        ov2w.moe.overlap = true;
+        ov2w.moe.io_two_wave = true;
 
-    std::string s_ov0, s_ovc, s_ov1, s_ov2w;
-    if (!gen(ov0, s_ov0, err)) {
-        std::fprintf(stderr, "overlap(cache off) run failed: %s\n", err.c_str());
-        return 2;
+        std::string s_ov0, s_ovc, s_ov1, s_ov2w;
+        if (!gen(ov0, s_ov0, err)) {
+            std::fprintf(stderr, "overlap(cache off) run failed: %s\n", err.c_str());
+            return 2;
+        }
+        if (!gen(ovc, s_ovc, err)) {
+            std::fprintf(stderr, "overlap(cache) run failed: %s\n", err.c_str());
+            return 2;
+        }
+        if (!gen(ov1, s_ov1, err)) {
+            std::fprintf(stderr, "overlap(io_threads=1) run failed: %s\n", err.c_str());
+            return 2;
+        }
+        if (!gen(ov2w, s_ov2w, err)) {
+            std::fprintf(stderr, "overlap(two-wave) run failed: %s\n", err.c_str());
+            return 2;
+        }
+        fails += check("G4a overlap(cache off) == streaming(cache off)", s_s0, s_ov0);
+        fails += check("G4b overlap(LRU cache) == streaming(cache off)", s_s0, s_ovc);
+        fails += check("G4c overlap(io_threads=1) == streaming(cache off)", s_s0, s_ov1);
+        fails += check("G4d overlap(two-wave publish) == streaming(cache off)", s_s0, s_ov2w);
     }
-    if (!gen(ovc, s_ovc, err)) {
-        std::fprintf(stderr, "overlap(cache) run failed: %s\n", err.c_str());
-        return 2;
-    }
-    if (!gen(ov1, s_ov1, err)) {
-        std::fprintf(stderr, "overlap(io_threads=1) run failed: %s\n", err.c_str());
-        return 2;
-    }
-    if (!gen(ov2w, s_ov2w, err)) {
-        std::fprintf(stderr, "overlap(two-wave) run failed: %s\n", err.c_str());
-        return 2;
-    }
-    fails += check("G4a overlap(cache off) == streaming(cache off)", s_s0, s_ov0);
-    fails += check("G4b overlap(LRU cache) == streaming(cache off)", s_s0, s_ovc);
-    fails += check("G4c overlap(io_threads=1) == streaming(cache off)", s_s0, s_ov1);
-    fails += check("G4d overlap(two-wave publish) == streaming(cache off)", s_s0, s_ov2w);
-#else
-    std::printf("[SKIP] G4 (expert-ready hook not built)\n");
-#endif
 
     // ── S1/S2: warm cache across Session generates must not change bytes ──
     // A forced small LRU cache so the first generate leaves state (resident + evicted entries)
@@ -528,18 +678,18 @@ int main(int argc, char ** argv) {
     }
     fails += check("G5a streaming(prefetch) == streaming(cache off)", s_s0, s_pf);
 
-#ifdef BMOE_HAVE_EXPERT_READY_HOOK
-    RunConfig pf_ov = pf;
-    pf_ov.moe.overlap = true;
-    std::string s_pf_ov;
-    if (!gen(pf_ov, s_pf_ov, err)) {
-        std::fprintf(stderr, "prefetch overlap run failed: %s\n", err.c_str());
-        return 2;
+    if (!have_hook) {
+        std::printf("[SKIP] G5b (the CPU backend here has no expert-ready hook)\n");
+    } else {
+        RunConfig pf_ov = pf;
+        pf_ov.moe.overlap = true;
+        std::string s_pf_ov;
+        if (!gen(pf_ov, s_pf_ov, err)) {
+            std::fprintf(stderr, "prefetch overlap run failed: %s\n", err.c_str());
+            return 2;
+        }
+        fails += check("G5b overlap(prefetch) == streaming(cache off)", s_s0, s_pf_ov);
     }
-    fails += check("G5b overlap(prefetch) == streaming(cache off)", s_s0, s_pf_ov);
-#else
-    std::printf("[SKIP] G5b (expert-ready hook not built)\n");
-#endif
 
     // G5c forces speculative reads to complete synchronously, so the integrate-then-hit path (a
     // prefetched expert becoming resident and a later routing hitting it) is deterministically
@@ -553,19 +703,19 @@ int main(int argc, char ** argv) {
     }
     fails += check("G5c prefetch(sync integrate+hit) == streaming(cache off)", s_s0, s_pf_sync);
 
-#ifdef BMOE_HAVE_EXPERT_READY_HOOK
-    RunConfig sess_ov = sess;
-    sess_ov.moe.overlap = true;
-    std::string s_og1, s_og2;
-    if (!session_two_gens(sess_ov, s_og1, s_og2, err)) {
-        std::fprintf(stderr, "session overlap run failed: %s\n", err.c_str());
-        return 2;
+    if (!have_hook) {
+        std::printf("[SKIP] S2 (the CPU backend here has no expert-ready hook)\n");
+    } else {
+        RunConfig sess_ov = sess;
+        sess_ov.moe.overlap = true;
+        std::string s_og1, s_og2;
+        if (!session_two_gens(sess_ov, s_og1, s_og2, err)) {
+            std::fprintf(stderr, "session overlap run failed: %s\n", err.c_str());
+            return 2;
+        }
+        fails += check("S2a session+overlap generate #1 == resident", s_res, s_og1);
+        fails += check("S2b session+overlap generate #2 (warm cache) == resident", s_res, s_og2);
     }
-    fails += check("S2a session+overlap generate #1 == resident", s_res, s_og1);
-    fails += check("S2b session+overlap generate #2 (warm cache) == resident", s_res, s_og2);
-#else
-    std::printf("[SKIP] S2 (expert-ready hook not built)\n");
-#endif
 
     // G8 — cache-aware expert dropping, plumbing vs policy.
     //
@@ -890,28 +1040,38 @@ int main(int argc, char ** argv) {
     // speculative read path and adopted by the demand load, so a mistake there reads an expert slot
     // the cache never filled. Asserting the override COUNT is what stops an inert policy passing
     // this vacuously, the same trap G10b guards for the prefetch.
-    RunConfig ra_live = base(model);
-    ra_live.moe.enabled = true;
-    ra_live.moe.cache_mb = 2;
-    ra_live.moe.force_cache = true;
-    ra_live.moe.io_threads = 4;
-    ra_live.moe.route_ahead = 1;
-    std::string s_ra_live;
-    if (!gen(ra_live, s_ra_live, err)) {
-        std::fprintf(stderr, "route-ahead(1) run failed: %s\n", err.c_str());
-        return 2;
-    }
-    {
+    //
+    // Run once per gate format (--gate-mirror on and off), because which one a machine takes is
+    // timed at load: a host that never picks one would otherwise never exercise it. Both rank the
+    // same gate, so both must commit; their outputs are not compared, since a near-tie between two
+    // experts may resolve differently at an int8 step and route-ahead is lossy either way.
+    for (const GateMirror gm : {GateMirror::On, GateMirror::Off}) {
+        const char * gm_name = gm == GateMirror::On ? "int8 gates" : "float gates";
+        RunConfig ra_live = base(model);
+        ra_live.moe.enabled = true;
+        ra_live.moe.cache_mb = 2;
+        ra_live.moe.force_cache = true;
+        ra_live.moe.io_threads = 4;
+        ra_live.moe.route_ahead = 1;
+        ra_live.moe.gate_mirror = gm;
+        std::string s_ra_live;
+        if (!gen(ra_live, s_ra_live, err)) {
+            std::fprintf(stderr, "route-ahead(1) run on %s failed: %s\n", gm_name, err.c_str());
+            return 2;
+        }
         RunResult r = run(ra_live);
         if (r && !s_ra_live.empty() && !adjacent_moe) {
-            std::printf("[N/A ] G14b route-ahead(1): no two adjacent MoE blocks, nothing to commit ahead\n");
+            std::printf("[N/A ] G14b route-ahead(1), %s: no two adjacent MoE blocks, nothing to commit ahead\n",
+                        gm_name);
         } else if (!r || s_ra_live.empty() || r.summary.route_ahead_overridden <= 0) {
-            std::printf("[FAIL] G14b route-ahead(1) must commit routings and generate (committed=%lld, empty=%d)\n",
-                        r ? r.summary.route_ahead_overridden : -1, (int) s_ra_live.empty());
+            std::printf("[FAIL] G14b route-ahead(1), %s, must commit routings and generate (committed=%lld, "
+                        "empty=%d)\n",
+                        gm_name, r ? r.summary.route_ahead_overridden : -1, (int) s_ra_live.empty());
             ++fails;
         } else {
-            std::printf("[PASS] G14b route-ahead(1) committed %lld routings (%lld passed through) and generated\n",
-                        r.summary.route_ahead_overridden, r.summary.route_ahead_passthrough);
+            std::printf("[PASS] G14b route-ahead(1), %s, committed %lld routings (%lld passed through) and "
+                        "generated\n",
+                        gm_name, r.summary.route_ahead_overridden, r.summary.route_ahead_passthrough);
         }
     }
 
@@ -993,6 +1153,46 @@ int main(int argc, char ** argv) {
             std::snprintf(a, sizeof(a), "%.17g/%d", p_cpu.nll, p_cpu.n_top1);
             std::snprintf(b, sizeof(b), "%.17g/%d", p_dev.nll, p_dev.n_top1);
             fails += check("G16c perplexity with device prefill == all CPU (nll/top1, bit for bit)", a, b);
+
+            // G16d: speculation beside the prefill device. The verify batches are host graphs narrower
+            // than any piece the device is handed (validate() holds the two apart), so the run is the
+            // CPU one, and the n-gram source drafts from a prompt that repeats itself.
+            {
+                RunConfig ref = pref;
+                ref.n_ubatch = 8;
+                ref.prompt = "one two three four five six seven eight one two three four five six seven eight one "
+                             "two three four five six seven eight one two three four";
+                RunConfig dspec = ref;
+                dspec.prefill.device = dev;
+                dspec.prefill.min_tokens = 8;
+                dspec.spec.source = DraftSource::ngram;
+                dspec.spec.draft_max = 3;
+                std::string s_ref;
+                if (!gen(ref, s_ref, err)) {
+                    std::fprintf(stderr, "G16d reference run failed: %s\n", err.c_str());
+                    return 2;
+                }
+                const RunResult rd = run(dspec);
+                if (!rd) {
+                    std::printf("[FAIL] G16d prefill device with speculation failed: %s\n", rd.error.c_str());
+                    ++fails;
+                } else {
+                    fails += check("G16d prefill on device, n-gram speculation on the CPU == all CPU", s_ref,
+                                   rd.generated_text);
+                    if (rd.summary.prefill_device_tokens <= 0) {
+                        std::printf("[FAIL] G16d the device prefilled nothing\n");
+                        ++fails;
+                    }
+                    RunConfig wide = dspec;
+                    wide.spec.draft_max = 7;
+                    if (validate(wide).ok) {
+                        std::printf("[FAIL] G16d a verify as wide as the device's narrowest piece was accepted\n");
+                        ++fails;
+                    } else {
+                        std::printf("[PASS] G16d a verify as wide as the device's narrowest piece is refused\n");
+                    }
+                }
+            }
 
             // ── G17: streamed experts through the device arena ──
             // The model streams; the device prefill gets its experts from two slots refilled layer by
@@ -1156,8 +1356,9 @@ int main(int argc, char ** argv) {
 
         // Open a session on `c` and run `qs` in order. False (with err) if any call fails.
         auto decide_seq = [&](const RunConfig & c, const std::vector<DecideRequest> & qs,
-                              std::vector<DecideResult> & out) {
+                              std::vector<DecideResult> & out, int n_batch = 0) {
             SessionConfig sc = session_config_from(c);
+            if (n_batch > 0) sc.n_batch = n_batch;
             sc.decide.enabled = true;
             sc.decide.prefix_cache = PrefixCacheMode::On;
             std::unique_ptr<Session> s = Session::open(sc, err);
@@ -1206,15 +1407,21 @@ int main(int argc, char ** argv) {
         fails += check("G18b decide(grown prefix restored) == decide(grown prefix as computed)", logps(grown[1]),
                        logps(grown[2]));
 
+        // A perplexity pass wants every row's logits, so it is fed in pieces no wider than the rows a
+        // context reserves (PrefillDeviceConfig::max_outputs), and this text is wider than that. Both
+        // sides are opened at that batch so they compute the same pieces: across different piece
+        // boundaries llama.cpp rounds differently (see G18b), and that is not what (c) is about.
+        const int g18c_batch = PrefillDeviceConfig::max_outputs;
         std::vector<DecideResult> whole;
         DecideRequest q_whole = q1;
         q_whole.reuse_prefix = false;
-        if (!decide_seq(stream0, {q_whole}, whole)) {
+        if (!decide_seq(stream0, {q_whole}, whole, g18c_batch)) {
             std::fprintf(stderr, "decide(whole) run failed: %s\n", err.c_str());
             return 2;
         }
         {
             SessionConfig sc = session_config_from(stream0);
+            sc.n_batch = g18c_batch;
             std::unique_ptr<Session> s = Session::open(sc, err);
             if (!s) {
                 std::fprintf(stderr, "perplexity session failed: %s\n", err.c_str());
@@ -1228,9 +1435,10 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "perplexity run failed: %s\n", pr.error.c_str());
                 return 2;
             }
-            DecideResult as_decide;
-            as_decide.choice_logp = pr.choice_logp;
-            fails += check("G18c decide(whole prefill) == perplexity(choices)", logps(as_decide), logps(whole[0]));
+            // The choices go through a wide prefill here and one row at a time there (G18 c): the
+            // same distribution, to within the kernels' batch-shape rounding.
+            fails += check_close("G18c decide(whole prefill) == perplexity(choices)", pr.choice_logp,
+                                 whole[0].choice_logp, 1e-9);
 
             // f) off by default: the same session (decide not enabled) refuses, without harm.
             const DecideResult off = s->decide(q1);
@@ -1386,6 +1594,14 @@ int main(int argc, char ** argv) {
         } else {
             fails += check("G19 budget past n_ctx == budget of the room", exact.generated_text, big.generated_text);
         }
+        const RunResult uncapped = s->generate(GenerateRequest{stream0.prompt, 0});
+        if (!uncapped || uncapped.summary.n_predict != room) {
+            std::printf("[FAIL] G19 no ceiling must be the room (ok=%d budget=%d room=%d)\n", (int) (bool) uncapped,
+                        uncapped.summary.n_predict, room);
+            ++fails;
+        } else {
+            fails += check("G19 no ceiling == budget of the room", exact.generated_text, uncapped.generated_text);
+        }
         std::string long_prompt;
         for (int i = 0; i < 64; ++i)
             long_prompt += "streaming test words ";
@@ -1397,6 +1613,321 @@ int main(int argc, char ** argv) {
             ++fails;
         } else {
             fails += check("G19 refused prompt leaves the session usable", exact.generated_text, again.generated_text);
+        }
+    }
+
+    // ── G20: routing on a device with memory of its own, experts streamed from the host (#321) ──
+    // The placement llama.cpp's capacity fitter writes when a MoE model does not fit: every layer's
+    // dense part on the device, the routed experts overridden back to the host, where the streamer
+    // serves them. The router's top-k then runs on the device, in a buffer that is not host memory,
+    // and the hook must read its ids through a copy (#335). The reference has the same placement with
+    // the experts resident, so streaming is the only difference. a) serial, b) under --overlap.
+    // The loopback RPC device is one every host has; its buffers report as not host, so this is the
+    // path a discrete GPU takes.
+    {
+        const std::string dev = loopback_rpc_device();
+        if (dev.empty()) {
+            std::printf("[SKIP] G20 routing on a device: this build has no RPC backend (GGML_RPC=OFF)\n");
+        } else {
+            RunConfig placed = base(model);
+            placed.moe.enabled = false;
+            // Every block on the device, as the split states it: the two must name one placement.
+            placed.n_gpu_layers = read_gguf_model_info(model.c_str()).n_block;
+            placed.device_split = {{dev, placed.n_gpu_layers}};
+            placed.buft_overrides = {"\\.ffn_(up|down|gate|gate_up)_(ch|)exps"};
+
+            RunConfig placed_s = placed;
+            placed_s.moe = stream0.moe;
+
+            std::string s_placed;
+            if (!gen(placed, s_placed, err)) {
+                std::fprintf(stderr, "G20 reference run failed: %s\n", err.c_str());
+                return 2;
+            }
+            const RunResult r_s = run(placed_s);
+            if (!r_s) {
+                std::fprintf(stderr, "G20 run failed: %s\n", r_s.error.c_str());
+                return 2;
+            }
+            fails += check("G20a device routing, streamed experts == device routing, resident experts", s_placed,
+                           r_s.generated_text);
+            // Identity alone would pass if the overrides had left no expert to stream.
+            const double read_mib = r_s.summary.moe_read_mib + r_s.summary.prefill_read_mib;
+            if (read_mib <= 0.0) {
+                std::printf("[FAIL] G20a no expert was streamed: the placement left nothing on the host\n");
+                ++fails;
+            } else {
+                std::printf("[PASS] G20a the experts streamed from the host (%.3f MiB read)\n", read_mib);
+            }
+            // G25 — the device tier: the same placement with llama.cpp's device-side expert cache in
+            // front of the host's experts, so every routed expert is computed on the device from a
+            // slot the cache filled. a) the experts resident on the host, b) streamed to it. Both
+            // must give the resident placement's bytes: a slot is the expert's own bytes, computed by
+            // the device's own kernel.
+            {
+                RunConfig cached = placed;
+                cached.moe.device_cache_mb = 4;
+                RunConfig cached_s = placed_s;
+                cached_s.moe.device_cache_mb = 4;
+                std::string s_cached, s_cached_s;
+                if (!gen(cached, s_cached, err) || !gen(cached_s, s_cached_s, err)) {
+                    std::printf("[FAIL] G25 a device cache run failed: %s\n", err.c_str());
+                    ++fails;
+                } else {
+                    fails += check("G25a device cache over resident experts == resident experts", s_placed, s_cached);
+                    fails += check("G25b device cache over streamed experts == resident experts", s_placed, s_cached_s);
+                    // c) with speculation: a verify batch is a few positions wide, served by the same
+                    // slots, and greedy drafting accepts only what the target would have produced.
+                    RunConfig cached_spec = cached_s;
+                    cached_spec.spec.source = DraftSource::ngram;
+                    std::string s_cached_spec;
+                    if (!gen(cached_spec, s_cached_spec, err)) {
+                        std::printf("[FAIL] G25c a device cache run with speculation failed: %s\n", err.c_str());
+                        ++fails;
+                    } else {
+                        fails += check("G25c device cache, streamed, n-gram speculation == resident experts", s_placed,
+                                       s_cached_spec);
+                    }
+                }
+            }
+            if (!have_hook) {
+                std::printf("[SKIP] G20b (the CPU backend here has no expert-ready hook)\n");
+            } else {
+                RunConfig placed_ov = placed_s;
+                placed_ov.moe.overlap = true;
+                std::string s_placed_ov;
+                if (!gen(placed_ov, s_placed_ov, err)) {
+                    std::fprintf(stderr, "G20b run failed: %s\n", err.c_str());
+                    return 2;
+                }
+                fails +=
+                    check("G20b device routing, streamed experts, overlap == resident experts", s_placed, s_placed_ov);
+            }
+        }
+    }
+
+    // ── G24: the knob trial (docs/measured-planning.md, Step 2) switches the decode thread count and
+    // overlap between windows of the answer it is decoding: the answer must be the resident one. ──
+    {
+        RunConfig ref = resident;
+        ref.n_predict = 120; // long enough for both knobs' rounds at a two-token window
+        std::string s_ref;
+        if (!gen(ref, s_ref, err)) {
+            std::fprintf(stderr, "G24 reference run failed: %s\n", err.c_str());
+            return 2;
+        }
+        RunConfig trial = streamc; // the cache settles, then the windows alternate
+        trial.n_predict = ref.n_predict;
+        trial.trial.threads = {1, 4};
+        trial.trial.overlap = have_hook; // without the hook the session leaves overlap out, and says so
+        trial.trial.window_tokens = 2;
+        const RunResult r = run(trial);
+        if (!r) {
+            std::fprintf(stderr, "G24 run failed: %s\n", r.error.c_str());
+            return 2;
+        }
+        fails += check("G24a knob trial (threads 2 vs 1 vs 4, then overlap) == resident", s_ref, r.generated_text);
+        // Identity alone would pass a trial that never switched anything.
+        const MeasuredKnobs & mk = r.knobs;
+        const bool threads_ok = mk.threads > 0 && mk.threads_tried == std::vector<int>({2, 1, 4}) && mk.rounds > 0;
+        const bool overlap_ok = !have_hook || (mk.overlap >= 0 && mk.overlap_incumbent == 0);
+        if (!threads_ok || !overlap_ok) {
+            std::printf("[FAIL] G24a the trial did not reach its verdicts: threads %d (%zu tried), overlap %d, "
+                        "%d rounds\n",
+                        mk.threads, mk.threads_tried.size(), mk.overlap, mk.rounds);
+            ++fails;
+        } else {
+            std::printf("[PASS] G24a the trial reached its verdicts: %d threads (x%.2f), overlap %s, %d rounds\n",
+                        mk.threads, mk.threads_gain,
+                        mk.overlap < 0 ? "not measured"
+                        : mk.overlap   ? "on"
+                                       : "off",
+                        mk.rounds);
+        }
+
+        // G24b: the trial spans turns. A request that ends inside a window drops it and the next one
+        // takes up the trial where it stood; every answer is still the resident one.
+        RunConfig ref_b = resident;
+        ref_b.n_predict = 40;
+        std::string s_ref_b;
+        if (!gen(ref_b, s_ref_b, err)) {
+            std::fprintf(stderr, "G24b reference run failed: %s\n", err.c_str());
+            return 2;
+        }
+        RunConfig turns = trial;
+        turns.n_predict = ref_b.n_predict;
+        std::unique_ptr<Session> s = Session::open(session_config_from(turns), err);
+        if (!s) {
+            std::fprintf(stderr, "G24b open failed: %s\n", err.c_str());
+            return 2;
+        }
+        GenerateRequest req;
+        req.prompt = turns.prompt;
+        req.n_predict = turns.n_predict;
+        req.clear_kv = true;
+        bool same = true;
+        std::string differ;
+        for (int t = 0; t < 4; ++t) {
+            const RunResult rt = s->generate(req);
+            if (!rt) {
+                std::fprintf(stderr, "G24b turn %d failed: %s\n", t, rt.error.c_str());
+                return 2;
+            }
+            if (rt.generated_text != s_ref_b) {
+                same = false;
+                differ = rt.generated_text;
+            }
+        }
+        fails += check("G24b knob trial across four turns == resident, every turn", s_ref_b, same ? s_ref_b : differ);
+        const MeasuredKnobs mt = s->measured_knobs();
+        if (mt.threads <= 0) {
+            std::printf("[FAIL] G24b the trial reached no verdict across the turns\n");
+            ++fails;
+        } else {
+            std::printf("[PASS] G24b the trial reached its verdict across the turns: %d threads, overlap %s\n",
+                        mt.threads,
+                        mt.overlap < 0 ? "not measured"
+                        : mt.overlap   ? "on"
+                                       : "off");
+        }
+    }
+
+    // G22 — context checkpoints (context_checkpoints.h). Turn 1 answers u1; turn 2 resends a
+    // different answer in its place, so the prompt diverges inside it. A memory that cuts anywhere just cuts there; one
+    // that refuses (a recurrent state, a sliding window) goes back to the checkpoint taken at the end
+    // of turn 1's prompt. The reference reaches the same pieces with no restore: turn 1 generates
+    // nothing, so turn 2 only extends it. Comparing with a one-piece prefill instead would compare
+    // llama.cpp's rounding across piece boundaries, which it does not promise (G18b).
+    {
+        auto msgs = [](std::initializer_list<std::pair<const char *, std::string>> l) {
+            std::vector<ChatMessage> v;
+            for (const auto & m : l)
+                v.push_back(ChatMessage{m.first, m.second});
+            return v;
+        };
+        const std::string u1 = "Name a colour.";
+        const std::string u2 = "And a fruit?";
+        // false (with err) on a failed open or turn. prefilled = tokens turn 2 prefilled.
+        auto two_turns = [&](int checkpoints, int n_predict1, std::string & out, int & prefilled, int & n_prompt2) {
+            RunConfig c = stream0;
+            c.chatml = true;
+            c.ctx_checkpoints = checkpoints;
+            std::unique_ptr<Session> s = Session::open(session_config_from(c), err);
+            if (!s) return false;
+            GenerateRequest q;
+            q.messages = msgs({{"user", u1}});
+            q.n_predict = n_predict1;
+            RunResult r1 = s->generate(q);
+            if (!r1) {
+                err = r1.error;
+                return false;
+            }
+            q.messages = msgs({{"user", u1}, {"assistant", "Blue, I would say."}, {"user", u2}});
+            q.n_predict = 8;
+            q.clear_kv = false;
+            RunResult r2 = s->generate(q);
+            if (!r2) {
+                err = r2.error;
+                return false;
+            }
+            out = r2.generated_text;
+            prefilled = r2.summary.n_prompt;
+            n_prompt2 = r2.summary.n_past - r2.summary.n_generated;
+            return true;
+        };
+        std::string out_ck, out_ref, out_off;
+        int pf_ck = 0, pf_ref = 0, pf_off = 0, np_ck = 0, np_ref = 0, np_off = 0;
+        if (!two_turns(32, 8, out_ck, pf_ck, np_ck) || !two_turns(32, 0, out_ref, pf_ref, np_ref) ||
+            !two_turns(0, 8, out_off, pf_off, np_off)) {
+            std::fprintf(stderr, "G22 run failed: %s\n", err.c_str());
+            return 2;
+        }
+        if (pf_off < np_off) {
+            // This memory cut at the divergence by itself: checkpoints had nothing to add.
+            std::printf("[PASS] G22 this model's context cuts anywhere (turn 2 prefilled %d of %d without "
+                        "checkpoints): nothing to restore\n",
+                        pf_off, np_off);
+            if (pf_ck >= np_ck) {
+                std::printf("[FAIL] G22 with checkpoints turn 2 prefilled all %d tokens\n", np_ck);
+                ++fails;
+            }
+        } else {
+            std::printf("[PASS] G22b without checkpoints this model's context refuses the cut (turn 2 prefilled "
+                        "all %d tokens)\n",
+                        np_off);
+            if (pf_ck != pf_ref || pf_ck >= np_ck) {
+                std::printf("[FAIL] G22a the restore must land at the end of turn 1's prompt (prefilled %d, the "
+                            "reference %d, of %d)\n",
+                            pf_ck, pf_ref, np_ck);
+                ++fails;
+            }
+            fails += check("G22a turn 2 restored from a checkpoint == the same pieces prefilled", out_ref, out_ck);
+        }
+    }
+
+    // G23 — the KV cache's element type is orthogonal to streaming: with f16 keys and values, the
+    // streamed run and the resident one must still agree to the byte, as they do at the q8_0 default.
+    {
+        RunConfig res_q = resident, str_q = stream0;
+        for (RunConfig * c : {&res_q, &str_q}) {
+            c->cache_type_k = KvCacheType::F16;
+            c->cache_type_v = KvCacheType::F16;
+        }
+        std::string r_q, s_q;
+        if (!gen(res_q, r_q, err) || !gen(str_q, s_q, err)) {
+            std::fprintf(stderr, "G23 run failed: %s\n", err.c_str());
+            return 2;
+        }
+        fails += check("G23 f16 KV cache: streaming == resident", r_q, s_q);
+    }
+
+    // ── G26: the real-layer probe (docs/measured-planning.md, Step 3) ─────────────────────────────
+    // The planner's compute probe on this model's own layer: built from the file's tensors, run on
+    // the host and on every device this build has - the loopback RPC device among them, whose buffers
+    // are not host memory - with the results compared to the host's, and the crossing timed. Not an
+    // identity gate on output: it holds that every device that runs the layer agrees with the host,
+    // and that every fact the rules read was filled. Its time is printed, not gated: the samples are
+    // bounded by duration, and what a sanitized build adds around them is the build's, not the probe's.
+    {
+        const std::string rpc = loopback_rpc_device(); // registered once per process; "" without RPC
+        HardwareProfile hw = probe_hardware(model.c_str());
+        const ModelProfile mp = probe_model(model.c_str());
+        probe_device_support(hw, mp);
+        const auto t0 = std::chrono::steady_clock::now();
+        probe_bandwidth(hw, mp);
+        const double t_layer = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        probe_device_costs(hw, mp);
+        const double t_all = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        bool ok = hw.host_expert_gibs > 0.0 && hw.host_dense_gibs > 0.0 && hw.host_wide_matmul_gibs > 0.0;
+        std::printf("       G26 host: experts %.2f GiB/s, dense %.2f GiB/s, %u wide %.2f GiB/s (GEMV %.2f)\n",
+                    hw.host_expert_gibs, hw.host_dense_gibs, hw.wide_batch, hw.host_wide_matmul_gibs,
+                    hw.host_bandwidth_gibs);
+        bool saw_rpc = rpc.empty();
+        for (const ComputeDevice & d : hw.devices) {
+            if (d.is_cpu) continue;
+            std::printf("       G26 %s: experts %.2f, dense %.2f, wide %.2f GiB/s, identity %s/%s, crossing %.1f us\n",
+                        d.name.c_str(), d.expert_gibs, d.dense_gibs, d.wide_matmul_gibs,
+                        d.identity_ok == Tri::Yes  ? "same"
+                        : d.identity_ok == Tri::No ? "WRONG"
+                                                   : "unknown",
+                        d.wide_identity_ok == Tri::Yes  ? "same"
+                        : d.wide_identity_ok == Tri::No ? "WRONG"
+                                                        : "unknown",
+                        1e6 * d.split_seconds);
+            if (d.identity_ok == Tri::No || d.wide_identity_ok == Tri::No) ok = false;
+            if (d.name == rpc) {
+                saw_rpc = true;
+                ok = ok && d.expert_gibs > 0.0 && d.dense_gibs > 0.0 && d.wide_matmul_gibs > 0.0 &&
+                     d.identity_ok == Tri::Yes && d.wide_identity_ok == Tri::Yes && d.split_seconds > 0.0;
+            }
+        }
+        if (!ok || !saw_rpc) {
+            std::printf("[FAIL] G26 the real-layer probe left a fact unfilled or disagreed (%.2f s)\n", t_all);
+            ++fails;
+        } else {
+            std::printf("[PASS] G26 real-layer probe: every device agrees with the host (%.2f s compute, %.2f s "
+                        "with the device costs)\n",
+                        t_layer, t_all);
         }
     }
 

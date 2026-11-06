@@ -7,7 +7,9 @@
 // Checks are explicit (not <cassert>): the Release build defines NDEBUG, which compiles assert out.
 
 #include "bmoe/config.h"
+#include "bmoe/params.h"
 
+#include <cctype>
 #include <cstdio>
 #include <limits>
 #include <string>
@@ -40,9 +42,39 @@ static void expect_ok(const char * name, const RunConfig & c) {
     }
 }
 
+// A rejection is read by whoever set the config: a CLI user who typed flags, or a person in a
+// settings form who has never seen one. So the engine names a setting only as a `{key}` placeholder
+// the front-end renders (name_params), never as a flag or a field. Returns what is wrong, or empty.
+static std::string front_end_neutral(const std::string & msg) {
+    std::string bare; // the message with its placeholders taken out
+    for (size_t i = 0; i < msg.size(); ++i) {
+        if (msg[i] != '{') {
+            bare += msg[i];
+            continue;
+        }
+        const size_t close = msg.find('}', i);
+        if (close == std::string::npos) return "an unclosed brace";
+        const std::string inner = msg.substr(i + 1, close - i - 1);
+        const std::string key = inner.substr(0, inner.find('='));
+        if (!find_param(key)) return "{" + inner + "} names no parameter";
+        bare += ' ';
+        i = close;
+    }
+    if (bare.find("--") != std::string::npos) return "a command-line flag";
+    // A field name: a word joined by an underscore (n_ubatch, top_p, cache_mb).
+    for (size_t i = 0; i + 2 < bare.size(); ++i)
+        if (bare[i + 1] == '_' && std::isalnum((unsigned char) bare[i]) && std::isalnum((unsigned char) bare[i + 2]))
+            return "a field name around '" + bare.substr(i > 8 ? i - 8 : 0, 20) + "'";
+    return "";
+}
+
 static void expect_fail(const char * name, const RunConfig & c) {
     ValidationResult r = validate(c);
-    if (!r.ok) {
+    const std::string wrong = r.ok ? "" : front_end_neutral(r.error);
+    if (!r.ok && !wrong.empty()) {
+        std::printf("[FAIL] %s\n  the message names %s: %s\n", name, wrong.c_str(), r.error.c_str());
+        ++failures;
+    } else if (!r.ok) {
         std::printf("[PASS] %s (rejected: %s)\n", name, r.error.c_str());
     } else {
         std::printf("[FAIL] %s\n  expected rejection, got ok\n", name);
@@ -60,8 +92,8 @@ int main() {
     }
     {
         RunConfig c = ok_base();
-        c.n_predict = 0;
-        expect_fail("n_predict must be positive", c);
+        c.n_predict = -1;
+        expect_fail("n_predict must not be negative", c);
     }
     {
         RunConfig c = ok_base();
@@ -157,6 +189,14 @@ int main() {
         expect_fail("route_ahead excludes the n-gram draft source", c);
         c.spec.source = DraftSource::none;
         expect_ok("route_ahead with speculation off", c);
+    }
+    // A head of its own belongs to the MTP source.
+    {
+        RunConfig c = ok_base();
+        c.spec.mtp_head = "head.gguf";
+        expect_fail("an MTP head without --mtp", c);
+        c.spec.source = DraftSource::mtp;
+        expect_ok("an MTP head with --mtp", c);
     }
 
     // Sampling ranges — enforced only when temp > 0.
@@ -385,7 +425,13 @@ int main() {
         c.moe.row_stream = false;
         c.moe.enabled = false;
         c.spec.source = DraftSource::ngram;
-        expect_fail("prefill device with speculation breaks the width invariant", c);
+        c.spec.draft_max = 3;
+        expect_ok("prefill device with speculation, verify narrower than the device's narrowest piece", c);
+        const int min_tokens = c.prefill.min_tokens;
+        c.prefill.min_tokens = c.spec.draft_max + 1;
+        expect_fail("prefill device with a verify as wide as the device's narrowest piece", c);
+        c.prefill.min_tokens = min_tokens;
+        c.spec.draft_max = SpecConfig{}.draft_max;
         c.spec.source = DraftSource::none;
         c.decide.enabled = true;
         expect_ok("prefill device with decide, prefix cache auto (resolved off)", c);
@@ -406,6 +452,44 @@ int main() {
         c.moe.enabled = true;
         expect_ok("decide probe on a streamed session", c);
         c.decide = DecideConfig{};
+    }
+
+    // The knob trial: candidates that could have been the run's own setting, and overlap only where
+    // it can be switched with the session open.
+    {
+        RunConfig c = ok_moe();
+        c.n_threads = 4;
+        c.trial.threads = {2, 8};
+        c.trial.overlap = true;
+        expect_ok("trial: two thread counts and overlap on a streamed run", c);
+        c.trial.threads = {2, 6, 8};
+        expect_fail("trial: three thread candidates", c);
+        c.trial.threads = {4};
+        expect_fail("trial: the incumbent as a candidate", c);
+        c.trial.threads = {2, 2};
+        expect_fail("trial: a candidate listed twice", c);
+        c.trial.threads = {0};
+        expect_fail("trial: zero threads", c);
+        c.trial.threads = {2};
+        c.trial.window_tokens = 0;
+        expect_fail("trial: an empty window", c);
+        c.trial.window_tokens = 8;
+        c.n_gpu_layers = 12;
+        expect_fail("trial: overlap with layers on a device (the context's offload is fixed at creation)", c);
+        c.n_gpu_layers = 0;
+        c.moe.overlap = true;
+        c.moe.cache_auto = true;
+        c.moe.io_two_wave = true;
+        expect_fail("trial: overlap with two-wave reads, which need it on throughout", c);
+        c.moe.io_two_wave = false;
+        expect_ok("trial: overlap on, measured against off", c);
+        RunConfig d = ok_base();
+        d.trial.overlap = true;
+        expect_fail("trial: overlap without streaming", d);
+        d.trial.overlap = false;
+        d.n_threads = 4;
+        d.trial.threads = {8};
+        expect_ok("trial: the thread count alone needs no streaming", d);
     }
 
     if (failures == 0) {

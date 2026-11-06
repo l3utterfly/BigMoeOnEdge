@@ -2,9 +2,9 @@
 import { api, openEvents } from '../lib/api';
 import { auth } from '../lib/auth';
 import type { SseEvent } from '../lib/sse';
-import { isConfig, isDoneSummary, isDownloadEvent, isInfo, isTokenEvent } from '../lib/guards';
+import { isConfig, isDoneSummary, isDownloadEvent, isInfo, isPlanProgress, isTokenEvent } from '../lib/guards';
 import { ema, mibPerSec, pushSample, tokPerSec, wallShare } from '../lib/metrics';
-import type { Config, DoneSummary, DownloadEvent, Info, ParamSpec, TokenEvent } from '../lib/types';
+import type { Config, DoneSummary, DownloadEvent, Info, ParamSpec, Plan, PlanProgress, TokenEvent } from '../lib/types';
 
 const HISTORY = 120;
 const RECONNECT_MIN_MS = 1000;
@@ -30,8 +30,21 @@ class ServerStore {
   params = $state<ParamSpec[] | null>(null);
   paramsError = $state('');
   connected = $state(false);
+  /** The stream was open once: a later loss is "unreachable", not a first "connecting". */
+  everConnected = $state(false);
   metrics = $state<LiveMetrics>(emptyMetrics());
   lastDone = $state<DoneSummary | null>(null);
+  /** The stage a measurement is in, null when none runs (a `done` stage clears it). */
+  planProgress = $state<PlanProgress | null>(null);
+  /**
+   * The plan the server holds for the chosen model (`GET /api/plan?cached=1`, never a measurement):
+   * read when the server is reached, when a session opens and when a turn ends, so the Plan page
+   * opens on it at once and its measured figures land when the answer does, whichever page is open.
+   */
+  plan = $state<Plan | null>(null);
+  planError = $state('');
+  /** A measurement asked for (`?measure=1`) is in flight: the person's tap, never automatic. */
+  measuring = $state(false);
   downloads = $state<Record<string, DownloadEvent>>({});
   /** Bumped when a download ends, so the Models page knows to refresh its list. */
   downloadsFinished = $state(0);
@@ -41,6 +54,8 @@ class ServerStore {
   ready = $derived(this.info?.state === 'ready' && this.info.model !== null);
 
   private stream: AbortController | null = null;
+  private listeners = new Set<(ev: SseEvent) => void>();
+  private openListeners = new Set<() => void>();
   private retryMs = RECONNECT_MIN_MS;
   private openedBefore = false;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -52,6 +67,18 @@ class ServerStore {
     });
     this.connect();
     this.refreshStatic();
+  }
+
+  /** Every event the stream carries, for the stores that keep their own state (the agent's). */
+  subscribe(fn: (ev: SseEvent) => void): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  /** Runs on every (re)connection: what was missed while cut off arrived as no event. */
+  onOpen(fn: () => void): () => void {
+    this.openListeners.add(fn);
+    return () => this.openListeners.delete(fn);
   }
 
   /** The key the person typed: kept for this browser, and everything is asked again with it. */
@@ -71,6 +98,32 @@ class ServerStore {
   refreshStatic(): void {
     this.loadParams();
     this.loadConfig();
+    this.refreshPlan();
+  }
+
+  /** The plan held, without measuring; skipped while a measurement runs, which answers instead. */
+  async refreshPlan(): Promise<void> {
+    if (this.measuring) return;
+    try {
+      this.plan = await api.plan('cached');
+      this.planError = '';
+    } catch (e) {
+      this.planError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  /** Measure the machine for the chosen model: the probes run, and the plan shown is the new one. */
+  async measurePlan(): Promise<void> {
+    if (this.measuring) return;
+    this.measuring = true;
+    this.planError = '';
+    try {
+      this.plan = await api.plan('measure');
+    } catch (e) {
+      this.planError = e instanceof Error ? e.message : String(e);
+    } finally {
+      this.measuring = false;
+    }
   }
 
   async loadConfig(): Promise<void> {
@@ -106,11 +159,13 @@ class ServerStore {
     openEvents(
       () => {
         this.connected = true;
+        this.everConnected = true;
         this.retryMs = RECONNECT_MIN_MS;
         // A reconnection may follow a server restart: the schema and the config can have changed,
         // and a config change made while this page was cut off arrived as no event.
         if (this.openedBefore) this.refreshStatic();
         this.openedBefore = true;
+        for (const fn of this.openListeners) fn();
       },
       (ev) => this.onEvent(ev),
       ac.signal,
@@ -127,9 +182,10 @@ class ServerStore {
   }
 
   private onEvent(ev: SseEvent): void {
+    for (const fn of this.listeners) fn(ev);
     switch (ev.event) {
       case 'state':
-        this.onJson<Info>(ev, isInfo, (d) => (this.info = d));
+        this.onJson<Info>(ev, isInfo, (d) => this.onInfo(d));
         break;
       case 'config':
         this.onJson<Config>(ev, isConfig, (d) => (this.config = d));
@@ -138,10 +194,17 @@ class ServerStore {
         this.onJson<TokenEvent>(ev, isTokenEvent, (d) => this.onToken(d));
         break;
       case 'done':
-        this.onJson<DoneSummary>(ev, isDoneSummary, (d) => (this.lastDone = d));
+        this.onJson<DoneSummary>(ev, isDoneSummary, (d) => {
+          this.lastDone = d;
+          // A finished turn is a new measurement beside the plan the model runs with.
+          if (this.info?.model) this.refreshPlan();
+        });
         break;
       case 'download':
         this.onJson<DownloadEvent>(ev, isDownloadEvent, (d) => this.onDownload(d));
+        break;
+      case 'plan_progress':
+        this.onJson<PlanProgress>(ev, isPlanProgress, (d) => (this.planProgress = d.step === 'done' ? null : d));
         break;
       default:
         break; // a ping, or an event this UI does not know
@@ -167,6 +230,14 @@ class ServerStore {
     if (guard(data)) apply(data); // and so is one that is not the shape the UI reads
   }
 
+  private onInfo(d: Info): void {
+    const before = this.info;
+    this.info = d;
+    // A new session runs a plan of its own (an auto load's, or the settings as they were).
+    const opened = d.state === 'ready' && d.model !== null && (before?.model?.path !== d.model.path || before?.model?.load_s !== d.model.load_s);
+    if (opened) this.refreshPlan();
+  }
+
   private onToken(t: TokenEvent): void {
     const m = this.metrics;
     const tok = tokPerSec(t.wall_ms);
@@ -179,6 +250,12 @@ class ServerStore {
       tokHistory: pushSample(m.tokHistory, tok, HISTORY),
       readHistory: pushSample(m.readHistory, read, HISTORY),
     };
+  }
+
+  /** Drop a download's last event: its partial files were deleted, so nothing is left to resume. */
+  forgetDownload(id: string): void {
+    const { [id]: _gone, ...rest } = this.downloads;
+    this.downloads = rest;
   }
 
   private onDownload(d: DownloadEvent): void {

@@ -1,4 +1,5 @@
 #include "engine_host.h"
+#include "bmoe/probe.h"
 
 #include "decide_protocol.h"
 
@@ -6,8 +7,10 @@
 #include "bmoe/params.h"
 #include "bmoe/version.h"
 
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <string>
 #include <utility>
 
 namespace bmoe::server {
@@ -24,6 +27,9 @@ struct Admission {
     int status = 0;
     std::string error;
 };
+
+// The parameter a short context is raised with: the one row of the table that sets n_ctx.
+constexpr const char * k_ctx_param = "ctx-size";
 
 const char * level_name(LogLevel l) {
     return l == LogLevel::Error ? "error" : l == LogLevel::Warn ? "warn" : "info";
@@ -44,12 +50,70 @@ public:
     int n_expert_used() const override { return s_->n_expert_used(); }
     ThinkControl think_control() const override { return s_->think_control(); }
     double load_seconds() const override { return s_->load_seconds(); }
+    bool vision() const override { return s_->vision(); }
+    RoutingTrace routing_record() const override { return s_->routing_record(); }
+    MeasuredKnobs measured_knobs() const override { return s_->measured_knobs(); }
 
 private:
     std::unique_ptr<Session> s_;
 };
 
 } // namespace
+
+json context_advice(int n_ctx, bool serves_network, bool refused) {
+    const bool short_of = n_ctx < RunConfig::ctx_for_clients;
+    return json{{"recommended", RunConfig::ctx_for_clients},
+                {"short", short_of},
+                {"param", k_ctx_param},
+                {"refused", refused},
+                {"warn", short_of && (serves_network || refused)}};
+}
+
+// A client that hides the server's message (an agent showing "unknown error") leaves the person at
+// the server with nothing to go on: the server's own log says what was refused and what fixes it.
+static void log_context_full(int n_ctx) {
+    log_printf(LogLevel::Warn,
+               "a request did not fit the context of %d tokens and was refused with context_full: load the model "
+               "with a larger context (%s) to serve it",
+               n_ctx, flag_spelling(k_ctx_param).c_str());
+}
+
+std::string engine_message(const std::string & message) {
+    return name_params(message, ParamNames::Labels);
+}
+
+// The other end of a full context: a request that fits is served, but its answer gets only the room
+// the prompt left. A client that summarizes its history when the context fills (an agent compacting)
+// then gets a cut or empty summary and may only say it failed, so the cut is said here.
+// One line per answer in the log, whatever client asked for it: a server left running for days has
+// no UI watching its event stream, and the question "how much did it read, how fast did it go" is
+// otherwise unanswerable afterwards. The figures are the summary's (docs/telemetry.md names them).
+static void log_answer(const RunSummary & sum, bool cancelled) {
+    log_printf(LogLevel::Info,
+               "answer%s: %d tokens at %.1f tok/s, prompt %d tokens prefilled in %.1f s (%.0f tok/s, %.0f MiB "
+               "read), context %d tokens, experts %.0f MiB read%s",
+               cancelled ? " (cancelled)" : "", sum.n_generated, sum.tokens_per_second, sum.n_prompt,
+               sum.prefill_seconds, sum.prefill_seconds > 0 ? sum.n_prompt / sum.prefill_seconds : 0.0,
+               sum.prefill_read_mib, sum.n_past, sum.moe_read_mib,
+               sum.cache_hit_pct >= 0 ? (", cache hit " + std::to_string((int) (sum.cache_hit_pct + 0.5)) + "%").c_str()
+                                      : "");
+}
+
+static void log_context_cut(int n_ctx, int asked, int given) {
+    if (asked <= 0) {
+        log_printf(LogLevel::Warn,
+                   "an answer stopped at %d tokens: the prompt left no more room in the context of %d tokens. A "
+                   "client that summarizes a long conversation gets a cut summary; load the model with a larger "
+                   "context (%s)",
+                   given, n_ctx, flag_spelling(k_ctx_param).c_str());
+        return;
+    }
+    log_printf(LogLevel::Warn,
+               "an answer stopped at %d tokens of the %d asked: the prompt left no more room in the context "
+               "of %d tokens. A client that summarizes a long conversation gets a cut summary; load the model "
+               "with a larger context (%s)",
+               given, asked, n_ctx, flag_spelling(k_ctx_param).c_str());
+}
 
 std::unique_ptr<HostedSession> open_real_session(const SessionConfig & cfg, std::string & error) {
     std::unique_ptr<Session> s = Session::open(cfg, error);
@@ -81,6 +145,10 @@ void EngineHost::set_host_info(std::function<json()> provider) {
     host_info_ = std::move(provider);
 }
 
+void EngineHost::set_cpu_temperature(std::function<double()> provider) {
+    cpu_temp_ = std::move(provider);
+}
+
 void EngineHost::begin_planning() {
     planning_ = true;
     publish_state();
@@ -93,7 +161,7 @@ void EngineHost::end_planning() {
 
 std::string EngineHost::load(const RunConfig & effective, const RunConfig & requested) {
     const ValidationResult v = validate(effective);
-    if (!v) return v.error;
+    if (!v) return engine_message(v.error);
     std::lock_guard<std::mutex> life(life_m_);
     {
         std::lock_guard<std::mutex> lk(m_);
@@ -102,6 +170,7 @@ std::string EngineHost::load(const RunConfig & effective, const RunConfig & requ
         error_.clear();
         model_ = nullptr;
         requested_ = requested;
+        last_turn_ = nullptr;
     }
     if (loader_.joinable()) loader_.join(); // the previous load finished: its state was not Loading
     publish_state();
@@ -114,6 +183,9 @@ std::string EngineHost::load(const RunConfig & effective, const RunConfig & requ
         {
             std::lock_guard<std::mutex> lk(m_);
             session_.reset();
+            // Again here, under gen_m_: a turn still running when load() cleared it records its
+            // figure on its way out, and that figure is the old model's.
+            last_turn_ = nullptr;
         }
         std::string error;
         std::shared_ptr<HostedSession> s = open_(session_config_from(effective), error);
@@ -121,9 +193,11 @@ std::string EngineHost::load(const RunConfig & effective, const RunConfig & requ
             std::lock_guard<std::mutex> lk(m_);
             if (!s) {
                 state_ = State::Error;
-                error_ = error.empty() ? "the model failed to load" : error;
+                error_ = error.empty() ? "the model failed to load" : engine_message(error);
             } else {
                 session_ = s;
+                routing_kept_ = 0; // a new session records afresh
+                knobs_kept_ = 0;   // and measures afresh
                 state_ = State::Ready;
                 model_ = json{{"path", effective.model_path},
                               {"name", std::filesystem::u8path(effective.model_path).filename().u8string()},
@@ -133,16 +207,33 @@ std::string EngineHost::load(const RunConfig & effective, const RunConfig & requ
                               {"think_ctl", think_control_name(s->think_control())},
                               {"load_s", s->load_seconds()},
                               {"streaming", effective.moe.enabled},
+                              // Whether a request may carry images, and the projector that reads
+                              // them (its file name; "" without one).
+                              {"vision", s->vision()},
+                              {"projector", effective.mmproj.empty()
+                                                ? ""
+                                                : std::filesystem::u8path(effective.mmproj).filename().u8string()},
                               // What a CPU figure is read against: the compute threads, and every
                               // thread busy in a decode, the read lanes included when they run
                               // beside compute. A UI reads these instead of the parameters.
                               {"compute_threads", effective.n_threads},
                               {"busy_threads",
                                effective.n_threads +
-                                   (effective.moe.enabled && effective.moe.overlap ? effective.moe.io_threads : 0)}};
+                                   (effective.moe.enabled && effective.moe.overlap ? effective.moe.io_threads : 0)},
+                              {"ctx_advice", context_advice(s->n_ctx(), serves_network_.load())}};
             }
         }
         publish_state();
+        // Said at load, where a person starting the server reads it, and not first by a client that
+        // shows the refusal as an unknown error after its first request.
+        if (s && s->n_ctx() < RunConfig::ctx_for_clients) {
+            const std::string raise = flag_spelling(k_ctx_param, std::to_string(RunConfig::ctx_for_clients));
+            log_printf(LogLevel::Warn,
+                       "the context is %d tokens, under the %d a coding agent's first request needs (its system "
+                       "prompt and tools alone are ~10k): such a client is refused with context_full. Load with "
+                       "%s to serve one; a larger context takes RAM from the expert cache",
+                       s->n_ctx(), RunConfig::ctx_for_clients, raise.c_str());
+        }
     });
     return "";
 }
@@ -158,8 +249,14 @@ void EngineHost::unload() {
         state_ = State::Empty;
         error_.clear();
         model_ = nullptr;
+        last_turn_ = nullptr;
     }
     publish_state();
+}
+
+json EngineHost::last_turn() const {
+    std::lock_guard<std::mutex> lk(m_);
+    return last_turn_;
 }
 
 void EngineHost::cancel() {
@@ -186,20 +283,27 @@ std::string EngineHost::model_name() const {
     return model_.is_object() ? model_.value("name", "") : "";
 }
 
-bool EngineHost::reload_required(const RunConfig & current) const {
+bool EngineHost::vision() const {
     std::lock_guard<std::mutex> lk(m_);
-    if (state_ != State::Ready) return false;
+    return model_.is_object() && model_.value("vision", false);
+}
+
+std::string EngineHost::model_path() const {
+    std::lock_guard<std::mutex> lk(m_);
+    return model_.is_object() ? model_.value("path", "") : "";
+}
+
+std::vector<std::string> EngineHost::reload_keys(const RunConfig & current) const {
+    std::lock_guard<std::mutex> lk(m_);
+    std::vector<std::string> keys;
+    if (state_ != State::Ready) return keys;
     for (const ParamDesc & d : params())
-        if (d.scope == ParamScope::Session && d.get(requested_) != d.get(current)) return true;
-    return false;
+        if (d.scope == ParamScope::Session && d.get(requested_) != d.get(current)) keys.push_back(d.key);
+    return keys;
 }
 
 json EngineHost::info() const {
-#if defined(BMOE_HAVE_EXPERT_READY_HOOK)
-    const bool overlap = true;
-#else
-    const bool overlap = false;
-#endif
+    const bool overlap = expert_ready_hook_available();
     std::lock_guard<std::mutex> lk(m_);
     return json{{"version", version()},
                 {"overlap_available", overlap},
@@ -209,6 +313,12 @@ json EngineHost::info() const {
                 {"error", error_},
                 {"model", model_},
                 {"generating", generating_.load()}};
+}
+
+void EngineHost::note_context_full(int n_ctx) {
+    log_context_full(n_ctx);
+    std::lock_guard<std::mutex> lk(m_);
+    if (model_.is_object()) model_["ctx_advice"] = context_advice(n_ctx, serves_network_.load(), true);
 }
 
 void EngineHost::publish_state() const {
@@ -229,7 +339,7 @@ std::unique_lock<std::mutex> EngineHost::take_turn() {
 }
 
 ChatOutcome EngineHost::chat(const ChatRequest & req,
-                             const std::function<void(const TokenMetrics &)> & on_token,
+                             const std::function<bool(const TokenMetrics &)> & on_token,
                              const std::function<bool()> & still_wanted) {
     ChatOutcome out;
     switch (turns_.enter(still_wanted)) {
@@ -273,28 +383,51 @@ ChatOutcome EngineHost::chat(const ChatRequest & req,
     gr.clear_kv = false;
     gr.n_predict = req.n_predict;
     gr.think = req.think;
+    gr.json_schema = req.json_schema;
     gr.render_text = true;
 
     generating_ = true;
     publish_state();
+    // The session is this turn's for as long as generate() runs, so a cancel from inside the
+    // callback stops this turn and cannot reach another client's.
+    bool client_gone = false;
+    // A sensor read is a few files, but a token can take milliseconds: read at most once a second
+    // and a half, the last reading riding on the tokens between.
+    double temp_c = -1.0;
+    std::chrono::steady_clock::time_point temp_at{};
     RunResult r = s->generate(gr, [&](const TokenMetrics & tm) {
-        bus_.publish("token", token_json(tm));
-        if (on_token) on_token(tm);
+        json ev = token_json(tm);
+        if (cpu_temp_) {
+            const auto now = std::chrono::steady_clock::now();
+            if (temp_at == std::chrono::steady_clock::time_point{} || now - temp_at > std::chrono::milliseconds(1500)) {
+                temp_at = now;
+                temp_c = cpu_temp_();
+            }
+            if (temp_c > 0) ev["cpu_temp_c"] = temp_c;
+        }
+        bus_.publish("token", ev);
+        if (on_token && !client_gone && !on_token(tm)) {
+            client_gone = true;
+            s->cancel();
+        }
     });
     generating_ = false;
 
     if (!r) {
-        out.error = r.error;
+        out.error = engine_message(r.error);
         out.code = run_error_name(r.error_kind);
+        if (r.error_kind == RunError::ContextFull) note_context_full(s->n_ctx());
         if (run_error_recoverable(r.error_kind)) {
-            out.status = 400;
+            // Bad generated output is a server error, but its rolled-back turn leaves the
+            // loaded model usable. A client should not have to reload it to retry a request.
+            out.status = r.error_kind == RunError::InvalidOutput ? 500 : 400;
         } else {
             // A failed decode leaves the context in an unknown state: the session is not reused.
             out.status = 500;
             std::lock_guard<std::mutex> lk(m_);
             session_.reset();
             state_ = State::Error;
-            error_ = "the session failed and was closed: " + r.error;
+            error_ = "the session failed and was closed: " + engine_message(r.error);
             model_ = nullptr;
         }
         publish_state();
@@ -303,9 +436,45 @@ ChatOutcome EngineHost::chat(const ChatRequest & req,
 
     out.n_predict = gr.n_predict;
     out.result = std::move(r);
+    const RunSummary & sum = out.result.summary;
+    const bool context_set_budget = gr.n_predict <= 0 || sum.n_predict < gr.n_predict;
+    if (!out.result.cancelled && sum.n_predict > 0 && context_set_budget && sum.n_generated >= sum.n_predict)
+        log_context_cut(s->n_ctx(), gr.n_predict, sum.n_predict);
+    // A cancelled turn is no measurement: it stopped at a moment the person chose, often mid-load.
+    if (!out.result.cancelled && sum.n_generated > 0 && sum.s_per_token > 0) {
+        std::lock_guard<std::mutex> lk(m_);
+        // The decode's own hit rate, the figure the plan credits; the session-cumulative one also
+        // counts every prompt and earlier turn.
+        const double hit = sum.cache_hit_decode_pct >= 0.0 ? sum.cache_hit_decode_pct : sum.cache_hit_pct;
+        last_turn_ = json{{"s_per_token", sum.s_per_token}, {"cache_hit_pct", hit}, {"tokens", sum.n_generated}};
+    }
+    log_answer(sum, out.result.cancelled);
     bus_.publish("done", summary_json(out.result.summary, out.result.cancelled));
     publish_state();
+    keep_routing(*s);
+    keep_knobs(*s);
     return out;
+}
+
+// The record grows over a session's first turns and then stops: handed on each time it grew, still
+// inside the turn's lock, so the session is not read while another turn runs on it.
+// The knob trial's verdicts come in one knob at a time during the first answers: each is handed on
+// as it arrives, so a session ended any way at all has kept what it measured.
+void EngineHost::keep_knobs(const HostedSession & s) {
+    if (!knobs_sink_) return;
+    const MeasuredKnobs mk = s.measured_knobs();
+    const int verdicts = (mk.threads > 0) + (mk.overlap >= 0);
+    if (verdicts <= knobs_kept_) return;
+    knobs_kept_ = verdicts;
+    knobs_sink_(model_path(), mk);
+}
+
+void EngineHost::keep_routing(const HostedSession & s) {
+    if (!routing_sink_) return;
+    RoutingTrace rec = s.routing_record();
+    if (rec.decode_tokens <= routing_kept_) return;
+    routing_kept_ = rec.decode_tokens;
+    routing_sink_(model_path(), rec);
 }
 
 DecideOutcome EngineHost::decide(const DecideRequest & req, const std::function<bool()> & still_wanted) {
@@ -348,8 +517,9 @@ DecideOutcome EngineHost::decide(const DecideRequest & req, const std::function<
     generating_ = false;
 
     if (!r.ok && !r.cancelled) {
-        out.error = r.error;
+        out.error = engine_message(r.error);
         out.code = run_error_name(r.error_kind);
+        if (r.error_kind == RunError::ContextFull) note_context_full(s->n_ctx());
         if (!r.fatal) {
             out.status = 400;
         } else {
@@ -357,7 +527,7 @@ DecideOutcome EngineHost::decide(const DecideRequest & req, const std::function<
             std::lock_guard<std::mutex> lk(m_);
             session_.reset();
             state_ = State::Error;
-            error_ = "the session failed and was closed: " + r.error;
+            error_ = "the session failed and was closed: " + engine_message(r.error);
             model_ = nullptr;
         }
         publish_state();

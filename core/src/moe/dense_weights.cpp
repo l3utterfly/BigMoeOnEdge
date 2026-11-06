@@ -1,6 +1,7 @@
 #include "dense_weights.h"
 #include "bmoe/log.h"
 
+#include "ggml-backend.h"
 #include "ggml.h"
 #include "row_stream.h"
 
@@ -39,11 +40,7 @@ bool DenseWeights::init(DenseWeightsMode mode,
     paths_ = paths;
     ranges_ = std::move(ranges);
     tensors_ = std::move(tensors);
-    basenames_.clear();
-    for (const std::string & p : paths_) {
-        const size_t slash = p.find_last_of("/\\");
-        basenames_.push_back(slash == std::string::npos ? p : p.substr(slash + 1));
-    }
+    index_mapping();
 
     hold_back_oversized();
     take_row_gathered();
@@ -54,7 +51,7 @@ bool DenseWeights::init(DenseWeightsMode mode,
             return true;
         }
         if (mode_ == DenseWeightsMode::Pinned && pio::pinned_max_bytes() == 0) {
-            log_printf(LogLevel::Error, "--dense-weights ahwb needs reclaim-exempt memory, which this "
+            log_printf(LogLevel::Error, "--dense-weights pinned needs reclaim-exempt memory, which this "
                                         "platform does not provide");
             return false;
         }
@@ -77,20 +74,6 @@ bool DenseWeights::init(DenseWeightsMode mode,
     }
     advise_random_mapped();
     return true;
-}
-
-static const char * mode_flag(DenseWeightsMode m) {
-    switch (m) {
-    case DenseWeightsMode::Mmap:
-        return "mmap";
-    case DenseWeightsMode::Warmed:
-        return "warm";
-    case DenseWeightsMode::Anonymous:
-        return "anon";
-    case DenseWeightsMode::Pinned:
-        return "ahwb";
-    }
-    return "?";
 }
 
 // Remove [a, b) from a sorted list of disjoint [first, second) ranges, splitting the one it falls in.
@@ -126,28 +109,42 @@ static void subtract_range(std::vector<std::pair<uint64_t, uint64_t>> & ranges, 
 // than reading it once sequentially at load (measured: token_embd left mmap'd lost 16 % decode).
 void DenseWeights::hold_back_oversized() {
     mapped_.clear();
-    const uint64_t avail = pio::mem_available_bytes();
-    if (!avail) return; // unmeasured on this platform: hold nothing back, as before
+    const uint64_t avail = pio::mem_available_bytes(); // 0 where unmeasured: nothing is oversized
+    const auto named = [this](const DenseTensorRef & d) {
+        if (!d.tensor) return false;
+        for (const std::string & n : mapped_names_)
+            if (n == d.tensor->name) return true;
+        return false;
+    };
     std::vector<DenseTensorRef> keep;
     keep.reserve(tensors_.size());
-    uint64_t held = 0;
+    uint64_t oversized = 0, by_plan = 0;
+    size_t n_oversized = 0, n_by_plan = 0;
     for (const DenseTensorRef & d : tensors_) {
-        if (d.size <= avail) {
+        const bool too_large = avail && d.size > avail;
+        const bool by_name = named(d);
+        if (!too_large && !by_name) {
             keep.push_back(d);
             continue;
         }
         mapped_.push_back(d);
-        held += d.size;
+        (too_large ? oversized : by_plan) += d.size;
+        (too_large ? n_oversized : n_by_plan) += 1;
         if (d.file_idx >= 0 && (size_t) d.file_idx < ranges_.size())
             subtract_range(ranges_[(size_t) d.file_idx], d.file_off, d.file_off + d.size);
     }
     tensors_ = std::move(keep);
-    if (held)
+    if (oversized)
         log_printf(LogLevel::Warn,
                    "dense-weights=%s — %llu MiB in %zu tensor(s) exceeds the %llu MiB available: left "
                    "mmap'd with random-access advice, outside the warm sweep and the residency sensor",
-                   mode_flag(mode_), (unsigned long long) (held >> 20), mapped_.size(),
+                   dense_weights_mode_name(mode_), (unsigned long long) (oversized >> 20), n_oversized,
                    (unsigned long long) (avail >> 20));
+    if (by_plan)
+        log_printf(LogLevel::Info,
+                   "dense-weights=%s — %llu MiB in %zu table(s) left mmap'd as the plan priced them: the graph "
+                   "gathers rows from them, outside the warm sweep and the residency sensor",
+                   dense_weights_mode_name(mode_), (unsigned long long) (by_plan >> 20), n_by_plan);
 }
 
 void DenseWeights::set_row_gathered(std::vector<DenseTensorRef> tables, uint64_t budget_bytes) {
@@ -222,12 +219,11 @@ void DenseWeights::take_row_gathered() {
     }
     tensors_ = std::move(keep);
     log_printf(LogLevel::Info, "dense-weights=%s — %llu MiB of row-gathered table(s) left out of the resident set",
-               mode_flag(mode_), (unsigned long long) (freed >> 20));
+               dense_weights_mode_name(mode_), (unsigned long long) (freed >> 20));
 }
 
 void DenseWeights::advise_random_mapped() {
     if (mapped_.empty()) return;
-    resolve_vmas();
     const size_t page = pio::vm_page();
     for (const DenseTensorRef & d : mapped_) {
         const char * a = addr_of(d.file_idx, d.file_off);
@@ -272,11 +268,12 @@ bool DenseWeights::read_anonymous() {
         }
         void * buf = nullptr;
         pio::PinnedAlloc pa;
+        const size_t held = (size_t) d.size + pio::tensor_tail_slack(); // readable past the last block
         // A tensor larger than one buffer may be was never going to fit and says nothing about
         // the store's total: it takes an ordinary buffer alone, and the tensors after it still pin.
-        const bool too_big = pinned && d.size > pio::pinned_max_bytes();
+        const bool too_big = pinned && held > pio::pinned_max_bytes();
         bool pin_this = pinned && !too_big;
-        if (pin_this && !pio::pinned_alloc((size_t) d.size, &pa)) {
+        if (pin_this && !pio::pinned_alloc(held, &pa)) {
             log_printf(LogLevel::Warn,
                        "pinned dense buffer %llu MiB refused after %llu MiB (per-buffer ceiling %llu MiB); "
                        "the rest of the dense set is ordinary memory",
@@ -292,7 +289,7 @@ bool DenseWeights::read_anonymous() {
             if (mode_ == DenseWeightsMode::Pinned) pin_refused_bytes_ += d.size;
             // Aligned for the reader that fills it, and to a page for the sensor and the drop that
             // later clip this buffer to pages.
-            buf = pio::alloc_aligned(readers_[(size_t) d.file_idx]->buffer_align(), (size_t) d.size);
+            buf = pio::alloc_aligned(readers_[(size_t) d.file_idx]->buffer_align(), held);
             if (!buf) {
                 log_printf(LogLevel::Error, "dense buffer alloc %llu failed", (unsigned long long) d.size);
                 return false;
@@ -312,42 +309,52 @@ bool DenseWeights::read_anonymous() {
         total += d.size;
     }
     if (pin_refused_bytes_)
-        log_printf(LogLevel::Info, "dense-weights=ahwb — %llu MiB in %zu buffers, %llu MiB of it pinned",
+        log_printf(LogLevel::Info, "dense-weights=pinned — %llu MiB in %zu buffers, %llu MiB of it pinned",
                    (unsigned long long) (total >> 20), buf_sz_.size(),
                    (unsigned long long) ((total - pin_refused_bytes_) >> 20));
     else
-        log_printf(LogLevel::Info, "dense-weights=%s — %llu MiB in %zu %s buffers", pinned ? "ahwb" : "anon",
+        log_printf(LogLevel::Info, "dense-weights=%s — %llu MiB in %zu %s buffers",
+                   dense_weights_mode_name(pinned ? DenseWeightsMode::Pinned : DenseWeightsMode::Anonymous),
                    (unsigned long long) (total >> 20), buf_sz_.size(), pinned ? "pinned" : "anon");
     return true;
 }
 
-// Per-shard VMA resolution for every consumer that must turn (file_idx, offset) into an address.
-// llama.cpp maps each shard of a split model separately, so the lookup is per shard basename.
-void DenseWeights::resolve_vmas() {
-    if (vmas_tried_) return;
-    vmas_tried_ = true;
-    vmas_.resize(basenames_.size());
-    for (size_t s = 0; s < basenames_.size(); ++s)
-        pio::file_mapped_regions(basenames_[s].c_str(), vmas_[s]);
+// Every consumer that must turn (file_idx, offset) into an address asks here. It used to ask the
+// process's own region list (/proc/self/maps, or a walk of the address space), which an iOS app is
+// not given, so the sensor read -1 there and a dense set being refaulted every token went unseen.
+// The tensors already know: before anything is rebound, a weight's data is where its bytes are
+// mapped. A tensor in a buffer the host cannot address (a device's) has no such address.
+void DenseWeights::index_mapping() {
+    spans_.assign(paths_.size(), {});
+    for (const DenseTensorRef & d : tensors_) {
+        const ggml_tensor * t = d.tensor;
+        if (!t || !t->data || !t->buffer || !ggml_backend_buffer_is_host(t->buffer) || d.size == 0) continue;
+        if (d.file_idx < 0 || (size_t) d.file_idx >= spans_.size()) continue;
+        spans_[(size_t) d.file_idx].push_back({d.file_off, d.size, (const char *) t->data});
+    }
+    for (auto & shard : spans_)
+        std::sort(shard.begin(), shard.end(),
+                  [](const MappedSpan & a, const MappedSpan & b) { return a.file_off < b.file_off; });
 }
 
 const char * DenseWeights::addr_of(int file_idx, uint64_t off) const {
-    if (file_idx < 0 || file_idx >= (int) vmas_.size()) return nullptr;
-    for (const auto & v : vmas_[file_idx]) {
-        const uint64_t span = (uint64_t) (v.end - v.start);
-        if (off >= v.file_offset && off < v.file_offset + span) return (const char *) v.start + (off - v.file_offset);
-    }
-    return nullptr;
+    if (file_idx < 0 || (size_t) file_idx >= spans_.size()) return nullptr;
+    const std::vector<MappedSpan> & shard = spans_[(size_t) file_idx];
+    // The last span starting at or before `off`; the bytes between tensors map to nothing here.
+    auto it = std::upper_bound(shard.begin(), shard.end(), off,
+                               [](uint64_t o, const MappedSpan & sp) { return o < sp.file_off; });
+    if (it == shard.begin()) return nullptr;
+    --it;
+    return off < it->file_off + it->size ? it->addr + (off - it->file_off) : nullptr;
 }
 
 // Hand the mmap copies back. The capture warm-up decode faulted these dense pages in mmap-resident,
 // and read_anonymous has just copied them into anon buffers and rebound every tensor — so the file-
 // backed pages are referenced by nobody. Left alone they sit resident until reclaim, doubling the
 // dense footprint at the worst moment (right before prefill). Drop them with MADV_DONTNEED: a clean
-// read-only mapping, so nothing is lost and nothing will refault the range. Best-effort — needs
-// /proc/self/maps to turn a file offset into an address; where that is unreadable the pages stay.
+// read-only mapping, so nothing is lost and nothing will refault the range. Best-effort: a tensor
+// whose mapped address was not known (index_mapping) keeps its pages until reclaim.
 void DenseWeights::drop_mmap_copies(size_t page) {
-    resolve_vmas();
     uint64_t dropped = 0;
     for (const DenseTensorRef & d : tensors_) {
         if (!d.tensor || d.size == 0) continue;
@@ -364,7 +371,7 @@ void DenseWeights::drop_mmap_copies(size_t page) {
     }
     if (dropped)
         log_printf(LogLevel::Info, "dense-weights=%s — dropped %llu MiB of now-unused mmap pages",
-                   mode_ == DenseWeightsMode::Pinned ? "ahwb" : "anon", (unsigned long long) (dropped >> 20));
+                   dense_weights_mode_name(mode_), (unsigned long long) (dropped >> 20));
 }
 
 // ── Warmed: one sequential buffered sweep over the dense ranges to populate the page cache ──
@@ -439,12 +446,11 @@ void DenseWeights::sample_anon(size_t page) {
 }
 
 // Mmap/Warmed: the weights are llama.cpp's mmaps of the gguf shards; a dense (shard, offset) becomes
-// an address through the VMA that backs it (/proc/self/maps), which an app may read, being its own.
+// an address through the tensor that holds it (index_mapping), on every platform alike.
 // Probe sample_pages points spread evenly across the dense bytes of ALL shards, one page each, so the
 // fraction keeps meaning "of the whole dense set" whatever the shard layout.
 void DenseWeights::sample_mmap(size_t page) {
     if (ranges_.empty()) return;
-    resolve_vmas();
 
     uint64_t total = 0;
     for (const auto & shard : ranges_)

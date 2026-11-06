@@ -24,9 +24,15 @@ The order is the order of dependence, and each step ships on its own.
 
 **Release what is on `main`.** Shipped: the planner, the parameter table, the macOS port, the
 desktop server and the iOS harness in 0.29.0; the server as the framework, the Android app on it
-and one visual language in 0.30.0, after a run of the app on a phone and of the desktop server on
-Windows. Owed from that run: the NPU prefill on the release APK, the one build that carries the
-Hexagon backend.
+and one visual language in 0.30.0; the compute backends as modules on every OS, any model from
+its Hugging Face repository with the header read before the download, the expert layout read
+from the file instead of a table, and llama.cpp at its 2026-10 master in 0.31.0, after a run of
+the app on a phone (CPU build) and of the desktop server on Windows; the Plan screen led by its
+outcome in the web UI and the Android app, settings that say what a value means, a download that
+resumes the same way on the phone and the desktop, files judged by their header and the dense set
+held in memory on every platform in 0.32.0. Owed: the NPU prefill on the release APK, the one
+build that carries the Hexagon backend, where a load with the NPU armed last
+ended in the allocator ([#264](https://github.com/Helldez/BigMoeOnEdge/issues/264)).
 
 **One application framework.** The server is it ([application-framework.md](application-framework.md)).
 Its policy - the engine host with its one session and its turn line, the model library, the
@@ -48,13 +54,24 @@ switch to serve the network with a key under the same security statement the des
 Owed: a run on a phone before it is released, and the decide endpoint (#245) that brings Choose
 from options back to every UI.
 
-**Desktop and Windows at parity.** An installer per OS, signed, that updates itself, in place of an
-archive. In the engine, what Windows lacks: the device probes in a process of their own, the cache
-lock, the byte-identity gates in its CI job, and one documented planner run.
+**Desktop and Windows at parity.** A package per OS now ships beside the archives: `BigMoeOnEdge.app`
+in a `.dmg`, a per-user Windows installer and an AppImage (#385). Owed: the `.dmg` notarised and the
+installer signed, and an app that updates itself. In the engine, what Windows lacks: the device
+probes in a process of their own, the cache lock, the byte-identity gates in its CI job, and one
+documented planner run.
 
-**iOS, with the community.** The harness proves the engine builds and runs there; the app on the
-framework needs a device, an Apple team and the memory entitlements, none of which this project
-has. An issue states what exists, what is needed and what a contributor needs to bring.
+**The box that stays on.** The first always-on use is in the field: a mini-PC serving a 400B MoE
+to a coding agent for hours on one prompt, built from source and started by hand in a terminal
+(#462). `bmoe-server service install` now registers the server with the person's init system on
+every desktop platform, and `--autoload` brings the model back after a restart and on the first
+request. Owed, in [#472](https://github.com/Helldez/BigMoeOnEdge/issues/472): an idle policy,
+management from the command line, discovery and the apps' remote mode, and updates for an
+installed service.
+
+**iOS, with the community.** The app is on the framework: `bmoe_server` runs on a thread inside it
+and the five SwiftUI screens speak to it on loopback, as the other UIs do (`examples/ios`); it
+builds and runs in the simulator. What it owes is a device: a run on an iPhone or iPad, signed by
+an Apple team granted the memory entitlements, none of which this project has (#235).
 
 **One experience, three native UIs.** One written specification for the five screens - chat,
 models, plan, settings, metrics - that each UI follows in its own toolkit: [screens.md](screens.md).
@@ -75,9 +92,11 @@ most phones and PCs is reached through neither of the two GPU ones measured (Met
 Vulkan reaches any GPU with a driver - discrete and integrated on Windows and Linux, and Android -
 and OpenCL is llama.cpp's Adreno path. Both name the expert op, and both implement wrapping host
 memory without advertising it, which is the capability streamed experts computed on a device would
-need. The work, in order: carry each backend in a build (a desktop archive with Vulkan, an APK
-with OpenCL beside Hexagon), so the planner sees the device with no code here; one measured run of
-the prefill device on each, against the CPU and, on the phone, against the NPU; then the
+need. The work, in order: carry each backend in every build, so the planner sees the device with
+no code here - done, as modules beside the engine on every OS ([backends.md](backends.md)): the
+APK carries Vulkan and OpenCL beside Hexagon, the Linux and Windows archives Vulkan; one measured
+run of the prefill device on each, against the CPU and, on the phone, against the NPU - done on
+one phone ([npu-prefill.md](npu-prefill.md)), owed on a desktop GPU; then the
 `buffer_from_host_ptr` route for the streamed experts where the measurement says the device wins.
 The OpenCL entry in [backends.md](backends.md) carries the one negative so far: the dense set on a
 phone's integrated GPU lost 27%. That measured the dense weights, not the prefill.
@@ -87,6 +106,9 @@ for, and today it takes launch options and hand-typed values. One Connect view i
 the server: share on the network with a key, the base URL, model id, context and maximum output a
 client must be told, a preset that sizes the context for an agent, and a filled-in snippet per
 client. Researched and specified in [#257](https://github.com/Helldez/BigMoeOnEdge/issues/257).
+The server half is built: `GET /api/connect` lists the clients with their settings filled in for
+this server, and writes a client's settings file with a backup ([agent.md](agent.md)); the views
+that show it in each UI are owed.
 
 **The planner, drawn.** One diagram of the whole solution, as logic rather than code: the facts
 the probes measure, the rules that read them, the ledger that keeps memory honest, and the plan
@@ -208,7 +230,7 @@ through `AHardwareBuffer`** is exempt from reclaim by construction and needs no 
 bandwidth gate passes cleanly (1.00× against anonymous memory; usable in 2047 MiB units, an
 `AHardwareBuffer_lock` boundary at 2^31 bytes —
 [bench-data/2026-07-21-pinned-memory/](bench-data/2026-07-21-pinned-memory/findings.md)). What is
-`--dense-weights ahwb` implements it, and the in-app A/B came back **positive: +17.9% on a long
+`--dense-weights pinned` implements it, and the in-app A/B came back **positive: +17.9% on a long
 generation, confidence intervals disjoint**, with `dense_resident_frac` pinned at exactly 1.000
 ([bench-data/2026-07-21-pinned-dense-ab/](bench-data/2026-07-21-pinned-dense-ab/findings.md)).
 
@@ -220,9 +242,9 @@ So **`compute_ms` has been absorbing swap-in all along**, and any earlier "this 
 compute-bound" conclusion deserves re-examination. Making that cost visible (minor faults, swap-in
 time) is worth more than the next few percent of throughput.
 
-Still open: the reversed-order pair (`ahwb` ran first in the decisive pair), and anything beyond one
+Still open: the reversed-order pair (`pinned` ran first in the decisive pair), and anything beyond one
 device / model / config — hence default off. **Not** worth extending to the expert cache without
-sizing the prize first: under `ahwb` only ~294 MiB of a 3000 MiB budget sits in zram, so the prize
+sizing the prize first: under `pinned` only ~294 MiB of a 3000 MiB budget sits in zram, so the prize
 is a fraction of the dense one while the cost — 3 GiB of rigid, LMK-accounted memory, and the loss
 of the reserve/commit/evict elasticity the cache is built on — is far higher.
 
@@ -254,12 +276,12 @@ byte-correct, it just cannot hit. See [cache-sizing.md](cache-sizing.md).
 
 ## More architectures
 
-`qwen3moe`, `qwen2moe`, `qwen35moe` (the hybrid attention/SSM family, e.g. Qwen3.6-35B-A3B),
-`gemma4` (merged `ffn_gate_up_exps` plus shared experts), OpenAI `gpt-oss` (MXFP4, purely
-routed) and `nemotron_h_moe` (gate-less `ffn_up_exps`/`ffn_down_exps`) are supported; other
-`build_moe_ffn` models are one recipe row each. The remaining frontier is architectures whose
-routing node is not the shared `ffn_moe_topk` — custom gating, which the capture/stream hook
-would need to learn. See [adding-a-model.md](adding-a-model.md).
+Any MoE llama.cpp loads whose experts come in one of the three layouts it builds (split, fused
+`ffn_gate_up_exps`, gate-less) streams with no change here, since which tensors are the routed
+experts is read from the file rather than from a table
+([which-models-stream.md](which-models-stream.md)); each layout has a byte-identity gate. The
+remaining frontier is architectures whose routing node is not the shared `ffn_moe_topk` — custom
+gating, which the capture/stream hook would need to learn.
 
 ## Steering the routing toward what is resident — built, measured on the desktop
 
@@ -298,6 +320,18 @@ more budget — which `--cache-mb auto` now takes automatically, capped by `--ca
 ([cache-sizing.md](cache-sizing.md)). Admission policies and a persistent cross-run cache
 remain unexplored.
 
+## The experts a device does not hold, computed beside it
+
+Where a model fits between a GPU and RAM, the engines written for a few GPUs decode two to four times
+faster than this one ([comparison.md](comparison.md)). They compute the experts the GPU's cache misses
+on the CPU, from RAM, while the GPU computes the rest; this engine uploads every miss over the bus to
+the device cache, and llama.cpp's scheduler runs a CPU part of a graph only after the GPU part, so an
+experimental branch that computed the misses on the CPU gained 12% once its cache settled on an 8 GB laptop card and lost on
+a 32 GB one. Running the two halves of a layer at once needs the scheduler to split them, which is a
+change to llama.cpp, and the planner would then choose the split from measured rates. A wide-batch
+prefill that overlaps the uploads with the compute belongs with it: prefill on long prompts is where
+the gap is widest.
+
 ## Hardware planning — what is measured, and what is still owed
 
 `--auto` derives the streaming knobs from the machine and the model instead of from flags, and
@@ -312,18 +346,19 @@ machine reports available; and a thread rule that reads core classes rather than
 because a barrier waits for its slowest participant.
 
 What is still owed is measurement rather than design, and every knob the plan cannot decide prints
-`[unprobed]`.
+`[unprobed]`. The four steps that replace the plan's predictions with measurements on the model
+itself are built: its routing for the cache, its first request for the lossless knobs, one real
+layer of it for every device, and device memory as a tier of the expert cache
+([measured-planning.md](measured-planning.md)). What each still owes is its run on the reference
+phone, a Windows machine and a discrete card the archives now carry a CUDA module for.
 
-- **Streamed experts computed on a device, rather than on the CPU cores.** Half built, and the
-  missing half is a design question rather than plumbing. A device is asked whether it offers a host buffer type and whether it runs this model's
-  own expert matmul on the file's native layout; the bandwidth probe schedules one GEMV on every
-  backend so the host's figure and the device's are the same measurement; where the device wins, the
-  session binds the overridden experts to that device's host buffer type at load. What is not done is
-  the streamer's own reservations coming from that same allocator: it rebinds `data` onto memory it
-  reserved itself, so a device pointed at those tensors would read ordinary host memory it was never
-  given access to. Doing it trades against the lazy commit that lets a model far past RAM have valid
-  addresses everywhere while holding a fraction of it. On a machine that registers only a CPU the
-  measured half runs and finds nothing to compare, which is what the plan says.
+- **Streamed experts computed on a device, rather than on the CPU cores.** Built as the device tier
+  of the expert cache: llama.cpp's device-side expert cache holds the experts used most in the
+  device's own memory and computes them there, resident or streamed, a miss uploaded from the host
+  (from the backend's own host memory where that measured faster); the plan arms it where the device
+  prices faster on this model's own expert block, and the byte-identity gates cover it. What stays
+  on the host is the streamer's own reservations, by design: a model far past RAM keeps valid
+  addresses everywhere while holding a fraction of it.
 - **A prefill-aware cache floor.** Each expert is already read at most once per ubatch (the `seen_`
   guard in the streamer), so the read-once property that wave-partitioned prefill exists to provide
   is not missing. What is missing is a guarantee that the cache can hold one layer's ubatch working
@@ -357,6 +392,51 @@ What is still owed is measurement rather than design, and every knob the plan ca
   its one policy figure were sized on a single laptop; a phone with an NPU, a machine with no
   accelerator, a discrete GPU and a system that commits what it reserves each owe a run before the
   rule is believed there ([hardware-planning.md](hardware-planning.md#the-widest-graph)).
+
+## Conversation reuse on hybrid models (the server, tool calls)
+
+`bmoe-server` keeps no conversation: every request carries the whole history, the engine tokenizes
+it and keeps the leading tokens that already match its KV cache, so a turn costs only its new
+message. That rests on dropping the divergent tail with `llama_memory_seq_rm`, and a hybrid model
+cannot do that: on Qwen3.8-Flash-Next (36 gated-delta layers, 12 attention) the recurrent state
+exists only at its last position, llama.cpp refuses any partial removal, and the engine falls back
+to clearing the cache and recomputing the conversation from its first token. A tool loop triggers
+it every time, because the client sends the assistant's call back in structured form and the chat
+template renders it differently from the tokens the model generated. On a 125B model with the
+history in the tens of thousands of tokens that is a turn of minutes, or a failed one (issue #240).
+
+Every server that runs hybrid models has met this, and the answers are all a form of the same
+thing: a snapshot of the recurrent state to fall back on. llama-server keeps up to 32 per slot in
+host RAM (fp32, 60 to 215 MiB each) and restores the last one before the divergence; vLLM
+snapshots only at block boundaries, so short prompts never hit; SGLang keeps one per node of its
+radix tree. None of them can avoid the divergence, because they serve conversations they did not
+produce. This engine can, and that order is the plan:
+
+1. **Replay the assistant's own tokens.** Keep the raw tokens generated for each assistant turn.
+   When the client sends that turn back and it parses to the same content and tool calls, match it
+   against those tokens instead of the template's rendering. The prefix then stays exact through a
+   tool loop at no memory cost, on every architecture, and the recurrent state is never asked to
+   roll back.
+2. **A recurrent checkpoint at each turn boundary**, through the public state API
+   (`llama_state_seq_get_data_ext` with the recurrent-only flag; no fork), the last two or three
+   kept, stored in half precision. This covers the histories a client does rewrite (compaction,
+   superseded tool results) by restarting from the previous turn instead of from zero. Its cost is
+   RAM a phone does not have to spare, so it ships as a toggle behind a device measurement, like
+   every other lever on this page.
+
+Not planned: approximate state reconstruction in the style of LinearKV (arXiv:2608.11231), where
+one cached state initialises every linear layer at 0.46x the time to first token. It is the
+interesting lever for long prompts, and it gives up the byte identity the gates guarantee.
+
+## Image input — built
+
+Asked in #250 and built on llama.cpp's own projector library (`mtmd`): a model loaded with its
+`mmproj` file reads images on every API, the agent and the CLI, with the KV prefix reused through
+an image ([server-api.md](server-api.md#chat), "Images"; [seam.md](seam.md)). What is still owed:
+a run of a streamed MoE vision model on each platform other than the laptop it ran on, an image on the
+Android and iOS apps' composers (the server side is the same), the agent taking a screenshot of its
+own page for a coding harness, and speculation beside an image (today it is off while a
+conversation holds one).
 
 ## Not on this list
 

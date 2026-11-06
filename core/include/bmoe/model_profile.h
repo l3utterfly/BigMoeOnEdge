@@ -12,8 +12,8 @@
 // "dense weights" prices things that differ by three orders of magnitude identically. So the file
 // is decomposed into groups by ACCESS SHAPE, and each carries its own per-token demand.
 //
-// On not hardcoding: the tensor names that identify EXPERT weights come from the architecture
-// recipe (bmoe/recipe.h), so a new MoE family stays one table row. The remaining names —
+// On not hardcoding: which tensors are EXPERT weights is read from the file's shapes
+// (bmoe/expert_layout.h), so a new MoE family needs nothing here. The remaining names —
 // `token_embd`, `output`, `blk.N.attn_*`, `blk.N.ffn_*` — are the gguf naming convention itself,
 // which every architecture llama.cpp converts shares; they are a property of the FORMAT, not of
 // any model, and a name that matches nothing lands in Other and is priced as read-whole, which is
@@ -23,8 +23,11 @@
 // this from a gguf, and bmoe/planner.h for what reads it.
 #pragma once
 
+#include "bmoe/measured_knobs.h"
+
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace bmoe {
 
@@ -61,6 +64,34 @@ struct GroupDemand {
     bool streamable = false;
 };
 
+// How many of a token's expert reads an LRU expert cache of a given size serves, for THIS model: an
+// LRU replay of a routing trace this model recorded (bmoe/routing.h), at sizes from nothing to the
+// whole expert set. Routing does not depend on where an expert is computed or which machine ran it,
+// so the curve is a property of the model (and of the kind of prompt it was recorded on), and it is
+// over the WHOLE expert set: a caller sizing a cache for part of it scales by the share it serves.
+//
+// Absent (`measured` false) is the first load of a model, and every caller keeps the credit it had
+// before there was a curve. A curve is never invented from a coefficient.
+struct HitPoint {
+    uint64_t cache_bytes = 0;
+    double hit = 0.0; // decode lookups served from the cache, 0..1: what a decoded token is priced with
+};
+
+struct HitCurve {
+    bool measured = false;
+    // Ascending in cache_bytes, monotone in hit, starting at (0, 0). Between two points the share is
+    // interpolated; past the last it holds the last.
+    std::vector<HitPoint> points;
+    uint32_t decode_tokens = 0;  // decoded tokens in the trace it was replayed from
+    uint32_t prefill_tokens = 0; // prompt tokens in it
+    // Why a trace that was offered was not used (a different model, too short): "" otherwise. A
+    // rejected trace leaves `measured` false, and the plan is the one it would be without it.
+    std::string rejected;
+
+    // The share served at `cache_bytes`, 0..1, non-decreasing in it. 0 when not measured.
+    double hit_share(uint64_t cache_bytes) const;
+};
+
 struct ModelProfile {
     std::string arch; // for the rationale and for the record; never branched on
     bool is_moe = false;
@@ -73,6 +104,10 @@ struct ModelProfile {
     // silently wrong on exactly the architectures that motivated the distinction.
     uint32_t n_layer = 0;     // blocks in the file: llama.cpp's own layer indices
     uint32_t n_moe_layer = 0; // of those, the ones carrying expert tensors — the ones that stream
+    // Which blocks those are, ascending, in llama.cpp's indices: what a placement expressed in
+    // blocks (n_gpu_layers, an override pattern) is read against, so a count of "layers on the
+    // host" is a count of expert-carrying ones. Empty when the file was not read.
+    std::vector<uint32_t> moe_layers;
 
     uint32_t n_expert = 0;      // experts per MoE layer
     uint32_t n_expert_used = 0; // routed per token (top-k)
@@ -95,6 +130,16 @@ struct ModelProfile {
     uint64_t expert_bytes = 0;         // every routed-expert tensor
     uint64_t dense_bytes = 0;          // everything else: embeddings, attention, norms, head
     uint64_t largest_dense_tensor = 0; // the one a residency policy may not be able to hold
+    // The MTP head file's size, where the run names one (SpecConfig::mtp_head): what placing the
+    // head on a device costs that device. 0 where there is no file or it cannot be read.
+    uint64_t mtp_head_bytes = 0;
+    // The multimodal projector's size, where the run names one (RunConfig::mmproj): what llama.cpp's
+    // library holds beside the model to read images, whole, on a device the run uses or on the host.
+    // Dense, so never streamed. 0 where there is no file or it cannot be read.
+    uint64_t projector_bytes = 0;
+    // The tensors of the Embedding group, by name: what a plan that prices the group as left
+    // mapped hands the run (MoeStreamConfig::dense_mapped), so the run leaves exactly those.
+    std::vector<std::string> embedding_tensors;
 
     // The file that holds the most routed-expert bytes: where the streamer's reads land, so where a
     // storage probe has to read. A model in one file names that file. A split one does not name
@@ -142,7 +187,12 @@ struct ModelProfile {
     // instead answered 2 threads on a phone where the engine is 58% faster at 4: an F32 GEMV
     // saturates the bus at very few threads, a quantized one carries dequantization work per byte
     // and keeps scaling.
+    //
+    // A mixed quant carries several: `expert_type_id` is the one holding the most expert bytes,
+    // `expert_type_ids` every one of them (ascending), so a device is asked about all the layouts
+    // it would have to execute and not only the commonest.
     int expert_type_id = -1;
+    std::vector<int> expert_type_ids;
 
     // ── shapes that constrain what may be done ──────────────────────────────────────
     // The output head is the embedding table. Two tensor objects over one range, so a policy that
@@ -151,6 +201,17 @@ struct ModelProfile {
     // streaming however large it is. No size threshold or architecture name is involved.
     bool tied_output_head = false;
     bool has_mtp = false; // a trained multi-token-prediction block is present
+
+    // This model's own hit-rate curve, from a routing trace it recorded on an earlier run
+    // (attach_routing in bmoe/routing.h). Not read from the file: a front-end that kept a trace hands
+    // it back, and without one the curve is absent and the plan is what it always was.
+    HitCurve hit_curve;
+
+    // What an earlier load of this model measured about its lossless knobs on this machine and this
+    // engine (bmoe/measured_knobs.h), the record a front-end kept and probe_and_plan matched by
+    // hardware_fingerprint and engine version. Empty without one, and the plan is then the one a
+    // first load gets.
+    MeasuredKnobs knobs;
 
     bool ok = false; // false when the file could not be read; every rule declines
     std::string error;

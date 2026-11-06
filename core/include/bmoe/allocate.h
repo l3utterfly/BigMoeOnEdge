@@ -79,6 +79,8 @@ struct AllocationInputs {
     // part that is refused is ordinary memory on a machine that will then reclaim it.
     uint64_t lockable_bytes = 0;      // everything held reclaim-exempt, after the margin
     uint64_t lock_in_place_bytes = 0; // the part that may be locked where it already is (the cache)
+    bool lockable_bytes_known = true;
+    bool lock_in_place_bytes_known = true;
 
     // What the holdable ceiling was before its margin, and the margin's terms. The margin is room
     // left for memory the machine can take back, and locked memory is not that: so where the cache
@@ -93,6 +95,12 @@ struct AllocationInputs {
     // nothing here chooses them, but they come out of the same memory, so they are a line rather
     // than something the budget is assumed to have left room for.
     uint64_t fixed_bytes = 0;
+    // The multimodal projector, where the run has one and it lands in this pool: dense weights held
+    // whole for the run to read images, never streamed, and not the planner's to size.
+    uint64_t projector_bytes = 0;
+    // Held the same way, and filled as a chat goes rather than at load: the context checkpoints the
+    // run may keep. A line of its own, so a reader finds what a chat run costs over a one-shot one.
+    uint64_t checkpoint_bytes = 0;
 
     // What a device the run is ARMED to compute on costs this pool, and whether it is charged to
     // the lockable ceiling too. Zero where no device is armed or its memory is its own.
@@ -134,6 +142,18 @@ struct AllocationInputs {
     // it caches, and on a machine where the first stage placed some layers on a device that set is
     // smaller than the model's.
     uint64_t cacheable_bytes = 0;
+
+    // ── the device crossing, as a candidate (docs/measured-planning.md, Step 3) ─────────────────
+    // Where the capacity fitter put the dense part of some layers on a device and left their experts
+    // on the host, every such layer crosses the host/device boundary twice a token. Bringing those
+    // layers home - whole, onto the host - removes the crossings and costs the host what their dense
+    // part and context take. `layers_home_bytes` is that RAM, `layers_home_saved` the seconds per
+    // token the measured crossings cost more than the device saves on those layers' dense matmuls;
+    // both 0 when there is nothing to price, or the host does not win. It is ranked against the
+    // cache and the resident groups like any other use of the budget.
+    uint64_t layers_home_bytes = 0;
+    double layers_home_saved = 0.0;
+    uint32_t layers_home_count = 0; // the layers it brings home, for the rationale
 };
 
 // One line of the memory ledger: something the run holds for its whole length, and whether it is
@@ -152,9 +172,24 @@ struct Ledger {
     std::vector<LedgerRow> rows;
     uint64_t holdable_cap = 0; // what the process may hold, after the margin
     uint64_t lockable_cap = 0; // what it may hold reclaim-exempt, after its own margin
-    uint64_t held = 0;         // every row
-    uint64_t locked = 0;       // the rows held reclaim-exempt
+    bool lockable_cap_known = true;
+    uint64_t held = 0;   // every row
+    uint64_t locked = 0; // the rows held reclaim-exempt
 };
+
+// One thing the cost model has to say that is not a setting: a fact it priced by, or a reason it
+// declined. The topic is the note's name, so a front-end can title it and a reader can tell two notes
+// apart without parsing prose; the brief is what a person reads, the detail what --explain prints.
+struct AllocationNote {
+    std::string topic;  // stable kebab-case key; notes of the same family share one
+    std::string value;  // the number the note turns on, rendered; "-" when there is none
+    std::string brief;  // one plain sentence
+    std::string detail; // the full account
+};
+
+// A size as a person reads it: GB with one decimal from 1 GiB up, whole MiB below. The planner's
+// one-line briefs use it so every size on a screen is spelled the same way.
+std::string size_brief(uint64_t bytes);
 
 struct Allocation {
     GroupPlacement groups[(int) WeightGroup::count];
@@ -176,8 +211,19 @@ struct Allocation {
     // The part of `cache_bytes` the platform can be asked to keep in place; 0 when the cache is
     // ordinary memory, because it was not asked for or because not even one token cycle fits.
     uint64_t cache_locked_bytes = 0;
+    // An unknown ceiling permits a bounded runtime attempt, not a predicted lock grant. This
+    // never widens the holdable budget; the run fits the cache to what the kernel actually grants.
+    bool cache_lock_unverified = false;
 
     uint64_t cache_bytes = 0; // expert cache budget; 0 means the expert lane is not used
+
+    // Whether the ranking funded AllocationInputs::layers_home_*: the plan then brings those layers
+    // home and is made again with them there.
+    bool layers_home = false;
+    // The share of a token's expert reads the cost model credits the cache with serving, 0..1: what
+    // `seconds_per_token` was priced with, so a front-end shows the figure the plan stands on rather
+    // than a cache-to-experts ratio of its own. 0 without a cache.
+    double cache_hit_credited = 0;
 
     // What was available for the cache BEFORE the floor was applied. It is the only way to say how
     // far short a refused cache fell: `cache_bytes` is 0 once the floor rejects it, and a shortfall
@@ -202,7 +248,7 @@ struct Allocation {
     // the probe found.
     bool device_applicable = true;
 
-    std::vector<std::string> notes;
+    std::vector<AllocationNote> notes;
 
     const GroupPlacement & at(WeightGroup g) const { return groups[(int) g]; }
     GroupPlacement & at(WeightGroup g) { return groups[(int) g]; }

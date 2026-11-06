@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bmoe {
@@ -44,6 +45,19 @@ enum class DenseWeightsMode {
                // and says how much, loudly.
 };
 
+// Stable lowercase spelling ("mmap", "warm", "anon", "pinned"), shared by the flag, the plan and the
+// telemetry.
+const char * dense_weights_mode_name(DenseWeightsMode m);
+
+// Whether route-ahead's prediction scores against an int8 mirror of the router gates or their own
+// float weights (MoeStreamConfig::gate_mirror). Both rank the same experts to within an int8 step;
+// they differ in cost, and which is cheaper is a property of the machine, so neither is a default.
+enum class GateMirror {
+    Auto, // timed at load (or by --auto's probe) on the model's own gate shape; the faster path wins
+    On,   // the int8 mirror: a quarter of the bytes, plus quantizing the activation per call
+    Off,  // the gate's own weights
+};
+
 // MoE expert-selective streaming knobs.
 struct MoeStreamConfig {
     bool enabled = false; // turn streaming on; init fails fast if the model is not MoE
@@ -60,6 +74,21 @@ struct MoeStreamConfig {
     // device whose free RAM it cannot know in advance; it does not chase memory pressure afterwards.
     // Mutually exclusive with an explicit cache_mb > 0. See docs/cache-sizing.md.
     bool cache_auto = false;
+
+    // Experts COMPUTED on a device, from a cache of them in its memory, in MiB; 0 is off. The
+    // layers go to the device and their experts stay in this streamer's host memory, and llama.cpp's
+    // device-side expert cache (llama_context_params::moe_cache_size) uploads a routed expert into
+    // its slots from where the streamer put it. On a device that shares the host's memory the upload
+    // is a copy within one pool; elsewhere it crosses the device's link. See docs/backends.md.
+    int device_cache_mb = 0;
+    // Where that cache's misses are uploaded FROM, for experts resident on the host: a copy of them in
+    // a buffer of the device's own host buffer type (ggml_backend_dev_host_buffer_type) instead of the
+    // file's mapping, the same bytes in the same layout, the expert tensors pointed at it as the
+    // streamer points them at its slots. The backend's host memory reaches its device faster where it
+    // can be locked; a device with no such type keeps the mapping. The device's name (as
+    // ggml_backend_dev_name gives it), empty for off: the planner names the device it measured the
+    // gain on, where the host holds the copy.
+    std::string expert_host_buffer;
     int cache_floor_mb = 1536; // RAM to leave free for the rest of the system when auto-sizing
     int cache_ceil_mb = 0;     // upper bound on the auto budget in MiB (0 = cap only at the full
                                // expert-set size); useful to keep the cache from taking all the
@@ -89,6 +118,12 @@ struct MoeStreamConfig {
     // when it sized the cache to the lockable total; a hand-set budget is never shrunk unasked.
     bool cache_pin_fit = false;
 
+    // Halve the expert cache when the system takes it back mid-run: a token whose compute stalls
+    // against this machine's own reference, confirmed by a sample of the cache's pages that are no
+    // longer in RAM. Shrinks only, never under one token's cycle, and never grows back within the run
+    // (docs/pressure.md is why). Inert wherever nothing presses on memory.
+    bool cache_brake = true;
+
     // Overlap async expert reads with FFN compute instead of blocking on them: load_layer()
     // publishes the reads and returns immediately, and the CPU mul_mat_id kernel blocks per
     // expert (via the fork's expert-ready hook) only if that expert's slice is not yet in.
@@ -111,6 +146,21 @@ struct MoeStreamConfig {
     // a fixed cache_mb or cache_auto (speculative slices land in the per-layer cache buffers),
     // so validate() rejects it when both are off. See docs/prefetch.md.
     int prefetch_layers = 0;
+
+    // How many tokens of this model's routing the session keeps for the planner: the experts each
+    // MoE layer asks the cache for, for the first N decoded tokens and the last N of the prompt
+    // before them (Session::routing_record). A front-end that keeps the record hands it to the next
+    // --auto plan of the same file, which then prices the cache on the hit rate this model's routing
+    // actually gets at every size instead of a linear credit (bmoe/routing.h). It asks the graph for
+    // nothing - the ids are gathered on every routing anyway - and stops by itself; 0 records nothing.
+    // Lossless: it changes no output.
+    int routing_record_tokens = 256;
+    // Record the routing on a run that does not stream as well. With no streamer the routing nodes
+    // are not otherwise observed, so recording them costs one barrier per MoE layer per token until
+    // the record is full, and nothing after. The planner sets it where a choice it has to make is
+    // priced by that record and none exists yet (the device tier); off, an unstreamed run records
+    // nothing, as before.
+    bool record_unstreamed = false;
 
     // How the dense (non-expert) weights are treated. The streamer only rebinds experts; the rest —
     // gguf header/metadata, embeddings, attention, norms, lm_head — is handled by one of three
@@ -144,11 +194,20 @@ struct MoeStreamConfig {
     bool row_stream = false;
     int row_stream_mb = 64; // resident window across all row-streamed tables, in MiB
 
+    // ── tables the plan leaves mapped ─────────────────────────────────────────────────
+    // Tensor names the hardware planner priced as left mapped: the graph gathers rows from them,
+    // so a resident copy buys bytes nothing reads. Under Anonymous/Pinned they stay mapped, as a
+    // tensor too large to hold does; every other mode is unchanged. The names are read off the
+    // file by the planner's own grouping, never written here. Measured why it matters: a 28.8 GB
+    // per-layer table that "fits" by the kernel's count was copied beside a 25.8 GB expert cache
+    // on a 42.6 GiB control group and the run was killed at 43 GB.
+    std::vector<std::string> dense_mapped;
+
     // ── release the model file's mapping after load (Windows) ─────────────────────────
     // llama.cpp keeps the gguf mapped for the model's lifetime, and on Windows a live section of
     // the file serialises the streamer's concurrent unbuffered reads: four lanes deliver one
     // lane's throughput (measured; see core/src/io/mapping_release.h). With this on, once nothing
-    // reads through the mapping any more (dense weights copied out under anon/ahwb, every file
+    // reads through the mapping any more (dense weights copied out under anon/pinned, every file
     // tensor either streamed, copied or row-served) the engine unmaps the file and closes its
     // section. On POSIX the mapping is munmap'd the same way; Android was measured not to serialise
     // reads, so there the gain is smaller and of a different kind (see docs/moe-streaming.md).
@@ -276,6 +335,15 @@ struct MoeStreamConfig {
     // one of them, so the pair pays the prediction and the early reads and commits nothing.
     int route_ahead = 0;
 
+    // What route-ahead's prediction GEMV reads (see GateMirror). Inert unless route_ahead > 0. The
+    // committed selection is a ranking, and the int8 mirror changes a score by far less than the
+    // margins between experts, so the choice is about cost: measured on device the mirror took the
+    // prediction from 19 to 6 ms/token at 74.5% agreement with the router against 74.7% for the
+    // exact weights, while on an x86 host with bandwidth to spare the float path was faster. Like
+    // route-ahead itself the choice can change which expert a near-tie commits to; it is lossy only
+    // where route-ahead already is.
+    GateMirror gate_mirror = GateMirror::Auto;
+
     // Test/debug only: complete each prefetch's speculative reads synchronously, on the eval
     // thread, before returning. This defeats the latency-hiding purpose (the reads no longer
     // overlap compute) but makes speculative integration deterministic, so the byte-identity
@@ -293,6 +361,8 @@ struct MoeStreamConfig {
     static constexpr int cache_min_mb = 1500; // smallest non-pathological cache (see above)
     static constexpr int io_threads_max = 8;
     static constexpr int prefetch_layers_max = 8;
+    // A record's memory is a few ints per layer per token; this keeps the longest one in single MiB.
+    static constexpr int routing_record_tokens_max = 4096;
     static constexpr int route_ahead_max = 8; // beyond this the staleness has no measured meaning
     static constexpr int predict_spec_max_limit = 8;
     static constexpr float drop_cold_frac_max = 1.0f;    // the uniform share: never empties a routing
@@ -328,11 +398,28 @@ enum class DraftSource {
 struct SpecConfig {
     DraftSource source = DraftSource::none;
 
+    // MTP only. A GGUF holding the model's trained MTP head on its own, for a model file that ships
+    // without it: llama.cpp's converter writes one (convert_hf_to_gguf.py --mtp). Empty uses the head
+    // inside the model file. The head is opened as a model of its own and drafts in a context that
+    // reads the target's hidden states, as llama.cpp's own speculative driver loads a draft head.
+    std::string mtp_head;
+    // MTP only, with a head file: the head's weights on the devices the target's layers are on
+    // (true) or on the host (false). The planner sets it where a device computes this model's
+    // experts faster than the host by the margin - the head's block is one more expert block - and
+    // the head fits in the bytes the capacity fitter gave the experts, which it takes from the
+    // device expert cache; the target's own placement is untouched. Measured why: on a 12 GB card
+    // with 8 slow cores, drafting on the host cost 35 ms of a 65 ms token and lost to no head at all.
+    bool mtp_head_on_devices = false;
+
     // Tokens drafted per verify batch. The verify decode is 1 + draft_max positions wide, so this
     // sets both the ceiling on tokens-per-decode and the width of the read-set widening above.
     // Past the source's acceptance horizon the extra drafts are rejected and paid for anyway, which
     // is why the useful range is small; 3 is upstream's default for a single trained head.
     int draft_max = 3;
+    // The narrowest ubatch an MTP draft context is reserved at: it computes 1 + draft_max positions
+    // at decode, a prompt chunk in pieces this wide at prefill (Session::open, and the placement
+    // probe that fits it beside the target).
+    static constexpr int mtp_draft_ubatch = 32;
 
     // MTP only. Confidence floor for continuing to draft, as the head's own probability for the
     // token it is proposing. At 0 the head is asked for draft_max tokens unconditionally, however
@@ -395,6 +482,23 @@ struct PrefillDeviceConfig {
     // its own must ask for - a speed-up the planner chose is never a reason for a model not to load.
     bool best_effort = false;
 
+    // Confirm the device on THIS model before the session keeps it: one prefill of a fixed text
+    // computed on the host and on the device, compared row by row. A device that does not pick the
+    // host's next token in nearly every row is handed back like one that failed to open
+    // (best_effort decides how). The planner's test is one synthetic matmul, which cannot see a
+    // fault only the model's own activations trigger: a phone GPU's half-precision prefill turned
+    // a model into noise. Whether the device is FASTER is not judged here - at this width cold
+    // expert reads dominate - and stays the planner's call. The cost is three short prefills at
+    // load; false skips it.
+    bool verify = true;
+    static constexpr int verify_tokens = 64; // the probe prefill's width, under max_outputs
+    // Positions compared, spread across that width. Each is a row of the output head, the model's
+    // largest matrix, and from 32 rows up ggml's BLAS backend unpacks a quantized matrix whole into
+    // float32 and keeps that scratch: 1940 MiB on a 248k vocabulary at load, outside every budget.
+    // As many rows as stay under that, for the most statistics a narrow product allows.
+    static constexpr int verify_rows = 31;
+    static constexpr float verify_min_agree = 0.9f; // rows whose top token must match the host's
+
     // How many layers of streamed experts the device holds at once (with moe.enabled). Two reads a
     // layer while the one before it computes; one reads each layer at its own routing node, with
     // the device waiting, and costs a layer less of memory. Same result either way.
@@ -445,10 +549,11 @@ struct PrefillDeviceConfig {
 
     static constexpr int min_tokens_floor = 2; // decode is one token wide; this keeps the shapes apart
 
-    // Logit rows a graph may produce, with the device on. llama.cpp reserves compute memory for as many
-    // as the ubatch is wide, and a row is the whole vocabulary: 2048 rows of a 248k-token vocabulary
-    // were 2 GB of reservation (measured on a 35B-A3B), which starved decode into thrashing. A prompt
-    // needs one row; a perplexity pass is fed in pieces this wide instead.
+    // Logit rows a graph may produce, on every run and not only with the device on. llama.cpp
+    // reserves compute memory for as many as the ubatch is wide, and a row is the whole vocabulary:
+    // 2048 rows of a 248k-token vocabulary were 2 GB of reservation (measured on a 35B-A3B), which
+    // starved decode into thrashing. A prompt needs one row; a perplexity pass is fed in pieces this
+    // wide instead.
     static constexpr int max_outputs = 128;
 
     bool enabled() const { return !device.empty(); }
@@ -490,10 +595,60 @@ enum class DeviceUse {
     CpuOnly, // the CPU and nothing else
 };
 
+// The element type of the K and V caches, by llama.cpp's own names (its --cache-type-k and
+// --cache-type-v). F16 is llama.cpp's default. Every other type changes the output, the quantized
+// ones by storing the cache in fewer bits (llama.cpp rotates a quantized cache's heads first, which
+// is most of what keeps 4 bits usable). The planner never picks one; the default below is the one
+// lossy choice the engine makes for its caller.
+enum class KvCacheType { F16, BF16, F32, Q8_0, Q5_1, Q5_0, Q4_1, Q4_0, IQ4_NL };
+
+// Q8_0 by default, where llama.cpp keeps F16: on this engine the KV is memory the expert cache does
+// not get, and a long agent chat (18 turns to 60k on Qwen3.6-35B-A3B, 16 GB) decoded in 281-303 s
+// at Q8_0 against 442-490 s at F16. F16 is the lossless choice, one flag away.
+inline constexpr KvCacheType k_default_kv_cache_type = KvCacheType::Q8_0;
+// Every value, in declaration order, and its llama.cpp name: the one list both the parameter table
+// and the telemetry read.
+inline constexpr KvCacheType k_kv_cache_types[] = {KvCacheType::F16,  KvCacheType::BF16, KvCacheType::F32,
+                                                   KvCacheType::Q8_0, KvCacheType::Q5_1, KvCacheType::Q5_0,
+                                                   KvCacheType::Q4_1, KvCacheType::Q4_0, KvCacheType::IQ4_NL};
+const char * kv_cache_type_name(KvCacheType t);
+// Lossless knobs measured on the first real request (docs/measured-planning.md, Step 2). Empty by
+// default, and then nothing is measured: the plan arms it when the front-end keeps the result
+// (bmoe/measured_knobs.h), or a person does by hand. Once the cache's hit rate has settled, decode
+// windows alternate between the incumbent and each candidate, A B A B, every window decoding the
+// user's own answer; a candidate replaces the incumbent only if it decodes faster by the planner's
+// device margin in the median of its rounds. The winner stays for the rest of the session and is
+// returned (Session::measured_knobs). Changes no output: every knob here is lossless.
+struct KnobTrialConfig {
+    // Decode thread counts tried against n_threads, at most threads_max_candidates. Switched live
+    // (llama_set_n_threads); prefill keeps n_threads_batch.
+    std::vector<int> threads;
+    // Also try the other setting of moe.overlap. Switched live between two decodes, by giving the
+    // streamer's first read lane a worker of its own or taking it back; needs streaming, the
+    // expert-ready hook, and no layer on a device (overlap changes how a context offloads, which is
+    // fixed when it is created).
+    bool overlap = false;
+    // Tokens per timed window. Small values are for tests: a window of a token or two times the
+    // noise of one token.
+    int window_tokens = 8;
+
+    bool enabled() const { return !threads.empty() || overlap; }
+
+    static constexpr int threads_max_candidates = 2;
+    static constexpr int window_tokens_max = 256;
+};
+
 // A full run: model, prompt, decoding, streaming, telemetry.
 struct RunConfig {
     std::string model_path;
+    // The multimodal projector (an `mmproj` GGUF) that gives the model image input, loaded beside it.
+    // Empty: text only. Any model llama.cpp's projector library knows, any quantization of either
+    // file: the projector is read by its own header, nothing here names a family.
+    std::string mmproj;
     std::string prompt = "The capital of Japan is";
+    // Image files the prompt places with image_marker() (bmoe/chat.h), in order: the one-shot run's
+    // input beside `prompt`, read by the front-end and handed to the session as bytes.
+    std::vector<std::string> images;
     int n_predict = 128;
     int n_threads = 4;
     // Threads for prefill, which is a different question from threads for decode: prefill is
@@ -517,14 +672,38 @@ struct RunConfig {
     // Decode is unaffected: a decode graph is one token wide whatever this says. The cost is
     // prefill throughput, which processes a long prompt in more, smaller passes.
     int n_ubatch = 0;
+
+    // Context checkpoints, as llama.cpp's server keeps them (--ctx-checkpoints and
+    // --checkpoint-min-step): copies of the part of the context's state that
+    // cannot be cut at an arbitrary position, so a chat turn whose prompt diverges from the cached
+    // one inside a recurrent state or a sliding window rolls back to the newest one before the
+    // divergence instead of prefilling the whole conversation again. One is taken at the end of
+    // every prompt, and inside a prompt prefilled in pieces every min_step tokens. A memory that can
+    // be cut anywhere has no such state, and keeps none. Lossless: a restored state is the state the
+    // same tokens computed.
+    //
+    // Fewer than the server's 32 by default: here every MiB they hold is a MiB the expert cache does
+    // not get, and Qwen3.6-35B-A3B's state is 62.8 MiB. An agent's request diverges at the end of the
+    // last prompt nearly always, which the newest checkpoint covers.
+    int ctx_checkpoints = 8;
+    int checkpoint_min_step = 8192;
+
+    // The K and V caches' element type (llama.cpp's --cache-type-k / --cache-type-v). A quantized
+    // cache holds a long context in a half or a quarter of the memory, which on this engine goes to
+    // the expert cache, at a cost in output quality: see KvCacheType. A quantized V cache needs flash
+    // attention, which llama.cpp turns on where the backend has it; where it has not, a quantized V
+    // falls back to F16 rather than failing the run.
+    KvCacheType cache_type_k = k_default_kv_cache_type;
+    KvCacheType cache_type_v = k_default_kv_cache_type;
     bool chatml = false; // wrap the prompt in the model family's chat turn (arch-aware)
 
     // Render the chat template with reasoning enabled. Passed to the template as the
     // `enable_thinking` kwarg, so a reasoning model (Qwen3, thinking Gemma, …) only emits
     // its thinking channel when true. Off suppresses reasoning at the source rather than
     // relying on the display-time parser, which cannot strip a format it does not know.
-    // Only meaningful with chatml; the raw-prompt path ignores it.
-    bool think = true;
+    // Only meaningful with chatml; the raw-prompt path ignores it. Off by default: on device a
+    // reasoning model can spend a whole turn's budget thinking before it answers (#331).
+    bool think = false;
 
     // Override the number of active MoE experts per token (top-k routing). 0 = use the
     // model's own <arch>.expert_used_count from the gguf. A lower value cuts per-token
@@ -541,6 +720,13 @@ struct RunConfig {
     // buffer type, since the streamer can only serve experts that live in host memory.
     int n_gpu_layers = 0;
     std::vector<std::string> buft_overrides;
+    // How many of those layers each device takes, by name, in the fitter's device order (see
+    // Placement::device_split). Empty leaves the split to llama.cpp, which divides by free memory.
+    std::vector<std::pair<std::string, int>> device_split;
+    // The devices llama.cpp may use, by name, where the planner chose among backends that drive the
+    // same card (bmoe/backend_choice.h). Empty leaves the choice to llama.cpp, which keeps the first
+    // backend registered for a card.
+    std::vector<std::string> device_list;
 
     // Put the DENSE weights on an accelerator that shares this host's memory, leaving the routed
     // experts on the host for the streamer. On such a machine the move frees no memory - it is the
@@ -550,9 +736,9 @@ struct RunConfig {
     // Off by default, armed by the caller, and currently REFUSED by the planner - because it was
     // measured three times in July on a device of exactly this class and it lost by 27%: the dense
     // and expert halves interleave, so a two-device split crosses the boundary twice per layer and
-    // the boundary tax eats the CPU time the device frees. See
-    // docs/bench-data/2026-07-27-gpu-dense-offload/. Kept as a named lever so the next person to
-    // have this idea finds the verdict instead of the idea.
+    // the boundary tax eats the CPU time the device frees. See the OpenCL row of
+    // docs/backends.md. Kept as a named lever so the next person to have this idea finds the
+    // verdict instead of the idea.
     bool dense_on_device = false;
 
     // Hand llama.cpp the CPU and nothing else. Set when this plan has decided no weight goes on a
@@ -573,6 +759,12 @@ struct RunConfig {
     SpecConfig spec;             // self-speculative decoding (MTP head or n-gram lookup); off by default
     PrefillDeviceConfig prefill; // prefill graphs on an accelerator; off by default
     DecideConfig decide;         // decide()'s prefix-state policy; off by default
+    KnobTrialConfig trial;       // lossless knobs measured on the first real request; off by default
+
+    // Let llama.cpp's and ggml's DEBUG log lines through to stderr. Off, they are dropped: about
+    // 1200 lines of graph bookkeeping per model load, which buried the engine's own output. For
+    // debugging llama.cpp itself, not the engine. Process-wide, as llama.cpp's log is.
+    bool llama_debug_log = false;
 
     // The upper ends of the ranges a settings form offers. They keep a slider finite and a typo
     // out; validate() does not enforce them, and none is a property of any model or machine.
@@ -580,6 +772,16 @@ struct RunConfig {
     static constexpr int threads_max = 256;    // n_threads and n_threads_batch
     static constexpr int n_expert_used_max = 256;
     static constexpr int n_gpu_layers_max = 1024;
+    static constexpr int ctx_checkpoints_max = 256;
+
+    // The context a client of a server needs, below which a front-end warns before the first
+    // request fails rather than after. Measured: opencode's first request, its system prompt and
+    // tool schemas alone, is 9911 tokens, so a coding agent is refused with context_full at any
+    // context under ~10k before it has done anything. This is the next power of two above that,
+    // which leaves room for the first answer and a few steps; a long agent session wants more.
+    // Advice, not a limit: validate() accepts any context, and a short one is right for a plain chat
+    // on a machine whose expert cache needs the RAM.
+    static constexpr int ctx_for_clients = 16384;
 };
 
 // Validation result: ok plus a human-readable reason when not.

@@ -6,7 +6,6 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.system.Os
@@ -61,18 +60,28 @@ class ServerProcess(private val ctx: Context) {
             "--models-dir", ModelManager.internalModelsDir(ctx).absolutePath,
             "--catalog", stageCatalog(ctx).absolutePath,
             "--api-key-file", writeKeyFile(ctx, apiKey).absolutePath,
+            // A phone is a chat client: its conversations are plain chat, the agent is the
+            // desktop's (docs/agent.md).
+            "--chat-only",
         )
         // The other places a model can sit: the server lists what they hold and loads it in place.
         for (d in ModelManager.scanDirs(ctx)) argv += listOf("--scan-dir", d.absolutePath)
 
         val pb = ProcessBuilder(argv)
         pb.redirectErrorStream(false)
-        // Where the system finds the engine's code, which only the app knows. How the backends are
-        // configured once found is the server's (server/platform.cpp).
+        // The engine's own directory first: the backends are modules there, and a module whose
+        // driver library is missing is not loaded, which is how one APK runs on every phone. Then
+        // the system directory, then the vendor one, and in that order. A process started from the
+        // app links in the linker's default namespace, which may open a vendor library (the phone's
+        // OpenCL, the DSP's libcdsprpc) only from a directory named on this path - a symlink to one
+        // from anywhere else is refused, so without /vendor/lib64 here the OpenCL and Hexagon
+        // modules fail to load and the engine says nothing. Last, it shadows nothing: a library the
+        // system directory has is found there first.
+        // How the backends are configured once found is the server's (server/platform.cpp).
         pb.environment()["LD_LIBRARY_PATH"] = "$nativeDir:/system/lib64:/vendor/lib64"
-        // The Hexagon backend loads its DSP-side skel (libggml-htp-v<arch>.so) through fastrpc, which
-        // resolves it against ADSP_LIBRARY_PATH, not the linker path above. Without it the NPU
-        // registers and then fails to open a session.
+        // The one environment entry a backend documents it needs to find its own files: a DSP-side
+        // library is resolved through this path and not the linker's. Set whatever backends are
+        // present; where none reads it, it costs nothing.
         pb.environment()["ADSP_LIBRARY_PATH"] = nativeDir
         pb.directory(dataDir)
         val p = pb.start()
@@ -180,7 +189,7 @@ class EngineService : Service() {
                 Engine.serverStopping()
                 lifecycle { stopServer() }
                 releaseWake()
-                stopForegroundCompat()
+                stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -257,9 +266,15 @@ class EngineService : Service() {
         wake = null
     }
 
-    private fun stopForegroundCompat() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) stopForeground(STOP_FOREGROUND_REMOVE)
-        else @Suppress("DEPRECATION") stopForeground(true)
+    // Swiped away from the recent apps, the engine stops with the app, its notification and the
+    // model's memory with it (#465). Shared on the network it stays: other devices are its clients.
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (!AppPrefs.shareOnNetwork(this)) {
+            Engine.serverStopping()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
@@ -274,9 +289,7 @@ class EngineService : Service() {
 
     private fun notification(text: String): Notification {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            nm.createNotificationChannel(NotificationChannel(CHANNEL, "Engine", NotificationManager.IMPORTANCE_LOW))
-        }
+        nm.createNotificationChannel(NotificationChannel(CHANNEL, "Engine", NotificationManager.IMPORTANCE_LOW))
         return Notification.Builder(this, CHANNEL)
             .setContentTitle("BigMoeOnEdge")
             .setContentText(text)

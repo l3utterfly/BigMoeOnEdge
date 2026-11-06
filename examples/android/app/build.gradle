@@ -1,6 +1,7 @@
 plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.plugin.compose'
 }
 
 // Short git SHA of the build, injected into BuildConfig so the running APK is identifiable
@@ -32,11 +33,21 @@ def keystorePropsFile = rootProject.file('keystore.properties')
 def keystoreProps = new Properties()
 if (keystorePropsFile.exists()) keystoreProps.load(new FileInputStream(keystorePropsFile))
 
+// LICENSE and THIRD_PARTY_LICENSES from the repository root, staged into a directory of their own
+// so that only they become assets.
+def licenseAssets = layout.buildDirectory.dir('generated/licenseAssets').get().asFile
+def stageLicenses = tasks.register('stageLicenses', Copy) {
+    from("$rootDir/../../LICENSE", "$rootDir/../../THIRD_PARTY_LICENSES")
+    into licenseAssets
+}
+preBuild.dependsOn stageLicenses
+
 android {
     // The code's package. The applicationId below stays what it was, so an update installs over
     // the previous build instead of beside it.
     namespace 'io.bigmoeonedge.app'
-    compileSdk 34
+    // 36: the minimum the Markdown renderer declares (compileSdk only; targetSdk is unchanged).
+    compileSdk 36
 
     signingConfigs {
         if (keystorePropsFile.exists()) {
@@ -53,8 +64,8 @@ android {
         applicationId 'io.bigmoeonedge.example'
         minSdk 29
         targetSdk 34
-        versionCode 45
-        versionName '0.30.0'
+        versionCode 66
+        versionName '0.40.1'
         buildConfigField 'String', 'GIT_SHA', "\"${gitSha}\""
         ndk {
             // The engine ships as prebuilt arm64 binaries staged by build-android.ps1.
@@ -95,10 +106,11 @@ android {
     }
 
     // The model catalog is the project's one data file (catalog/models.json), shipped as an asset
-    // and handed to the server at start: there is no second list in Kotlin.
+    // and handed to the server at start: there is no second list in Kotlin. The licenses ride
+    // along: the APK carries llama.cpp, ggml and the fonts, whose licenses ask for their text.
     sourceSets {
         main {
-            assets.srcDirs += ["$rootDir/../../catalog"]
+            assets.srcDirs += ["$rootDir/../../catalog", licenseAssets]
         }
     }
 
@@ -124,10 +136,6 @@ android {
         compose true
         buildConfig true
     }
-    composeOptions {
-        // Matches Kotlin 1.9.24 (see the Compose-Kotlin compatibility map).
-        kotlinCompilerExtensionVersion '1.5.14'
-    }
 }
 
 dependencies {
@@ -144,12 +152,17 @@ dependencies {
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.json:json:20240303'
 
-    def composeBom = platform('androidx.compose:compose-bom:2024.09.02')
+    // Compose 1.11.x: the release the Markdown renderer below is compiled against (it declares
+    // Compose compile-only, so the app's BOM is what it runs on and the two must agree).
+    def composeBom = platform('androidx.compose:compose-bom:2026.06.01')
     implementation composeBom
     implementation 'androidx.compose.ui:ui'
     implementation 'androidx.compose.ui:ui-graphics'
     implementation 'androidx.compose.material3:material3'
     implementation 'androidx.compose.material:material-icons-core'
+    // The chat's Markdown, GitHub-flavoured (tables included). The -m3 module only; no image
+    // loader module (Coil) is added, so an image in an answer is never fetched.
+    implementation 'com.mikepenz:multiplatform-markdown-renderer-m3:0.41.0'
     debugImplementation 'androidx.compose.ui:ui-tooling'
     implementation 'androidx.compose.ui:ui-tooling-preview'
 }

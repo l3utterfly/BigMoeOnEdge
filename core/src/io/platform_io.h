@@ -128,8 +128,9 @@ void aligned_free(void * p);
 // On Darwin it is wired memory: an anonymous mapping the process has locked, granted to any process
 // up to a system-wide total (see lockable_bytes).
 //
-// `pinned_max_bytes()` is the largest single allocation that will succeed: 0 where the platform has
-// no such allocation at all (Windows and Linux builds), and on Android the LOCK boundary rather than the
+// `pinned_max_bytes()` is the reported ceiling for one allocation: 0 where the platform has no such
+// allocation (Windows and Linux builds) or cannot report its ceiling. The latter does not establish
+// that vm_pin is unavailable. On Android it is the LOCK boundary rather than the
 // allocation one — AHardwareBuffer_lock fails with EINVAL at 2^31 bytes even though allocation
 // reaches the 4 GiB format cap, so a larger working set must be split across several buffers.
 struct PinnedAlloc {
@@ -144,9 +145,22 @@ void pinned_free(PinnedAlloc * a);
 // How much this process may still hold reclaim-exempt in total: `lockable_bytes` through
 // pinned_alloc, `lock_in_place_bytes` through vm_pin. Both are what is LEFT, net of what is already
 // held against the same limit, so they move while the process runs and are read when a plan is
-// made. 0 means the platform grants none; `lock_unbounded` means it publishes no total of its own
-// and the caller must bound it by what the process may hold at all.
+// made. 0 means the platform grants none; `lock_unbounded` means there is no reported total of its
+// own and the caller must bound it by what the process may hold at all. The query facts distinguish
+// a reported unlimited value from a query the sandbox denied: neither is evidence of a finite grant.
 constexpr uint64_t lock_unbounded = ~0ull;
+struct LockLimit {
+    uint64_t bytes = lock_unbounded;
+    // False if an applicable query failed, unless another established zero makes the answer
+    // certain. `bytes` still preserves every independently known upper bound; the caller must not
+    // report an uncertain bound as a measured grant.
+    bool known = false;
+};
+LockLimit intersect_lock_limits(LockLimit a, LockLimit b);
+LockLimit remaining_lock_limit(LockLimit limit, uint64_t held, bool held_known);
+LockLimit lockable_limit();
+LockLimit lock_in_place_limit();
+// Upper bounds only; use the facts above wherever an unknown must remain distinguishable.
 uint64_t lockable_bytes();
 uint64_t lock_in_place_bytes();
 
@@ -165,9 +179,22 @@ struct ChildResult {
 };
 bool can_run_self();
 ChildResult run_self(const std::vector<std::string> & args, double timeout_seconds, std::string * out);
+// The path the kernel started this process from (not argv[0], which is whatever the caller
+// typed), or "" where the platform does not say. Its directory is where a release's backend
+// modules are looked for.
+std::string self_path();
 
 // Reserved (address-only) region; physical pages appear on commit, vanish on evict.
 size_t vm_page();
+// Readable bytes every buffer we allocate to hold tensor data keeps past the tensor's last byte.
+// ggml's CPU kernels may load a vector that reaches beyond the last block (one Q6_K path reads 32
+// bytes from a 16-byte field at the block's end), which llama.cpp's own buffers absorb because
+// something always follows the last tensor in them. A buffer sized to its tensor exactly can end
+// on a page boundary with a guard page after it, and that load faults - seen on a phone, at random,
+// as the next mapping varied. One page, the OS's own, covers any vector a CPU loads at once.
+inline size_t tensor_tail_slack() {
+    return vm_page();
+}
 void * vm_reserve(size_t sz);
 bool vm_commit(void * p, size_t sz);
 // Ask the kernel to keep a committed span in RAM: not swapped, not compressed. False where the
@@ -187,6 +214,13 @@ void vm_release(void * p, size_t sz);
 // resident until reclaim. A no-op where the platform cannot (Windows host: a file view is not
 // VirtualFree-able, and the host build never streams). The range must be page-aligned by the caller.
 void vm_drop_file_pages(void * p, size_t sz);
+
+// Hand the system's cache of a FILE's pages back: the kernel keeps what was read through it (the
+// readahead llama.cpp asks for over the whole mapping at load) until pressure takes it, and under a
+// pressure with swap the kernel takes anonymous memory as well, the expert cache among it. Drops
+// clean pages only; a page any process still maps stays. A no-op where the platform offers no such
+// advice (Windows, Darwin: neither has posix_fadvise).
+void drop_file_cache(const char * path);
 
 // Drop the resident pages of an ANONYMOUS range someone else allocated and still owns, keeping the
 // range valid: the next touch maps a zero page instead of faulting. For memory whose contents moved
@@ -237,6 +271,22 @@ bool file_mapped_regions(const char * basename, std::vector<MappedRegion> & out)
 // size the expert cache to the device (--cache-mb auto); the budget is fixed for the run thereafter.
 uint64_t mem_available_bytes();
 
+// What a memory control group still lets this process take, in bytes: the tightest of its group
+// and every ancestor it can see, each as the limit less what the group holds, plus the group's own
+// inactive file pages, which the kernel drops before it would end anything. A container caps a
+// process this way whatever the machine has free, and exceeding the cap ends the process, so it is
+// the same kind of fact as a phone app's own share. 0 where no finite limit is set or none can be
+// read (no cgroups, an unlimited group, another kernel). The paths are parameters so a test can
+// stand a fake hierarchy up; production reads the defaults.
+uint64_t cgroup_memory_left(const char * fs_root = "/sys/fs/cgroup", const char * self = "/proc/self/cgroup");
+
+// The CPUs a control group's quota lets this process use, rounded up: the tightest quota over
+// period of its group and every ancestor (v2 cpu.max, v1 cpu.cfs_quota_us / cpu.cfs_period_us). A
+// container capped this way still shows every core of the host, and a short burst runs on all of
+// them before the quota throttles it, so a probe of a few milliseconds measures a machine the
+// sustained decode does not have. 0 where no quota is set or none can be read.
+uint32_t cgroup_cpu_limit(const char * fs_root = "/sys/fs/cgroup", const char * self = "/proc/self/cgroup");
+
 // Physical memory this machine has, 0 where it cannot be read. Not a sizing signal on its own -
 // what a process may hold is `mem_available_bytes()` and what it may KEEP is a separate probe - but
 // it bounds both, and it is what a rationale needs to say how much of the machine a plan is asking
@@ -245,8 +295,8 @@ uint64_t mem_total_bytes();
 
 // Process-wide compute-decomposition counters, cumulative since process start; the caller deltas
 // them across a single decode to split the per-token "compute" residual into its real causes.
-// Both return 0 when the platform cannot report them (Windows host build), which the metrics treat
-// as "unmeasured" rather than "zero work".
+// Both return 0 when the platform cannot report them, which the metrics treat as "unmeasured"
+// rather than "zero work"; major_faults_counted() says which reading a 0 fault count is.
 //
 //   * major_faults(): hard page faults served from backing store (getrusage ru_majflt). A non-zero
 //     per-token delta means a mmap-resident weight was re-faulted from flash *inside* the decode —
@@ -257,6 +307,9 @@ uint64_t mem_total_bytes();
 //     fault wait) rather than computing.
 uint64_t major_faults();
 double process_cpu_seconds();
+// Whether major_faults() counts anything here. Where it does not (no per-process count of HARD
+// faults is published), a 0 is "unmeasured", and a report must not print it as "no faults".
+bool major_faults_counted();
 
 // Bytes one major fault moves: the page size. Faults are counted, but what a reader wants to know is
 // how much memory the kernel took back and made us re-read — and a count only becomes that once it
@@ -273,6 +326,14 @@ struct ProcessMemory {
     uint64_t rss_anon_bytes = 0; // RssAnon: our cache lives here
     uint64_t rss_file_bytes = 0; // RssFile: the mmap'd model
     uint64_t swap_bytes = 0;     // VmSwap: anon we have already lost to zram
+
+    // The process's own accounting, when published: its charged footprint and the bytes left
+    // before its current limit. Neither can be reconstructed from RSS + swap. Known flags keep
+    // an exhausted allowance (a valid zero) distinct from a platform that does not publish one.
+    bool process_footprint_known = false;
+    uint64_t process_footprint_bytes = 0;
+    bool process_headroom_known = false;
+    uint64_t process_headroom_bytes = 0;
 };
 // False when the platform cannot report (Windows host), leaving `out` untouched.
 bool process_memory(ProcessMemory * out);
@@ -299,5 +360,17 @@ struct DeviceMemory {
     uint64_t compressed_held_bytes = 0;
 };
 bool device_memory(DeviceMemory * out);
+
+// What the kernel does with anonymous memory it wants back, as the facts that decide it. Each is
+// read from the kernel's own accounting - a syscall or a counter, never a benchmark - so asking
+// costs microseconds. False when nothing could be read at all.
+struct ReclaimFacts {
+    // What is left of this process's OWN share of memory, where the kernel keeps one and ends the
+    // process for exceeding it; 0 where no such share is published (the limit is the machine's).
+    uint64_t own_share_left = 0;
+    bool compresses = false; // anonymous memory is compressed in RAM before anything else happens to it
+    bool swaps = false;      // a backing store on disk exists for anonymous memory
+};
+bool reclaim_facts(ReclaimFacts * out);
 
 } // namespace bmoe::pio

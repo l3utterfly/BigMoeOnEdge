@@ -15,6 +15,7 @@
 
 #include <cstdio>
 #include <functional>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <string>
@@ -114,6 +115,12 @@ int main() {
     for (const ParamDesc & d : params()) {
         check(d.get && d.set, d.key + ": has accessors");
         check(!d.flag.empty() || !d.switches.empty(), d.key + ": reachable from the command line");
+        // A person reads a form row's help on a phone with nobody to ask: it explains itself (#468).
+        check(!d.form || !d.details.empty(), d.key + ": a form row has details");
+        // A form offers every basic row, and nothing still pending an A/B or kept for tests.
+        if (d.level == ParamLevel::Basic) check(d.form, d.key + ": a basic row is in the form");
+        if (d.level == ParamLevel::Experimental || d.level == ParamLevel::Debug)
+            check(!d.form, d.key + ": an experimental or debug row stays out of the form");
 
         // The default reads back through the setter to itself.
         RunConfig c;
@@ -121,9 +128,35 @@ int main() {
         const std::string v = d.get(defaults);
         check(d.set(c, v, err) && d.get(c) == v, d.key + ": default '" + v + "' round-trips");
 
-        if (d.bounded && (d.type == ParamType::Int || d.type == ParamType::Float) && v != "auto") {
+        const bool numeric = d.type == ParamType::Int || d.type == ParamType::Float;
+        if (d.bounded && numeric && v != "auto") {
             const double x = std::stod(v);
             check(x >= d.min && x <= d.max, d.key + ": default inside [min, max]");
+        }
+        if (d.bounded_below && numeric && v != "auto") check(std::stod(v) >= d.min, d.key + ": default >= min");
+        // A form shows the bounds as a range, so the type's own limit is not one (#268).
+        if (d.bounded)
+            check(d.max < (double) std::numeric_limits<int>::max(), d.key + ": max is a limit, not the type's");
+
+        // The typical range is guidance inside the limits, and the default is either in it or one
+        // of the row's named values: a form must never present its own default as unusual.
+        bool default_special = false;
+        for (const ParamSpecial & s : d.specials) {
+            RunConfig cs;
+            check(numeric, d.key + ": special values belong to numeric rows");
+            check(d.set(cs, s.value, err) && d.get(cs) == s.value, d.key + ": special '" + s.value + "' round-trips");
+            check(!s.label.empty(), d.key + ": special '" + s.value + "' has a label");
+            default_special |= s.value == v;
+        }
+        if (d.has_typical) {
+            check(numeric, d.key + ": a typical range belongs to a numeric row");
+            check(d.typical_min <= d.typical_max, d.key + ": typical min <= max");
+            if (d.bounded || d.bounded_below) check(d.typical_min >= d.min, d.key + ": typical inside the limits");
+            if (d.bounded) check(d.typical_max <= d.max, d.key + ": typical inside the limits");
+            if (v != "auto" && !default_special) {
+                const double x = std::stod(v);
+                check(x >= d.typical_min && x <= d.typical_max, d.key + ": default inside its typical range");
+            }
         }
         if (d.type == ParamType::Choice) {
             bool listed = false;
@@ -151,6 +184,8 @@ int main() {
     expect_flag({"-c", "4096"}, [](const RunConfig & c) { return c.n_ctx == 4096; });
     expect_flag({"--ctx-size", "1024"}, [](const RunConfig & c) { return c.n_ctx == 1024; });
     expect_flag({"--ubatch", "256"}, [](const RunConfig & c) { return c.n_ubatch == 256; });
+    expect_flag({"-ctk", "f16"}, [](const RunConfig & c) { return c.cache_type_k == KvCacheType::F16; });
+    expect_flag({"--cache-type-v", "q4_0"}, [](const RunConfig & c) { return c.cache_type_v == KvCacheType::Q4_0; });
     expect_flag({"--n-expert-used", "4"}, [](const RunConfig & c) { return c.n_expert_used == 4; });
     expect_flag({"--temp", "0.7"}, [](const RunConfig & c) { return c.sampling.temp == 0.7f; });
     expect_flag({"--top-k", "20"}, [](const RunConfig & c) { return c.sampling.top_k == 20; });
@@ -158,6 +193,7 @@ int main() {
     expect_flag({"--seed", "42"}, [](const RunConfig & c) { return c.sampling.seed == 42u; });
     expect_flag({"--seed", "4294967295"}, [](const RunConfig & c) { return c.sampling.seed == 0xFFFFFFFFu; });
     expect_flag({"--mtp"}, [](const RunConfig & c) { return c.spec.source == DraftSource::mtp; });
+    expect_flag({"--mtp-head-on-devices"}, [](const RunConfig & c) { return c.spec.mtp_head_on_devices; });
     expect_flag({"--ngram"}, [](const RunConfig & c) { return c.spec.source == DraftSource::ngram; });
     expect_flag({"--draft", "5"}, [](const RunConfig & c) { return c.spec.draft_max == 5; });
     expect_flag({"--mtp-p-min", "0.6"}, [](const RunConfig & c) { return c.spec.draft_p_min == 0.6f; });
@@ -165,6 +201,7 @@ int main() {
     expect_flag({"--ngram-max-match", "16"}, [](const RunConfig & c) { return c.spec.ngram_max_match == 16; });
     expect_flag({"--chatml"}, [](const RunConfig & c) { return c.chatml; });
     expect_flag({"--no-think"}, [](const RunConfig & c) { return !c.think; });
+    expect_flag({"--think"}, [](const RunConfig & c) { return c.think; });
     expect_flag({"--moe-stream"}, [](const RunConfig & c) { return c.moe.enabled; });
     expect_flag({"--cache-mb", "auto"}, [](const RunConfig & c) { return c.moe.cache_auto && c.moe.cache_mb == 0; });
     expect_flag({"--cache-mb", "2000"},
@@ -183,12 +220,15 @@ int main() {
                 [](const RunConfig & c) { return c.moe.dense_weights == DenseWeightsMode::Warmed; });
     expect_flag({"--dense-weights", "anon"},
                 [](const RunConfig & c) { return c.moe.dense_weights == DenseWeightsMode::Anonymous; });
+    expect_flag({"--dense-weights", "pinned"},
+                [](const RunConfig & c) { return c.moe.dense_weights == DenseWeightsMode::Pinned; });
     expect_flag({"--dense-weights", "ahwb"},
                 [](const RunConfig & c) { return c.moe.dense_weights == DenseWeightsMode::Pinned; });
     expect_flag({"--no-warm-dense"}, [](const RunConfig & c) { return c.moe.dense_weights == DenseWeightsMode::Mmap; });
     expect_flag({"--dense-weights", "mmap", "--dense-odirect"},
                 [](const RunConfig & c) { return c.moe.dense_weights == DenseWeightsMode::Anonymous; });
     expect_flag({"--load-all"}, [](const RunConfig & c) { return c.moe.load_all; });
+    expect_flag({"--llama-debug"}, [](const RunConfig & c) { return c.llama_debug_log; });
     expect_flag({"--force-cache"}, [](const RunConfig & c) { return c.moe.force_cache; });
     expect_flag({"--overlap"}, [](const RunConfig & c) { return c.moe.overlap; });
     expect_flag({"--io-two-wave"}, [](const RunConfig & c) { return c.moe.io_two_wave; });
@@ -205,6 +245,9 @@ int main() {
     // The planner's placement knobs, carried by the table so an applied plan keeps them.
     expect_flag({"--gpu-layers", "12"}, [](const RunConfig & c) { return c.n_gpu_layers == 12; });
     expect_flag({"--devices", "cpu"}, [](const RunConfig & c) { return c.device_use == bmoe::DeviceUse::CpuOnly; });
+    expect_flag({"--dense-mapped", "token_embd.weight;per_layer_token_embd.weight"}, [](const RunConfig & c) {
+        return c.moe.dense_mapped == std::vector<std::string>{"token_embd.weight", "per_layer_token_embd.weight"};
+    });
     expect_flag({"--tensor-overrides", "blk\\.1\\..*_exps;blk\\.2\\..*_exps"}, [](const RunConfig & c) {
         return c.buft_overrides.size() == 2 && c.buft_overrides[1] == "blk\\.2\\..*_exps";
     });
@@ -217,7 +260,7 @@ int main() {
 
     // Flags the table must NOT claim: they belong to the front-end, not to a run's configuration.
     for (const char * f : {"-p", "--prompt", "--progress", "--session", "--csv", "--route-trace", "--compute-trace",
-                           "--compute-trace-layers", "--io-trace", "--ppl", "--list-archs", "--help", "--version"}) {
+                           "--compute-trace-layers", "--io-trace", "--ppl", "--help", "--version"}) {
         RunConfig c;
         check(!apply_flag(c, f, "x").matched, std::string("front-end flag ") + f + " is not in the table");
     }
@@ -278,11 +321,39 @@ int main() {
         expect_roundtrip("speculation + prefetch", c);
     }
     {
+        RunConfig c;
+        c.moe.enabled = true;
+        c.trial.threads = {6, 10};
+        c.trial.overlap = true;
+        c.trial.window_tokens = 4;
+        expect_roundtrip("knob trial", c);
+    }
+    expect_flag({"--trial-threads", "6,10"},
+                [](const RunConfig & c) { return c.trial.threads == std::vector<int>({6, 10}); });
+    expect_flag({"--trial-threads", "12"},
+                [](const RunConfig & c) { return c.trial.threads == std::vector<int>({12}); });
+    expect_flag({"--trial-overlap"}, [](const RunConfig & c) { return c.trial.overlap; });
+    expect_reject({"--trial-threads", "6,"});
+    expect_reject({"--trial-threads", "6,,8"});
+    expect_reject({"--trial-threads", "x"});
+    {
         // Deprecated switches parse but are never emitted.
         RunConfig c;
         c.moe.dense_weights = DenseWeightsMode::Mmap;
         const std::vector<std::string> args = to_args(c);
         check(join(args) == "--dense-weights mmap", "to_args prefers --dense-weights over the deprecated alias");
+    }
+    {
+        // A former spelling still parses, and is written back under the current one.
+        RunConfig c;
+        std::string err;
+        const ParamDesc * d = find_param("dense-weights");
+        check(d && d->set(c, "ahwb", err) && d->get(c) == "pinned",
+              "dense-weights: the former 'ahwb' reads as pinned and is written back as 'pinned'");
+        bool listed = false;
+        for (const ParamChoice & ch : d->choices)
+            listed = listed || ch.value == "ahwb";
+        check(!listed, "dense-weights: the former spelling is not offered as a choice");
     }
 
     // ── flag_spelling: what prose tells a person to type ─────────────────────────────
@@ -309,6 +380,31 @@ int main() {
         }
     }
 
+    // ── name_params: one engine message, a flag for the CLI and a label for a form ───
+    {
+        const std::string msg = "{ubatch} (4096) is wider than {ctx-size} (2048)";
+        check(name_params(msg, ParamNames::Flags) == "--ubatch (4096) is wider than --ctx-size (2048)",
+              "name_params renders flags");
+        check(name_params(msg, ParamNames::Labels) == "\"Batch width\" (4096) is wider than \"Context\" (2048)",
+              "name_params renders labels");
+        check(name_params("{overlap} needs {moe-stream}", ParamNames::Flags) == "--overlap needs --moe-stream",
+              "name_params names a switch-only row by its switch");
+        check(name_params("it needs {spec=mtp}", ParamNames::Flags) == "it needs --mtp",
+              "name_params spells a value as the switch that says it");
+        check(name_params("it needs {spec=mtp}", ParamNames::Labels) ==
+                  "it needs \"Speculative drafts\" set to MTP head",
+              "name_params shows a value by its choice label");
+        check(name_params("{cache-mb=auto}", ParamNames::Flags) == "--cache-mb auto",
+              "name_params spells a flag with its value");
+        check(name_params("{overlap=true}", ParamNames::Labels) == "\"Overlap I/O\" set to on",
+              "name_params shows a switch's value as on/off");
+        const std::string plain = "{\"a\":1} {no-such-knob} {ubatch";
+        check(name_params(plain, ParamNames::Flags) == plain && name_params(plain, ParamNames::Labels) == plain,
+              "name_params leaves braces that name no parameter untouched");
+        check(name_params("{{ubatch}}", ParamNames::Flags) == "{--ubatch}", "name_params finds a key inside braces");
+        check(name_params("", ParamNames::Labels).empty(), "name_params of nothing is nothing");
+    }
+
     // ── schema ───────────────────────────────────────────────────────────────────────
     {
         const std::string js = params_json(RunConfig{});
@@ -316,6 +412,15 @@ int main() {
         for (const ParamDesc & d : params())
             all &= js.find("\"key\":\"" + d.key + "\"") != std::string::npos;
         check(all, "params_json lists every key");
+        // Every group a form shows has a title and a line of help, and its place in the form is its
+        // own (`group_order`), not where its first row happens to sit in the table.
+        bool described = true;
+        for (const ParamDesc & d : params()) {
+            described &= *param_group_label(d.group) && *param_group_help(d.group);
+            described &= js.find("\"group_order\":" + std::to_string((int) d.group)) != std::string::npos;
+        }
+        check(described, "params_json gives every group a label, a help line and an order");
+        check(js.find("\"group_read_only\":true") != std::string::npos, "params_json marks a group a form only shows");
         RunConfig c;
         c.moe.cache_auto = true;
         check(params_json(c).find("\"default\":\"auto\"") != std::string::npos, "params_json takes caller defaults");

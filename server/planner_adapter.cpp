@@ -1,5 +1,7 @@
 #include "planner_adapter.h"
 
+#include "plan_view.h"
+
 #include "bmoe/params.h"
 
 #if defined(BMOE_HAVE_PLANNER)
@@ -37,12 +39,22 @@ int run_device_probe_child(const std::string & model_path, const std::string & d
 #endif
 }
 
-PlanOutcome make_plan(const RunConfig & cfg, const std::vector<std::string> & pinned, bool isolated_probes) {
+PlanOutcome make_plan(const RunConfig & cfg,
+                      const std::vector<std::string> & pinned,
+                      bool isolated_probes,
+                      const PlanStepFn & on_step,
+                      const RoutingTrace * routing,
+                      const std::vector<MeasuredKnobs> * knobs,
+                      bool measure_knobs) {
     PlanOutcome o;
 #if !defined(BMOE_HAVE_PLANNER)
+    (void) routing;
+    (void) knobs;
+    (void) measure_knobs;
     (void) cfg;
     (void) pinned;
     (void) isolated_probes;
+    (void) on_step;
     o.error = "this build does not include the automatic hardware planner";
     return o;
 #else
@@ -52,6 +64,7 @@ PlanOutcome make_plan(const RunConfig & cfg, const std::vector<std::string> & pi
     }
     PlanRequest req;
     req.pinned = pinned;
+    req.measure_knobs = measure_knobs;
 
     // The probe order is core's (probe_and_plan), the one bmoe-cli --auto runs. What the server
     // decides: the storage is measured, the headroom only ever estimated - never the intrusive
@@ -61,12 +74,18 @@ PlanOutcome make_plan(const RunConfig & cfg, const std::vector<std::string> & pi
     AutoPlanOptions opt;
     opt.probe_io = true;
     opt.probe_mem = false;
+    opt.routing = routing;
+    opt.knobs = knobs;
     if (isolated_probes) {
         const std::string model = cfg.model_path;
         opt.isolated_probe_args = [model](const std::string & dev) {
             return std::vector<std::string>{"--probe-device", dev, "-m", model};
         };
     }
+    if (on_step)
+        opt.on_step = [&on_step](const char * step, int index, int count) {
+            on_step(step, plan_step_label(step), index, count);
+        };
     const AutoPlan planned = probe_and_plan(cfg, req, opt);
     const HardwareProfile & hw = planned.hw;
     const Plan & plan = planned.plan;
@@ -93,10 +112,11 @@ PlanOutcome make_plan(const RunConfig & cfg, const std::vector<std::string> & pi
         for (const std::string & p : plan.config.buft_overrides)
             not_applicable.push_back("tensor override " + p);
     for (const Decision & d : plan.decisions)
-        o.decisions.push_back(
-            {{"knob", d.knob}, {"value", d.value}, {"source", source_name(d.source)}, {"reason", d.reason}});
+        o.decisions.push_back(decision_json(d));
 
     o.ok = true;
+    o.held_bytes = plan.allocation.ledger.held;
+    o.hardware = hardware_fingerprint(hw);
     o.body = json{{"available", true},
                   {"model", cfg.model_path},
                   {"machine", hw.label},
@@ -108,6 +128,8 @@ PlanOutcome make_plan(const RunConfig & cfg, const std::vector<std::string> & pi
                   {"args", args},
                   {"not_applicable", not_applicable},
                   {"explain", plan.explain()}};
+    // What a person reads first: the outcome, the memory, the devices (plan_view.h).
+    o.body.update(plan_view(hw, plan));
     return o;
 #endif
 }

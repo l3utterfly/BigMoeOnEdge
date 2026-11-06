@@ -36,6 +36,8 @@ by the gates. That is the streaming path itself; two opt-in knobs deliberately t
 speed on top of it — `--n-expert-used` (fewer experts per token) and
 [`--drop-cold-experts`](expert-dropping.md) (skip an expert that would cost a read and was barely
 weighted). Both are off unless asked for, which is what keeps the sentence above true by default.
+The KV cache is `q8_0` by default (`--cache-type-k` / `--cache-type-v`): that changes the output
+against llama.cpp's `f16`, for streamed and resident runs alike, and not what streaming produces.
 
 ## Residency modes
 
@@ -83,11 +85,14 @@ policy — a dense set left mmap'd under `mmap` or `warm`, a table held back as 
 no name-based accounting could have found. Run with `--dense-weights mmap` and the engine reports the
 count and stands down.
 
-On Windows the run ends with `warning: UnmapViewOfFile failed`, printed by llama.cpp rather than
-by the engine. That is the designed outcome, not a defect: llama.cpp is not patched and still
-believes it owns the mapping, so at teardown it unmaps a base the engine has already released. An
-inert reservation is left in that range precisely so the call finds a placeholder and fails
-harmlessly, instead of finding whatever was allocated there next.
+llama.cpp is not patched and still believes it owns the mapping, so at teardown it unmaps a base
+the engine has already released and closes a handle the engine has already closed. Both are made
+to land on placeholders: the released range is re-occupied by a view of an empty, uncommitted
+pagefile section, which llama.cpp's `UnmapViewOfFile` then releases successfully (as its `munmap`
+releases the anonymous placeholder on POSIX), and the section's handle slot by an inert event its
+`CloseHandle` closes. Neither call can reach whatever was allocated in that range or slot next,
+and neither prints a warning. Where the range cannot be mapped at its base, a plain reservation
+holds it instead, and that run alone ends with llama.cpp's harmless `UnmapViewOfFile failed`.
 
 It is still opt-in, because the check answers for the pointers the capture pass saw and for no
 others. A graph shape this session never builds could hold another one, and llama.cpp exposes no way
@@ -111,7 +116,8 @@ The engine loads with `use_extra_bufts=false`; this is load-bearing, not a tunin
 
 ## Assumptions to re-check on a submodule bump
 
-- The routing node is named `ffn_moe_topk-<il>` and the expert tensors
-  `blk.<il>.ffn_{gate,up,down}_exps.weight`. The recipe isolates these names.
+- The routing node is named `ffn_moe_topk-<il>`. The expert tensors are not assumed by name: they
+  are the block weights with three dimensions indexed by the declared expert count
+  (`bmoe/expert_layout.h`), which is how llama.cpp shapes every `mul_mat_id` weight.
 - The eval-callback fires per decode (not skipped by graph reuse) and computes a
   marked node alone before the non-ask callback. The gates catch a regression here.

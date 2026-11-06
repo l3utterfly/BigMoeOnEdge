@@ -20,7 +20,9 @@ BMOE_PROGRESS {"step":<int>,"steps":<int>,"wall_ms":<float>,"io_ms":<float>,
 - `BMOE_PROGRESS.step`/`steps` are 1-based index and target token counts.
 - `read_mb` is the flash bytes read this token; `stall_ms` is the overlap-only wall time compute
   lost to reads (0 in serial mode).
-- `wall_ms` = total token time; `io_ms` = flash read time. `compute_ms` is a **residual, not a
+- `wall_ms` = total token time, closed only once the device backends have finished the token
+  (`llama_synchronize`), so a layer computed on a GPU is in it rather than in `loop_overhead_ms`;
+  `io_ms` = flash read time. `compute_ms` is a **residual, not a
   measured quantity**: no clock runs around llama.cpp's matmul kernels in a normal run, so compute
   is whatever wall time is left after the measured terms are subtracted — `wall_ms − io_ms −
   mgmt_ms` in serial, `wall_ms − stall_ms − mgmt_ms` under overlap. When that residual is the
@@ -93,12 +95,14 @@ BMOE_PROGRESS {"step":<int>,"steps":<int>,"wall_ms":<float>,"io_ms":<float>,
   re-faulted from flash *inside* the decode, i.e. a >RAM residency stall masquerading as compute.
   `cpu_ms` is CPU time summed across all threads; compare it to `wall_ms × threads` for occupancy —
   near 100% is genuinely compute-bound, well below means the cores were throttled, preempted, or
-  blocked (a low-clock frequency cap or a co-resident process), not doing more math. Both are `0`
-  when the platform can't report them (the Windows host build); treat `0` as "unmeasured".
+  blocked (a low-clock frequency cap or a co-resident process), not doing more math. `majflt` is `0`
+  where the platform publishes no per-process count of hard faults (Windows), and the summary's
+  `majflt_tok` is `-1` there so it never reads as "no faults"; `cpu_ms` is measured everywhere.
 - `dense_resident_frac` is the sampled fraction of the DENSE (non-expert) weights still in RAM (by
   `mincore`, throttled). Under `--dense-weights anon` it samples our own buffers (is zram holding
-  them?); under mmap/warm the model's mmap (is the kernel dropping it?). A diagnostic read alongside
-  `majflt` — nothing acts on it. `-1` when unmeasured.
+  them?); under mmap/warm the model's mmap, at the addresses llama.cpp mapped each tensor at (is the
+  kernel dropping it?), so it reads the same on every platform, iOS and Windows included. A
+  diagnostic read alongside `majflt` — nothing acts on it. `-1` when unmeasured.
 - `delta_text` is the newly generated **answer** text since the previous `BMOE_PROGRESS` line,
   JSON-escaped, with any reasoning span stripped out. The reader appends it to what this
   generation already delivered. (Carrying the cumulative answer on every line made a generation of
@@ -120,21 +124,21 @@ BMOE_PROGRESS {"step":<int>,"steps":<int>,"wall_ms":<float>,"io_ms":<float>,
 === perf ===
 generation: <n> tokens, <s> s/token (<t> tok/s)
 compute: <pct>% CPU occupancy (<c> cpu-s/token over <n> threads), <f> major faults/token
-mode: expert streaming, cache <auto|<n> MiB|off>, dense <mmap|warm|anon|ahwb>[, overlap]
+mode: expert streaming, cache <auto|<n> MiB|off>, dense <mmap|warm|anon|pinned>[, overlap]
 moe-stream: read <mib> MiB (<mib/tok> MiB/token), decode <s> s/token (compute <c> + cache mgmt <m> + flash I/O <i> s/token, <bw> MiB/s)
 moe-cache: <pct>% hit, resident <mib> MiB
 ```
 
 The `mode:` line is printed on every run, streaming or not, and is the first thing to read: without
 `--moe-stream` the engine is plain llama.cpp on mmap and every `moe-*` line below is absent, so a
-report missing them is a baseline and not a measurement of this engine. On a MoE architecture the
-build has a recipe for, that case names the flag; on any other model it says the architecture is not
-one this build streams.
+report missing them is a baseline and not a measurement of this engine. On a file that declares
+routed experts, that case names the flag; on a dense model it says so.
 
 The `compute:` line decomposes the residual: low CPU occupancy points at a throttled/preempted
 core (a frequency cap, a co-resident process) rather than heavy math, and non-zero major
-faults/token means dense weights were re-faulting from flash inside the decode. It is omitted on
-platforms that can't measure it (the Windows host build).
+faults/token means dense weights were re-faulting from flash inside the decode. Where the platform
+counts no hard faults (Windows) the line says so instead of printing a 0; read
+`dense_resident_frac` there.
 
 `compute` in the `moe-stream:` line is the same residual described for `compute_ms` above; `cache
 mgmt` is the per-token mean of `mgmt_ms`.
@@ -262,13 +266,14 @@ prints just the summary lines.
 ```
 # bmoe_metrics v2
 # engine=<ver>
+# cache_type_k=<f16|bf16|f32|q8_0|q5_1|q5_0|q4_1|q4_0|iq4_nl> cache_type_v=<same>
 # model=<file> arch=<arch> n_layer=<n> n_expert=<n> n_expert_used=<k> threads=<n>
   n_ctx=<n> n_ubatch=<n> chatml=<0|1>
 # moe_stream=<0|1> cache_mb=<n> cache_auto=<0|1> cache_floor_mb=<n> cache_ceil_mb=<n>
   cache_cycle_mb=<n> force_cache=<0|1> load_all=<0|1> io_threads=<n> o_direct=<0|1>
   overlap=<0|1> io_two_wave=<0|1> prefetch=<n>
   route_ahead=<n> predict_prefetch=<0|1> predict_log=<0|1> predict_spec_max=<n> prefetch_sync=<0|1>
-  dense_weights=<mmap|warm|anon|ahwb> drop_cold_frac=<f> drop_renorm=<0|1> drop_prefill=<0|1>
+  dense_weights=<mmap|warm|anon|pinned> drop_cold_frac=<f> drop_renorm=<0|1> drop_prefill=<0|1>
   substitute_lambda=<f>
 # temp=<f> top_k=<n> top_p=<f> seed=<u> compute_trace_layers=<n> spec=<off|mtp|ngram>
   spec_draft_max=<n> mtp_p_min=<f> ngram_min_match=<n>
@@ -282,7 +287,8 @@ know.
 
 Values are the **resolved** configuration, not what was typed — `cache_mb` is what the streamer
 settled on, which under `--cache-mb auto` is a number no flag mentioned, and `n_expert_used` is the
-effective top-k after any override. Fields to read carefully:
+effective top-k after any override. `dense_weights=pinned` was written `ahwb` in earlier releases; a
+parser that compares runs across that release reads both as the same mode. Fields to read carefully:
 
 - `engine` is the version that produced the rows (`bmoe-cli --version`), so a committed file still
   names its build after the checkout has moved on. `unknown` if the build did not define it. It sits
@@ -326,7 +332,7 @@ next to the `turn` column.
 step,steps,wall_ms,io_ms,compute_ms,read_bytes,cache_hit_pct,stall_ms,mgmt_ms,majflt,cpu_ms,
 dense_resident_frac,turn,majflt_mib,cache_budget_mib,rss_mib,rss_anon_mib,rss_file_mib,swap_mib,
 mem_available_mib,mem_free_mib,swap_free_mib,loop_overhead_ms,mtp_batch,mtp_draft_ms,drain_ms,
-adopt_ms,ra_issue_ms,ra_wd_ms
+adopt_ms,ra_issue_ms,ra_wd_ms,process_footprint_mib,process_headroom_mib
 ```
 
 `stall_ms`, `mgmt_ms`, `majflt`, `cpu_ms` and `dense_resident_frac` are trailing columns appended
@@ -381,10 +387,10 @@ The trailing block is the memory picture, added so a run can be diagnosed from i
 | `cache_budget_mib` | the expert-cache budget in effect. Fixed for the run (an explicit `--cache-mb`, or what `auto` sized to once at load) — the runtime governor that moved it is retired — with one exception: where the platform grants locks and stops part way, the budget shrinks once to what was locked, never under one token cycle, and `cache_resizes` counts it. |
 | `rss_anon_mib` | resident anonymous memory — **the expert cache lives here** (and, under `--dense-weights anon`, the dense buffers). Falling while `cache_budget_mib` stays put means the kernel is taking it. |
 | `rss_file_mib` | resident file-backed memory — the mmap'd model. Reclaimed by being dropped, not swapped, so it never shows in `swap_mib`. |
-| `dense_resident_frac` | fraction of the DENSE (non-expert) weights still in RAM, by `mincore` (throttled). Under `--dense-weights anon` it samples our own buffers — is zram holding them? Under mmap/warm the model's VMAs (`/proc/self/maps`) — is the kernel dropping the model? Read with `majflt`. `-1` when unmeasured. |
-| `swap_mib` | anonymous memory already lost to zram (`VmSwap`). |
-| `rss_mib` | total resident (`VmRSS`). |
-| `mem_available_mib` / `mem_free_mib` / `swap_free_mib` | what the device claims about itself. `MemAvailable` counts this process's own mmap'd weights as reclaimable, so it over-states headroom — it is recorded next to what we measured ourselves because the gap between them is the story. |
+| `dense_resident_frac` | fraction of the DENSE (non-expert) weights still in RAM, by `mincore` (throttled). Under `--dense-weights anon` it samples our own buffers — is zram holding them? Under mmap/warm the model's mapping, at each tensor's own address — is the kernel dropping the model? Read with `majflt`. `-1` when unmeasured. |
+| `swap_mib` | Linux/Android `VmSwap`, including zram where used; on Apple, the task's `compressed` accounting. See the platform distinction below. |
+| `rss_mib` | total resident memory (`VmRSS` on Linux/Android, task `resident_size` on Apple). |
+| `mem_available_mib` / `mem_free_mib` / `swap_free_mib` | the system's availability, free-memory and swap estimates, not the app's remaining allowance. Linux/Android `MemAvailable` counts this process's own mmap'd weights as reclaimable, so it can overstate headroom for keeping those weights resident. |
 | `loop_overhead_ms` | wall time between the **previous** token's decode and this one's: sampling, detokenization, rendering the answer for a UI, and the sink writes. On the first token, the gap from the end of prefill to the first decode. |
 | `mtp_batch` | how many tokens the decode that produced this row confirmed. `1` without speculation. A verify decode confirms a whole group and its **entire** cost — `wall_ms`, `io_ms`, `majflt`, `cpu_ms`, `read_bytes`, `loop_overhead_ms` — is charged to the group's FIRST row; the rest carry zeros. Without this column those zeros read as free tokens. Per-token cost of a group is the first row's `wall_ms / mtp_batch`. |
 | `mtp_draft_ms` | time this group spent drafting and catching the draft context up — everything speculation adds **outside** the decode. A slice of `loop_overhead_ms`, not an addition to it. `0` without speculation, and near-zero under `--ngram`, whose drafting is a scan of the token history rather than a decode. This is the column that makes the price of speculation measurable instead of inferable: `wall_ms` never contained it, and neither does `tok/s`. |
@@ -392,8 +398,53 @@ The trailing block is the memory picture, added so a run can be diagnosed from i
 | `adopt_ms` | route-ahead only: the load waiting for its own committed speculative reads to complete before staging (adoption). Part of `mgmt_ms`. |
 | `ra_issue_ms` | route-ahead only: eval-thread time issuing the committed selection's early reads (settle, residency split, retain, prefetch — page commits included). Part of `compute_ms`. |
 | `ra_wd_ms` | route-ahead only: the sampled fresh-gate watchdog's exact float GEMV on the eval thread. Part of `compute_ms`. |
+| `process_footprint_mib` | the process's dirty-memory ledger charge, from Apple's `TASK_VM_INFO.phys_footprint`. This includes accounting for compressed memory and is distinct from RSS, virtual reservations and the system's free memory. `-1` when unavailable. |
+| `process_headroom_mib` | the current dirty-memory limit remainder reported by `os_proc_available_memory()` for a physical iOS app process. A measured `0` is preserved; `-1` means unavailable, including macOS, the simulator, Linux and Windows, where this adapter has no exact equivalent. |
 
-All are `0` where the platform cannot report them (the Windows host build reports device memory but not the per-process split).
+The two process-accounting columns are appended to the existing header. They use `-1` for unknown,
+independently of the older memory fields, which retain their existing `0` convention where the
+platform cannot report them (the Windows host build reports device memory but not the per-process
+split). They are CSV diagnostics; the `BMOE_PROGRESS` protocol is unchanged.
+
+On Apple platforms, `swap_mib` is the task's `compressed` accounting, not disk swap or a measurement
+of the physical bytes held by the compressor. On Linux and Android it remains `VmSwap`, which can
+include zram. Neither `rss_mib + swap_mib` nor a virtual compute-buffer reservation is a substitute
+for `process_footprint_mib`. The Apple adapter reads footprint only when `task_info` succeeds and
+its returned count covers `TASK_VM_INFO_REV1_COUNT`; a shorter response leaves the field unknown.
+
+Process headroom is sampled directly, without falling back to system availability when the result
+is zero. Apple's API also returns zero for a process that is not an app, so zero alone does not
+establish that an arbitrary iOS process has a memory limit. Its interpretation here applies to the
+physical iOS app harness. The allowance can change during the app's lifetime, and a positive
+remainder does not promise that the system can sustain that allocation without memory pressure.
+Footprint and headroom are sampled separately; their sum is only an approximate view of the
+current limit, not a fixed capacity or an allocation guarantee.
+
+Memory is sampled after decode, outside its timing bracket. These rows miss temporary peaks
+inside a decode and all allocations before the first token. Additional sampling may add loop
+overhead even though it is excluded from `wall_ms` and the reported decode `tok/s`. The readings
+are observational: they do not resize the cache or change the planner's budget or policy.
+
+### Memory phase diagnostics
+
+The engine also sends Info-level memory snapshots through its existing log sink, so an app or
+server receives them wherever it already receives engine diagnostics. They are diagnostic lines,
+not additions to the `BMOE_*` protocol. The phase names identify the sampling points:
+
+- `auto-probe-begin`, before backend registration and probing;
+- `auto-hardware`, `auto-device-support`, `auto-bandwidth`, `auto-device-costs`, `auto-storage`
+  and `auto-headroom`, after the corresponding probe stages;
+- `auto-probe-end`, after placement probing, before the pure planning rules run;
+- `model-loaded`, after the model load;
+- `session-ready`, after context creation, streaming binding and prefill setup.
+
+Each snapshot reports `process_footprint_mib`, `process_headroom_mib`, `rss_mib`,
+`compressed_or_swap_mib` and `system_available_mib`. Every unavailable value in these diagnostic
+lines is `-1`; a measured zero remains zero. `compressed_or_swap_mib` carries the same
+platform-specific accounting as the CSV's `swap_mib`, and `system_available_mib` is the system
+estimate rather than the app's remaining allowance. Comparing `model-loaded` with `session-ready`
+helps separate model loading from later context, dense-buffer and cache allocations. These are
+snapshots, not peak measurements, and the extra observations do not feed planning decisions.
 
 ### What `tok/s` does not include
 
@@ -492,6 +543,64 @@ Real traces from Qwen3-30B-A3B, Gemma-4-26B-A4B and gpt-oss-120b on device, with
 support, are archived in
 [bench-data/2026-07-15-route-trace/](bench-data/2026-07-15-route-trace/findings.md).
 
+A route trace also prices a plan: `bmoe::parse_routing_trace` reads one into the planner's routing
+record, rebuilding its cache requests the way `scripts/route-replay.py` does.
+
+## Routing record
+
+Not a trace and not opt-in: a streamed session keeps the experts each MoE layer asked the cache for
+during its first tokens (`--routing-record N`, default 256 decoded tokens and the last 256 of the
+prompt; `0` is off), for the planner to read the model's hit curve from
+([hardware-planning.md](hardware-planning.md#the-cache-priced-on-the-models-own-routing)). It asks
+the graph for nothing, so a run with it is a benchmark run. `bmoe-cli --routing-dir DIR` and
+`bmoe-server` (under `routing/` in its data folder) keep it as one text file per model,
+`<fingerprint>.routing`:
+
+```
+# bmoe routing v1
+# n_layer=<int> n_expert=<int> n_expert_used=<int> prefill_tokens=<int> decode_tokens=<int>
+# layer=<int> expert_bytes=<int>                           (one per block with streamed experts)
+p <layer> <expert> <expert> ...                            (a prompt chunk's request, token-major)
+d <layer> <expert> ...                                     (a decoded token's request)
+```
+
+One line is one request to the expert cache, in the order the engine made them: what a block
+routed for one llama_decode, every token of a prompt chunk on one line. Replayed through an LRU of
+the run's budget, the record gives the hit rate the run measured (gate `G2r`).
+
+`BMOE_DONE`'s `cache_hit_pct` stays the cumulative figure. The decode-only one is what the CLI's
+`plan: predicted ...` line and `bmoe-server`'s `/api/plan` `measured.cache_hit_pct` now set against
+the plan's credited hit rate, since that is the figure a decoded token is priced with.
+
+## Knob trial
+
+With `--trial-threads` or `--trial-overlap` (which `--auto` sets when the verdict is kept;
+[hardware-planning.md](hardware-planning.md#lossless-knobs-measured-on-the-first-answer)), the first
+answer's decode alternates the knob between timed windows, and the engine logs what it did:
+
+```
+bmoe: knob trial: the cache has settled; measuring the decode thread count
+bmoe: knob trial: <n> decode threads (against <n>): decoded <pct>% faster in the median of <r> rounds
+bmoe: knob trial: <n> decode threads (against <n>): held: the best candidate was <+pct>% in the median of <r> rounds, inside the 10% margin
+bmoe: knob trial: overlap <on|off> (against <on|off>): ...
+```
+
+Per-token metrics during the trial are of the setting each token ran under: when overlap switches,
+`io_ms` changes meaning with it (wall blocked serially, lane busy time under overlap, as above) and
+the cursor it is taken against moves to the new counter, so no token straddles the two. The `mode:`
+line and the CSV preamble's `threads=` and `overlap=` are the session's settings at load. The verdict
+(`Session::measured_knobs()`) is kept beside the routing record as `<fingerprint>.knobs`, one line per
+machine and engine:
+
+```
+bmoe-measured-knobs 1
+hardware=<16 hex> engine=<version> threads=<n> threads_tried=<incumbent,candidates> threads_gain=<f>
+  overlap=<-1|0|1> overlap_incumbent=<-1|0|1> overlap_gain=<f> rounds=<n>      (one line)
+```
+
+`threads=0` and `overlap=-1` mean not measured. A key the reader does not know is skipped, so a later
+engine may add one.
+
 ## Session mode
 
 With `--session`, `bmoe-cli` keeps the model loaded and the expert cache warm across prompts
@@ -549,8 +658,11 @@ BMOE_ERROR {"id":<int>,"fatal":<bool>,"code":"<string>","msg":"<string>"}
 are the engine's failure kinds (`core/include/bmoe/run_error.h`): `context_full` (the conversation
 leaves no room in `n_ctx`), `empty_prompt`, `template_rejected` (the chat template refused the
 message list), `needs_chat_mode` (a message list to a session opened without the chat template),
-`invalid_request` (a malformed decide request, or decide off) and `failed` (a load, decode or
-expert-stream failure). Every code but `failed` comes with `fatal:false`.
+`invalid_request` (a malformed request, or decide off), `invalid_output` (a structured answer
+could not satisfy its grammar or failed final JSON validation, and the turn was rolled back)
+and `failed` (a load, decode or expert-stream failure).
+Every code but `failed` comes with `fatal:false`; invalid output can be retried without reloading
+the model.
 
 A `decide` request is answered by `BMOE_BEGIN` and then one `BMOE_DECIDE` line, with no per-token
 lines in between: nothing is decoded ([decide.md](decide.md)). `choice_logp[i]` is the log-probability

@@ -24,15 +24,27 @@ and per-generation callback lifetimes.
 We use both phases:
 
 **Capture phase** (one warm-up decode). `ask` is called for every node, so we scan each
-node's `src[]` for expert weight tensors (`blk.<il>.<suffix>.weight`, where the suffixes
-come from the arch's recipe — `ffn_{gate,up,down}_exps` for the split layout, a fused
-`ffn_gate_up_exps` for others) and record the live `ggml_tensor*`. We return false
+node's `src[]` for expert weight tensors (`blk.<il>.<suffix>.weight`, where the suffixes are
+the file's own: its 3-D block weights indexed by its expert count, read before the load —
+`ffn_{gate,up,down}_exps` in the split layout, a fused `ffn_gate_up_exps` in others) and record
+the live `ggml_tensor*`. We return false
 throughout — capture observes, it does not isolate. `ggml_tensor` is a public struct, so
 reading `->name`, `->ne`, `->nb` and writing `->data` is public API surface.
 
 **Stream phase** (real generation). We return true for `ffn_moe_topk-<il>`. The
 non-ask callback then hands us that node with the selected expert ids materialized; we
 gather them (stride-aware) and trigger the slice reads.
+
+Materialized does not mean readable in place. On a layer placed on a device with memory of its own
+(a discrete GPU) the routing node lives in that memory and `->data` is the device's address, so
+the ids are copied out with `ggml_backend_tensor_get`, which is valid there because the scheduler
+synchronizes the split's backend before the observing callback. Whether to copy is asked of the
+node's buffer (`ggml_backend_buffer_is_host`), never of the backend's name; unified memory reads
+as host and takes the direct read. The jobs below that read the router's inputs or rewrite its
+output act only on a node in host memory, and a device layer keeps the router's own choice.
+Gate G20 holds this path: the loopback RPC device, whose buffers are not host memory, takes every
+layer's dense part while the experts stream, serial and under `--overlap`. Before the copy existed
+the overlap half hung on every run, waiting for an expert the hook had never been asked for.
 
 Two optional jobs ask for more: the route trace and
 [cache-aware dropping](expert-dropping.md) also want each layer's `ffn_moe_weights*-<il>` chain,
@@ -70,8 +82,22 @@ CPU MoE kernel invokes.
 
 ```c
 // ggml-cpu.h
-void ggml_cpu_set_expert_ready_hook(ggml_expert_ready_hook_t hook, void * user_data);
+void ggml_cpu_set_expert_ready_hook(ggml_cpu_expert_ready_hook_t hook, void * user_data);
+// and the same setter from the CPU backend's registry, by name:
+ggml_backend_reg_get_proc_address(cpu_reg,
+                                  "ggml_cpu_set_expert_ready_hook");
 ```
+
+The engine never links the symbol: it asks the CPU backend's registry for it at run time, the
+way ggml exposes every other backend-specific function (threads, NUMA, the abort callback). That
+is what lets the CPU backend be a module loaded from beside the executable, which is how every
+release is built (`BMOE_BACKEND_MODULES`), and what lets a build on stock upstream run: the
+registry answers null, `expert_ready_hook_available()` says so, and `--overlap` is refused with
+the reason instead of failing to link. The gates that prove `--overlap` byte-identical (G4, G5b,
+S2) skip themselves on such a build, and the build whose job is to prove it passes
+`-DBMOE_GATES_REQUIRE_HOOK=ON`, under which a missing hook is a failure: whether the CPU module a
+build loads carries the hook is decided at run time now, and a bump or a stripped module must not
+be able to retire those gates quietly.
 
 `ggml_compute_forward_mul_mat_id` calls the hook at the top of its per-expert loop, right
 after the "expert not routed this token" skip, before it consumes that expert's weight
@@ -87,11 +113,11 @@ and it can only fire *before* the expert matmuls of a layer run — it cannot pa
 through them. Overlapping expert reads with expert compute requires a per-expert wait point
 *inside* the kernel, which the public API does not provide. Hence the extension.
 
-**Graceful degradation.** CMake probes `ggml-cpu.h` for the hook symbol and, when present,
-defines `BMOE_HAVE_EXPERT_READY_HOOK`. Built against stock upstream (symbol absent) the
-whole project still compiles and runs — the serial streaming path is unchanged; only
-`--overlap` is affected, and it fails with a clear runtime error instead of silently
-falling back.
+**Graceful degradation.** Nothing is detected at configure time. Built against stock upstream
+the whole project compiles and runs - the serial streaming path is unchanged; only `--overlap`
+is affected, and it fails with a clear runtime error instead of silently falling back. The
+server's default for overlap and the `overlap_available` it reports are read from the backend
+that loaded, not from a build flag.
 
 **Sunset condition.** This fork exists *solely* for this one hook. The moment upstream
 ships an equivalent per-expert readiness/residency callback, the branch is dropped and the
@@ -101,17 +127,29 @@ point is public, not a divergence we intend to maintain.
 ## The chat glue: llama.cpp `common` (not the streaming seam)
 
 Separate from the two streaming hooks above, `session.cpp` links llama.cpp's `common`
-library for two things: rendering the model's own chat template and parsing reasoning output, and
-(with `--mtp`) driving speculative decoding.
+library for rendering the model's own chat template and parsing reasoning output, driving
+speculative decoding (with `--mtp`), and applying request-level JSON schemas through the
+chat template.
 `common_chat_templates_init` / `common_chat_templates_apply` run the real Jinja template the
 gguf ships (so Gemma's channel format, Qwen ChatML, etc. all format correctly, driven by the
 model rather than hardcoded), and `common_chat_parse` extracts a reasoning model's thinking so
 it can be reported apart from the answer. The parser-params wiring lives in its own translation
-unit, `chat_parse.cpp` — the PEG parser arena has to be loaded explicitly or `common_chat_parse`
-throws on the first token, which is how issue #49 stayed invisible; keeping it separate makes
+unit, `chat_parse.cpp` — the PEG parser arena has to be copied across explicitly, or `common_chat_parse`
+falls back to a content-only parser (it threw on the first token before the 2026-10-18 base), which is how issue #49 stayed invisible; keeping it separate makes
 that seam unit-testable without a model.
 
 A second translation unit, `thinking_control.cpp`, crosses the same boundary for "thinking off".
+
+**Images: llama.cpp's `mtmd`.** `media_input.cpp` is the one file that includes `tools/mtmd`'s
+public headers (`mtmd.h`, `mtmd-helper.h`), the library behind `llama-mtmd-cli` and the upstream
+server's image input. It opens the projector (`mtmd_init_from_file`, on a device of the registry
+when there is one), tokenizes a prompt with its images into text and image chunks
+(`mtmd_tokenize`), encodes an image (`mtmd_encode_chunk`) and hands its embeddings back as
+`llama_batch_ext` batches with the positions the projector gives them (2-D under M-RoPE), which the
+session decodes through its own placed decode, so the arena, the prefill device and the route trace
+see an image's graphs as they see a text batch's. The library is built through upstream's own
+`LLAMA_BUILD_MTMD` hook, as a library of its own (`libmtmd`), and nothing in it is patched. Like
+`common`, it is not a stable API: a submodule bump re-reads these calls.
 `enable_thinking` is only a *request* to the template, and many templates never read it, so the
 engine renders the template to find out (three renders at open, no model names involved) and, where
 the flag is inert *and* reasoning is a structural section of the format, asks for a **continuation**
@@ -126,6 +164,33 @@ suggestion it can decline (LFM2.5 does), while a model that declares none separa
 structurally and cannot. Both facts come from the loaded model, never from its name.
 `tests/think_control_test.cpp` pins all of it against the vendored templates, again with no model.
 
+### Request-local output constraints
+
+The server maps `response_format` and the top-level `json_schema` field to a serialized schema
+on the generation request. `session.cpp` passes it to
+`common_chat_templates_inputs::json_schema`. `common_chat_templates_apply` builds the grammar
+and parser rule together, including the template's reasoning structure. The returned
+`common_chat_params::grammar` is applied by the existing `detail::ToolGrammar` in
+`chat_parse.cpp`; non-lazy grammars receive the generation prompt before the first generated
+token. Speculative acceptance also checks that grammar before accepting a drafted token.
+
+This shares the template and sampling path used for tools. No code calls the JSON-to-grammar
+converter directly, no second grammar sampler competes with the template's grammar, and the
+request does not change the session's sampling configuration. Each turn creates its own
+constraint state, so a following ordinary request is unaffected. The completed answer is
+validated after chat parsing, with reasoning kept separate; schema compilation and supported
+keywords belong to the pinned upstream implementation. Final validation checks JSON syntax,
+not the full schema. Length limits and cancellation preserve partial output and their finish
+reason. The integration changes neither upstream code nor the streamed-weight layout.
+
+### Context checkpoints
+
+`context_checkpoints.cpp` keeps its checkpoints in `common_prompt_checkpoint`, the type llama.cpp's
+server keeps them in, and copies them with its `update_tgt` / `load_tgt` helpers, which call the public
+`llama_state_seq_*_ext` functions with `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`. The restore rule (how far
+back a checkpoint may reach under a sliding window) is the server's, and the MTP driver's own state is
+saved beside it with `common_speculative_get_state`, as the server does. See [session.md](session.md).
+
 ### Speculative decoding
 
 Only the MTP source crosses into `common`. The verify half of the loop — the wide batch, the argmax
@@ -139,6 +204,9 @@ and no native backend (`tests/ngram_test.cpp`). See [ngram.md](ngram.md).
 includes only `llama.h` and `common.h`. The draft/verify orchestration — running the trained MTP
 head, moving hidden states from the target to it, seeding the next draft from the accepted position
 — is entirely upstream's; the engine supplies the loop around it and the two contexts it works on.
+The driver reads its own mirror of a batch's entries (`common_batch`), not the `llama_batch` the
+engine decodes, so the engine copies each batch it hands to `common_speculative_process` into one
+(`to_common_batch` in `session.cpp`): the decode itself stays on the public API.
 Worth stating explicitly because the internals it needs (`llama_set_embeddings_nextn` and the
 `nextn` hidden-state getters) live in `src/llama-ext.h`, a *staging* header: they are used **inside**
 `speculative.cpp`, which is already compiled into the `llama-common` the engine links, so nothing in
@@ -163,7 +231,7 @@ unaffected by this dependency.
 
 ### The capacity fitter: `common/fit.h`
 
-The third and newest consumer of `common` is the hardware planner's first stage. `--auto` calls
+Another consumer of `common` is the hardware planner's first stage. `--auto` calls
 `common_fit_params` — llama.cpp's own capacity fitter, the one behind its `--fit` flag — to place
 weights across the registered devices by projected memory, and reads back which layers kept their
 routed experts on the host and what the placed model reserves there for context and compute. That
@@ -263,18 +331,19 @@ Either way the gates are the enforcement. The fragility is not the public
 API but the *internal naming conventions* the seam attaches to — the tensor suffixes and
 the `ffn_moe_topk` node name are how llama.cpp happens to build MoE graphs today, not a
 guaranteed contract, so upstream can rename or restructure them (Gemma 4's fused
-`ffn_gate_up_exps` is one such evolution we absorbed with a recipe row). The gates are the
-enforcement: a rename breaks byte-identity before merge instead of silently corrupting
-output. Each supported architecture adds one more gate to keep green across a bump.
+`ffn_gate_up_exps` is one such evolution, absorbed with no change since the layout is read off
+the file's shapes). The gates are the enforcement: a rename breaks byte-identity before merge
+instead of silently corrupting output. Each expert layout has a gate to keep green across a bump.
 
 If a future release moves the two hooks (a stable expert-residency API, say) upstream,
 this seam shrinks further or disappears — `core/` does not change.
 
 Pinned submodule at the time of writing: `Helldez/llama.cpp` branch
-`bmoe/expert-ready-hook-2609`, commit `dce9698`: the single expert-ready-hook commit
-(section 3) on top of upstream `ggml-org/llama.cpp` master `965f897` of 2026-09-26 (530 commits
-past `b10666`). On this base upstream's CPU `mul_mat_id` has a tiled path that reads an expert
-before the classic loop does, so the hook fires ahead of it; G4 is what proves it still gates
-every read. Each bump gets its own fork branch and the
+`bmoe/expert-ready-hook-0411`, commit `7ac98f4`: the single expert-ready-hook commit
+(section 3), in the variant that also answers the CPU registry's `get_proc_address` so a build that
+loads the CPU backend as a module reaches it, on top of upstream `ggml-org/llama.cpp` tag
+`v0.9.0` (`cd959ba` of 2026-11-04, 164 commits past the previous base, `8ca4060` of 2026-10-28).
+The hook still fires ahead of upstream's tiled `mul_mat_id` path, which G4 proves. Each bump gets
+its own fork branch and the
 previous ones stay, so every commit an old pin names remains reachable (see `.gitmodules` /
 `git submodule status` for the current pin).

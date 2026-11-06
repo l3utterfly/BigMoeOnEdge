@@ -26,17 +26,62 @@ class ParamsAndConversationsTest {
     )
 
     @Test
-    fun groupsKeepTheTablesOrderAndLevelsFilter() {
+    fun groupsKeepTheTablesOrder() {
         val specs = ParamSpec.parse(table)
         val groups = ParamSpec.grouped(specs)
         assertEquals(listOf("Expert cache", "Dense weights"), groups.map { it.first })
         assertEquals(listOf("cache-mb", "overlap"), groups[0].second.map { it.key })
-        assertTrue(ParamSpec.visible("basic", "basic"))
-        assertTrue(!ParamSpec.visible("advanced", "basic"))
-        assertTrue(ParamSpec.visible("advanced", "experimental"))
         assertEquals(listOf("anon" to "Anon", "mmap" to "Mmap"), specs[2].choices)
         assertEquals("MiB", specs[0].unit)
+        // A table without "form" offers its basic rows to a form.
+        assertEquals(listOf(true, false, true), specs.map { it.form })
         assertTrue(specs[0].acceptsAuto)
+    }
+
+    @Test
+    fun groupsFollowTheTablesGroupOrderWhenItIsSent() {
+        val specs = ParamSpec.parse(
+            JSONArray(
+                """[
+                  {"key":"a","group":"late","group_label":"Late","group_order":2},
+                  {"key":"b","group":"early","group_label":"Early","group_order":0},
+                  {"key":"c","group":"late","group_label":"Late","group_order":2},
+                  {"key":"d","group":"unordered","group_label":"Unordered"}
+                ]""",
+            ),
+        )
+        val groups = ParamSpec.grouped(specs)
+        assertEquals(listOf("Early", "Late", "Unordered"), groups.map { it.first })
+        assertEquals(listOf("a", "c"), groups[1].second.map { it.key })
+    }
+
+    @Test
+    fun specialValuesTypicalRangeAndAdvancedRows() {
+        val row = ParamSpec.of(
+            org.json.JSONObject(
+                """{"key":"io-threads","label":"Read lanes","type":"int","group":"streaming","group_label":"Streaming",
+                    "level":"advanced","scope":"session","help":"Parallel expert-read lanes, including the calling thread. 1 is the serial baseline.",
+                    "flag":"--io-threads","min":1,"max":16,"unit":"lanes","typical":{"min":2,"max":8},
+                    "special":[{"value":0,"label":"off"}],"default":4}""",
+            ),
+        )
+        assertEquals(2.0..8.0, row.typical)
+        assertEquals("usually 2 to 8", row.typicalText())
+        assertEquals("off", row.specialLabel(0L))
+        assertEquals("off", row.specialLabel(0.0))
+        assertNull(row.specialLabel(4L))
+        assertEquals("Parallel expert-read lanes, including the calling thread." to "1 is the serial baseline.", row.helpParts())
+        val specs = ParamSpec.parse(table)
+        assertNull(specs[0].typicalText())
+    }
+
+    @Test
+    fun lanAddressIsIpv4AndReachable() {
+        val a = listOf("127.0.0.1", "169.254.3.4", "192.168.1.23", "fe80::1", "192.168.1.23", "10.0.0.5")
+            .map { java.net.InetAddress.getByName(it) }
+        assertEquals(listOf("192.168.1.23", "10.0.0.5"), io.bigmoeonedge.app.engine.LanAddress.pick(a))
+        assertEquals("http://192.168.1.23:8765/v1", io.bigmoeonedge.app.engine.LanAddress.url("192.168.1.23"))
+        assertEquals("http://192.168.1.23:8765", io.bigmoeonedge.app.engine.LanAddress.address("192.168.1.23"))
     }
 
     @Test

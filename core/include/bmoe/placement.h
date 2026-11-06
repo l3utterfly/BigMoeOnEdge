@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bmoe {
@@ -39,6 +40,12 @@ struct Placement {
 
     // Device-local memory the placement uses, summed over devices with memory of their own.
     uint64_t device_bytes = 0;
+    // The projector's bytes the fitter set aside on a device before placing any layer, when the
+    // run has one and a device with memory of its own to use it on: llama.cpp's library loads it
+    // there whole, on top of whatever the fitter placed, so the fitter is told to leave that room
+    // and the layer count already accounts for it. Counted in `device_bytes` and taken off that
+    // device's `device_spare`. Zero without a projector, or where no device has memory of its own.
+    uint64_t device_projector_bytes = 0;
 
     // True when the fitter had a device to place on, but one whose memory is the host's - so its
     // capacity arithmetic counted the same pool twice and its placement was NOT applied. Carried so
@@ -57,6 +64,20 @@ struct Placement {
     uint64_t device_compute_bytes = 0;
     uint64_t device_context_bytes = 0; // the context the fitter put on the devices, summed
 
+    // The part of the context, on every device and the host together, that does not grow with its
+    // length: a recurrent state, a sliding window. It is what one context checkpoint copies into host
+    // memory, read off two context lengths rather than off the architecture. Zero for a context that
+    // is all attention, or when not measured.
+    uint64_t context_fixed_bytes = 0;
+
+    // Which devices those compute buffers were projected for, and each one's part, at the width
+    // they were projected at. A device the fitter did not project for (one it never places layers
+    // on) has no part: the sum above describes other devices' graphs, not its own.
+    std::vector<std::string> projected_devices;
+    std::vector<uint64_t> projected_compute_bytes;
+    // The part of `device_compute_bytes` that is the named device's, at this placement's width.
+    uint64_t device_compute_of(const std::string & device) const;
+
     // The compute buffers above are those of one graph width - the widest graph the run computes at
     // once (RunConfig::n_ubatch) - and they grow with it: an activation is a row per token. The
     // width they were projected at, and what each further token of width costs, so the second stage
@@ -74,6 +95,25 @@ struct Placement {
     // The override patterns the fitter wrote, kept verbatim so the session can reapply them at load
     // (they are what routes the placed experts to a device buffer type).
     std::vector<std::string> override_patterns;
+    // The pattern that keeps one layer's routed experts on the host, for every layer that carries
+    // experts, written by the adapter (which owns tensor naming) for a plan that moves every
+    // layer's experts to the host itself: the device tier keeps the layers on the device and makes
+    // the bytes the fitter gave their experts a cache instead.
+    std::vector<std::string> all_expert_patterns;
+
+    // How many of `n_gpu_layers` each device takes, by device name, in the order the fitter listed
+    // the devices. The fitter decides this per device and projects its memory with it; loaded
+    // without it, llama.cpp splits the layers by free memory instead, which on two cards put the
+    // layers the fitter had spread over both onto whichever had more room (#321). Empty when nothing
+    // is placed.
+    std::vector<std::pair<std::string, uint32_t>> device_split;
+
+    // What each device in `device_split` has free beyond what the fitter projects for it and the
+    // margin it leaves, by device name: the remainder no further whole layer fitted in. The fitter
+    // fills a card in whole layers, so this is memory it never uses; a device expert cache can, since
+    // it fills by the expert rather than by the layer. Read off the same free figure the fitter
+    // planned against, in the same call. Empty when nothing is placed.
+    std::vector<std::pair<std::string, uint64_t>> device_spare;
 };
 
 } // namespace bmoe

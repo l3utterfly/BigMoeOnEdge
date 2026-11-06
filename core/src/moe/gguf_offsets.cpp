@@ -61,6 +61,9 @@ void fill_offsets(const gguf_context * gctx, int file_idx, GgufOffsets & out) {
         // caller must not be made to pay for twice.
         const int64_t * ne = gguf_get_tensor_ne(gctx, i);
         out.rows_by_name[name] = ne ? (uint64_t) (ne[1] > 0 ? ne[1] : 0) : 0;
+        // Exactly three dimensions: gguf pads ne to GGML_MAX_DIMS with ones, so a 3-D tensor is one
+        // whose fourth extent is 1 and whose third is not.
+        out.extents.push_back({name, ne && ne[3] == 1 && ne[2] > 1 ? (uint64_t) ne[2] : 0});
     }
 }
 
@@ -69,6 +72,10 @@ void fill_model_info(const gguf_context * gctx, GgufModelInfo & out) {
     if (arch_id >= 0 && gguf_get_kv_type(gctx, arch_id) == GGUF_TYPE_STRING) {
         out.arch = gguf_get_val_str(gctx, arch_id);
     }
+    const int64_t type_id = gguf_find_key(gctx, "general.type");
+    if (type_id >= 0 && gguf_get_kv_type(gctx, type_id) == GGUF_TYPE_STRING) out.type = gguf_get_val_str(gctx, type_id);
+    const int64_t name_id = gguf_find_key(gctx, "general.name");
+    if (name_id >= 0 && gguf_get_kv_type(gctx, name_id) == GGUF_TYPE_STRING) out.name = gguf_get_val_str(gctx, name_id);
     if (!out.arch.empty()) {
         // Arch-prefixed keys, exactly as llama.cpp names them (LLM_KV_EXPERT_COUNT /
         // LLM_KV_EXPERT_USED_COUNT expand "%s" to the architecture).
@@ -77,6 +84,9 @@ void fill_model_info(const gguf_context * gctx, GgufModelInfo & out) {
         // The hidden state's width. It is what a tensor crossing a host/device boundary actually
         // carries, so the split probe needs it to measure a crossing at the size this model pays.
         out.n_embd = meta_int(gctx, out.arch + ".embedding_length", 0);
+        out.n_block = meta_int(gctx, out.arch + ".block_count", 0);
+        out.n_nextn = meta_int(gctx, out.arch + ".nextn_predict_layers", 0);
+        out.reads_target = gguf_find_key(gctx, (out.arch + ".target_layers").c_str()) >= 0;
     }
     out.ok = true;
 }

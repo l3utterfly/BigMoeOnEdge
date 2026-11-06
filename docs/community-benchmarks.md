@@ -7,14 +7,16 @@ question: **what does expert streaming do on hardware we do not own?**
 Ten minutes and a machine is all it takes. Run the protocol, open a
 [benchmark report](https://github.com/Helldez/BigMoeOnEdge/issues/new?template=benchmark-report.yml),
 and the row lands in the [table below](#results) with your GitHub handle. You do not need to know
-the code, and you do not pick any settings: the protocol fixes them so rows compare.
+the code, and you do not pick any settings: the protocol is `--auto`, so the engine picks them for
+your machine and rows compare.
 
 ## Start here
 
-**Which model?** Any MoE the engine supports (`bmoe-cli --list-archs`), any quantization. No model
+**Which model?** Any MoE llama.cpp loads ([which-models-stream.md](which-models-stream.md)), any quantization. No model
 yet? The [catalog table](#models-that-line-up-with-the-readme) lists what the app ships. Larger
-than your RAM is the interesting case; one that fits is still a valid row (it measures what
-streaming costs against running resident). The report asks which of the two you are in.
+than your RAM is the interesting case; one that fits is still a valid row, and there `--auto` runs
+it resident (and on your GPU, with a build that carries one). The report asks which of the two you
+are in.
 
 ### PC or laptop, Linux and macOS
 
@@ -25,21 +27,30 @@ scripts/bench-report.sh /path/to/model.gguf
 ```
 
 It builds the CLI, records your CPU / RAM / drive, measures the drive at the request size the
-engine actually issues, runs the protocol, prints two markdown tables. Paste both. Done.
+engine actually issues, runs the model three times with `--auto` (see [the protocol](#the-protocol)),
+prints two markdown tables, the plan each run chose and what it predicted against what it
+measured. Paste all of it. Done.
 
 - **No toolchain?** Every release attaches a prebuilt `bmoe-cli` (Linux x86_64 / aarch64, macOS
   arm64, Windows x86_64). Point the script at it: `BMOE_CLI=/path/to/bmoe-cli scripts/bench-report.sh model.gguf`.
-- **Binary will not start?** The x86_64 builds assume AVX2, the aarch64 one armv8.2-a with dotprod.
-  Drop `BMOE_CLI=` and it builds from source.
+- **A GPU in the box?** `--auto` uses it only if the binary carries its backend. The release
+  archives carry Vulkan on Linux and Windows and Metal on macOS. For CUDA, build it in:
+  `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON && cmake --build build -j`; the
+  CUDA module lands beside `bmoe-cli` and loads like the shipped ones. The plan in the report says
+  which devices it used.
+- **Binary will not start?** The archives carry one CPU module per instruction-set tier and pick the
+  best one this machine runs, so no particular CPU is assumed. The Linux aarch64 archive needs
+  glibc 2.38 or newer (Ubuntu 24.04); the x86_64 one runs from Ubuntu 22.04. Drop `BMOE_CLI=` and
+  it builds from source.
 - **Windows:** use the prebuilt binary with the command under [On a phone](#on-a-phone), minus the
   `adb shell`. The script itself is Linux and macOS only.
 
 ### Android phone
 
 - **Easy path:** install the release APK, load a model from its catalog, generate at least 256
-  tokens, screenshot the telemetry panel. Change three settings first, or the row is measuring
-  something else: **cold-expert dropping Off** (it defaults to 75 %, which is a lossy speedup),
-  **cache Auto**, **context 2048**. Everything else already matches the protocol.
+  tokens, screenshot the telemetry panel. Check two settings first, or the row is measuring
+  something else: **Auto-plan On** (the Plan screen; on by default where the planner is built in)
+  and **cold-expert dropping Off** (it defaults to 75 %, which is a lossy speedup).
 - **Exact path** (comparable with the PC rows): push `bmoe-cli` and run it over adb, see
   [On a phone](#on-a-phone).
 
@@ -50,8 +61,8 @@ empty unless you run the storage probe yourself.
 
 | | Status |
 |---|---|
-| **Mac**, Apple silicon or Intel | Works. A direct request is served with `F_NOCACHE` (Apple's uncached-descriptor mode — a caching hint, not Linux `O_DIRECT`: no alignment, no DMA promise), and `o_direct` reports what the open actually achieved. Uncached reads can sit below the buffered rate on the same drive, so a Mac row's flash column may read slower than the storage probe suggests; that is the honest number, not a malfunction. Say "macOS" in your report. A 64 or 128 GB Mac is still a row we want. |
-| **iPhone, iPad** | Unvalidated. iOS does not run command-line binaries, so [`examples/ios`](../examples/ios) builds `bmoe-cli` into a harness app you sign and sideload yourself. It has not been run on a device here: a row from one is welcome, with the plan (`--auto --plan`) it printed. |
+| **Mac**, Apple silicon or Intel | Works. A direct request is served with `F_NOCACHE` (Apple's uncached-descriptor mode — a caching hint, not Linux `O_DIRECT`: no alignment, no DMA promise), and `o_direct` reports what the open actually achieved. Uncached reads can sit below the buffered rate on the same drive, so a Mac row's flash column may read slower than the storage probe suggests; that is the honest number, not a malfunction. A shell cannot bypass the page cache on macOS, so the script's storage column there is the engine's own probe (the `plan: storage:` line, one lane at the engine's request size, read with `F_NOCACHE`), labelled as such. Say "macOS" in your report. A 64 or 128 GB Mac is still a row we want. |
+| **iPhone, iPad** | iOS does not run command-line binaries, so [`examples/ios`](../examples/ios) builds `bmoe-cli` into a harness app you sign and sideload yourself. It has run a 35B on a real iPhone ([#235](https://github.com/Helldez/BigMoeOnEdge/issues/235)); a row from yours is welcome, run with `--auto --plan-explain` and with the plan it printed. |
 
 ### What happens to your row
 
@@ -62,30 +73,49 @@ empty unless you run the storage probe yourself.
 
 ## The protocol
 
-One run, 256 greedy tokens, the same prompt as every README table, settings fixed at what wins on
-the reference phone rather than tuned per machine: `min(8, cores)` threads, 4 read lanes,
-auto-sized cache, `--overlap`, `--dense-weights anon`, `--ubatch 512` (the same prefill width the
-Android app pins, so a host row and an in-app row reserve comparable memory).
+`--auto` and nothing else, 256 greedy tokens, the same prompt as every README table
+(`--plan-explain` only prints the plan it runs). That is what the engine does on *this* machine:
+the planner hands what fits to the GPUs the build carries, keeps a model that fits in RAM resident
+without streaming, and streams only the experts left over. It is the row to compare with other
+engines on the same hardware.
+
+The script runs it three times. Twice because the planner learns between the two
+([measured-planning.md](measured-planning.md)). The first load records what the model routed and
+measures the lossless knobs (threads, `--overlap`) on its first answer; the second plans on that
+record: the cache priced on the model's own hit curve, the knobs at their measured verdict. The
+second is the plan the app and the server run from their second load on, so **the second run is the
+row for the table**; the first says what a cold planner predicted, and the `plan: predicted ...
+measured ...` line under each run is the planner's error on your machine, which is the other thing a
+row is for. The third run is the second with `--overlap` pinned: overlap changes no output, the
+planner arms it only when its trial measured it 10% faster, and this row says what that margin left
+on your machine; it sits beside the table row, labelled, like any lossless-knob row. The record lives
+under the script's output folder (`--routing-dir`) and is cleared at each invocation, so a first
+load is always a first load. The script waits between the runs: the
+kernel returns a process's locked memory in the seconds after it exits, and a plan made before that
+sees a machine with gigabytes less than it has (on a 16 GB laptop, 3.4 GB available against 11 GB a
+minute later) and sizes a cache half the right one. When the second plan still saw much less memory
+than the first, the output says so under the table: run again with a longer `BENCH_SETTLE`.
+
+Settings are not part of the protocol: `--auto` chooses threads, cache, read lanes and device
+placement from what it measures, and the plan in the report says what it chose. A row with
+settings forced by hand measures those settings, not the machine, and does not go in the table.
 
 Override with an environment variable, and say so in the issue:
 
 | Variable | Default | Change it if |
 |---|---|---|
-| `THREADS` | `min(8, cores)` | big.LITTLE CPU (try the big-core count), or far more cores than 8 |
-| `IO_THREADS` | 4 | NVMe with a deep queue, or a slow SD / USB drive |
-| `CACHE_MB` | `auto` | auto left the machine short, or fed the cache so much that `majflt/tok` climbed |
-| `UBATCH` | 512 | memory is tight and you will trade prefill width for it, or you want the old full-width behaviour (`UBATCH=0`) |
 | `N_PREDICT` | 256 | never below 256, the cache is still warming |
+| `BENCH_RUNS` | 3 | 2 skips the `--overlap` row; 1 reports the first load alone (a model so large that one run is what the machine affords) |
+| `BENCH_SETTLE` | 30 | seconds between the runs; raise it when the note under the table says the second plan saw less memory than the first |
 
-Flags after the model path reach `bmoe-cli` verbatim (`--no-think` for gpt-oss,
-`--n-expert-used 6` for a turbo top-k row). A tuned row is welcome, it just sits *next to* the
-default row rather than replacing it. To understand the knobs first, see
-[benchmark-method.md](benchmark-method.md).
+Flags after the model path reach `bmoe-cli` verbatim: only the ones that change the model, not the
+engine (`--think` to measure a reasoning run, `--n-expert-used 6` for a turbo top-k row, which is lossy and
+sits *next to* the default row). To understand what the plan chose, see
+[benchmark-method.md](benchmark-method.md) and [hardware-planning.md](hardware-planning.md).
 
-Whatever you run, check the `mode:` line before reporting a number. It says `expert streaming` when
-the run measured this engine; if it says `mmap`, `--moe-stream` was missing and the run measured
-stock llama.cpp instead. A row like that is still welcome as a baseline, it just has to be labelled
-as one.
+Check the `mode:` line before reporting a number. It says `expert streaming` when
+`--auto` streamed, and the plan says why when it did not: a model that fits runs resident, which is
+the right answer on that machine, not a missing flag.
 
 ### On a phone
 
@@ -94,14 +124,13 @@ as one.
 
 ```bash
 adb push MODEL.gguf /data/local/tmp/
-adb shell /data/local/tmp/bmoe-cli -m /data/local/tmp/MODEL.gguf --chatml -n 256 -t 4 --ubatch 512 \
-  --moe-stream --cache-mb auto --io-threads 4 --overlap --dense-weights anon \
-  --csv /data/local/tmp/run.csv \
+adb shell /data/local/tmp/bmoe-cli -m /data/local/tmp/MODEL.gguf --chatml -n 256 \
+  --auto --plan-explain --csv /data/local/tmp/run.csv \
   -p "Write a long detailed essay about the history of computing including its origins its key milestones the people involved and the future directions of the field"
 ```
 
-This command is already the protocol: no dropping, cache auto, the default 2048 context. Three
-things to get right around it:
+This command is already the protocol; paste the `plan:` lines with the result. Things to get right
+around it:
 
 - Stage the model on `/data/local/tmp` or `/sdcard/Download`. **Not** the app's external files dir
   under `/storage/emulated`: it is FUSE-backed and `O_DIRECT` silently falls back to buffered.
@@ -121,7 +150,7 @@ the table is for. What the app catalog ships:
 | Qwen3.6-35B-A3B | Q4_K_M | 22.3 GB | [bartowski/Qwen_Qwen3.6-35B-A3B-GGUF](https://huggingface.co/bartowski/Qwen_Qwen3.6-35B-A3B-GGUF) | the README's reference row |
 | Qwen3-30B-A3B | Q4_K_M | 18.5 GB | [unsloth/Qwen3-30B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF) | |
 | Gemma-4-26B-A4B-it | Q4_K_M | 17.0 GB | [bartowski/google_gemma-4-26B-A4B-it-GGUF](https://huggingface.co/bartowski/google_gemma-4-26B-A4B-it-GGUF) | |
-| gpt-oss-120b | Q4_K_M | 62.8 GB | [unsloth/gpt-oss-120b-GGUF](https://huggingface.co/unsloth/gpt-oss-120b-GGUF) | add `--no-think`; pass the first shard |
+| gpt-oss-120b | Q4_K_M | 62.8 GB | [unsloth/gpt-oss-120b-GGUF](https://huggingface.co/unsloth/gpt-oss-120b-GGUF) | thinking stays off (the default); pass the first shard |
 | DeepSeek V4 Flash 0731 | UD-IQ2_M | 90.9 GB | [unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) | pass the first shard |
 | Qwen3.8-Flash-Next | UD-IQ3_XXS | 82.0 GB | [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | needs engine 0.22.0+; pass the first shard |
 | Qwen3.8-Flash-Next | Q2_K | 80.4 GB | [DevQuasar/Qwen.Qwen3.8-Flash-Next-GGUF](https://huggingface.co/DevQuasar/Qwen.Qwen3.8-Flash-Next-GGUF) | dense side at 2-4 bit (2.4 GB pinned); no imatrix; pass the first shard |
@@ -156,8 +185,9 @@ On a phone, the app's telemetry panel and the CSV from `scripts/bench-run.sh` ca
 
 ## Results
 
-Ordered by hardware class. "maintainer" rows are the README's, measured with the same protocol over
-`adb` on the reference phone and on the Windows laptop. Phone rows name the device class on purpose.
+Ordered by hardware class. "maintainer" rows are the README's, measured over `adb` on the reference
+phone and on the Windows laptop with the fixed streaming settings the protocol used before
+`--auto` replaced it, so they measure the streamer rather than what `--auto` picks. Phone rows name the device class on purpose.
 
 | Hardware | Storage (512 KiB rate) | Model, quant | k | Cache | Decode tok/s | Prefill tok/s | Stall s/tok | Flash/token | Cache hit | Engine | By |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|
@@ -166,8 +196,24 @@ Ordered by hardware class. "maintainer" rows are the README's, measured with the
 | Phone, 12 GB RAM, Snapdragon class | UFS 4.x (~2300 MiB/s) | Gemma-4-26B-A4B Q4_K_M | 8 | 4000 MiB | 4.1 | n/a | n/a | 144 MiB | 82% | 0.21.0 | maintainer |
 | Phone, 12 GB RAM, Snapdragon class | UFS 4.x (~2300 MiB/s) | gpt-oss-120b Q4_K_M | 2 | 2000 MiB | 2.2 | n/a | n/a | 590 MiB | 32% | 0.21.0 | maintainer |
 | Laptop, x86 8 cores, 16 GB DDR4 | NVMe | Qwen3.6-35B-A3B Q4_K_M | 8 | auto | 7.3 | n/a | n/a | 24 MiB | 92% | 0.21.0 | maintainer (`--drop-cold-experts 0.75`) |
+| Desktop, x86 16 cores, 60 GB DDR5, two 16 GB discrete GPUs | PCIe NVMe (4273-4392 MiB/s) | DeepSeek V4 Flash 0731 UD-IQ2_M (85 GiB, 1.4x RAM) | 6 | 41892 MiB, memlock raised | 8.7 | 5.1 | 0.000 | 87 MiB | 91.1% | 0.33.3 | [jordimarsal](https://github.com/Helldez/BigMoeOnEdge/issues/321) (layers split over the two cards, experts streamed) |
+| Desktop, x86 16 cores, 60 GB DDR5, two 16 GB discrete GPUs | PCIe NVMe (4273-4392 MiB/s) | DeepSeek V4 Flash 0731 UD-IQ2_M | 6 | 7342 MiB, default memlock | 4.4 | n/a | n/a | n/a | 72.7% | 0.33.3 | [jordimarsal](https://github.com/Helldez/BigMoeOnEdge/issues/321) (same box: the cache bounded by `RLIMIT_MEMLOCK`) |
+| Desktop, x86 16 cores, 60 GB DDR5, two 16 GB discrete GPUs | PCIe NVMe (4273-4392 MiB/s) | DeepSeek V4 Flash 0731 UD-IQ2_M | 6 | 41092 MiB | 1.0 | 1.4 | 0.036 | 120 MiB | 90.0% | 0.32.0 | [jordimarsal](https://github.com/Helldez/BigMoeOnEdge/issues/321) (CPU only, the protocol before `--auto`; 7284 majflt/tok) |
+| Desktop, x86 16 cores, 60 GB DDR5, two 16 GB discrete GPUs | PCIe NVMe (4273-4392 MiB/s) | Qwen3-30B-A3B Q4_K_M | 8 | resident on the cards | 245.8 | 242.9 | 0.000 | 0 MiB | n/a | 0.33.3 | [jordimarsal](https://github.com/Helldez/BigMoeOnEdge/issues/321) |
+| Desktop, x86 16 cores, 60 GB DDR5, two 16 GB discrete GPUs | PCIe NVMe (4273-4392 MiB/s) | MiniCPM-V-4.7-35B-A3B Q4_K_M | 8 | resident on the cards | 220.5 | 201.3 | 0.000 | 0 MiB | n/a | 0.33.1 | [jordimarsal](https://github.com/Helldez/BigMoeOnEdge/issues/321) |
+| Desktop, 31 usable x86 cores, 89 GiB control group, 24 GB discrete GPU | PCIe NVMe (1.0 GB/s direct) | Qwen3.6-35B-A3B Q4_K_M | 8 | resident on the card | 217.4 | 288.6 | 0.000 | 0 MiB | n/a | 0.37.0 | maintainer (rented card, `--auto`) |
+| Desktop, 31 usable x86 cores, 89 GiB control group, 24 GB discrete GPU | PCIe NVMe (1.0 GB/s direct) | Qwen3.8-Flash-Next 125B GSQ-RCO Q2_0 | 8 | 18225 MiB on the card, experts in RAM | 70.7 | 56.2 | 0.000 | 0 MiB | n/a | 0.37.0 | maintainer (rented card, `--auto`, second load) |
+| Desktop, 31 usable x86 cores, 89 GiB control group, 24 GB discrete GPU | PCIe NVMe (1.0 GB/s direct) | DeepSeek V4 Flash 0731 UD-IQ2_M (85 GB of experts) | 6 | 66034 MiB in RAM + 13020 MiB on the card | 9.3 | 4.5 | 0.000 | 87 MiB | 93.9% | 0.37.1 | maintainer (rented card, `--auto`; llama.cpp `--n-cpu-moe` 18.5 on the same file, #419) |
+| Desktop, 7.7 usable x86 cores, 42.6 GiB control group, 12 GB discrete GPU | PCIe NVMe | Qwen3.8-Flash-Next 125B GSQ-RCO Q2_0 | 8 | resident: 6 GB of experts on the card, the rest in RAM | 15.5 | 30.6 | 0.000 | 0 MiB | n/a | 0.37.1 + #420 | maintainer (rented card, `--auto --device-cache-mb 0`: the plain `--auto` run was killed by the control group, #424) |
+| Laptop, Apple silicon 10 cores, 16 GB unified | NVMe (6358 MiB/s, F_NOCACHE) | Qwen3.6-35B-A3B Q4_K_M | 8 | 4713 MiB | 17.4 | 24.5 | 0.000 | 91 MiB | 81.3% | 0.36.0 | maintainer (`--auto`; prefill on Metal, decode on the cores; the 30-token protocol prompt makes the prefill column mostly load) |
+| Mini-PC, x86 16 threads, 90 GiB usable DDR5, integrated GPU (Vulkan build) | PCIe NVMe (1191 MiB/s) | Qwen3.8-Flash-Next 125B Q2_K (75.4 GiB) | 10 | 43195 MiB | 8.8 | 9.1 | 0.000 | 50 MiB | 90.8% | 0.39.0 | [rustysixslinger](https://github.com/Helldez/BigMoeOnEdge/issues/462) (`--auto`, second load; the integrated GPU measured 0.6x the cores and was left off; the same box then served a coding agent for 24 hours on one prompt at 6-7 tok/s) |
+| Mini-PC, x86 16 threads, 90 GiB usable DDR5 (CPU-only build) | PCIe NVMe (1230 MiB/s) | Qwen3.8-Flash-Next 125B Q2_K (75.4 GiB) | 10 | 42672 MiB | 5.7 | 3.5 | 0.000 | 53 MiB | 90.5% | 0.39.0 | [rustysixslinger](https://github.com/Helldez/BigMoeOnEdge/issues/460) (`--auto`, second load) |
+| Phone, 12 GB RAM, Snapdragon 6 Gen 1 class | UFS | flint 40B-A2.5B UD-IQ1_M | n/a | auto | 3.0 | n/a | n/a | n/a | n/a | 0.35.1 | [finnuen](https://github.com/Helldez/BigMoeOnEdge/issues/177) (the app, default settings; Q2_K_XL 2.8, IQ3_XXS 2.2, Q3_K_XL 1.9, Q4_K_XL 1.1) |
+| Phone, 18 GB RAM | UFS | Qwen3.5-397B Q3_K_M | n/a | n/a | 0.5 | n/a | n/a | n/a | n/a | app, 2026-09 | [suomiT](https://github.com/Helldez/BigMoeOnEdge/issues/177) (the app, before `--auto`) |
 
-Columns the README rows never recorded are `n/a`; rows from `bench-report.sh` fill all of them.
+Columns the README rows never recorded are `n/a`; rows from `bench-report.sh` fill all of them. A
+resident row (the model fit on the cards) has no cache and no flash column: it measures the engine's
+compute ceiling on that machine, which is the number a streamed row on the same box is short of.
 The maintainer rows predate `--ubatch 512` in the protocol, so their compute-buffer reservation was
 wider than a fresh row's.
 Per-token CSVs for the maintainer rows are under `docs/bench-data/`.

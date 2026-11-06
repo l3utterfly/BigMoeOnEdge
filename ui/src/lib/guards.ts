@@ -2,7 +2,22 @@
 // cast trusts the wire; these make a server of another version, a proxy's error page or a
 // truncated body fail where it is read, with a message, instead of as an undefined deep inside a
 // component. They check structure, not every field: a field the UI does not read may change freely.
-import type { Config, DecideResult, DoneSummary, DownloadEvent, Info, ModelsResponse, ParamSpec, Plan, TokenEvent } from './types';
+import type {
+  Config,
+  DecideResult,
+  DoneSummary,
+  DownloadEvent,
+  HfAdded,
+  HfFacts,
+  HfModelsResponse,
+  HfSearchResponse,
+  Info,
+  ModelsResponse,
+  ParamSpec,
+  Plan,
+  PlanProgress,
+  TokenEvent,
+} from './types';
 
 type Obj = Record<string, unknown>;
 
@@ -39,10 +54,43 @@ export function isModelsResponse(v: unknown): v is ModelsResponse {
   );
 }
 
+export function isHfModelsResponse(v: unknown): v is HfModelsResponse {
+  return (
+    isObject(v) &&
+    isStr(v.repo) &&
+    Array.isArray(v.models) &&
+    v.models.every((m) => isObject(m) && isStr(m.name) && isNum(m.bytes) && isBool(m.complete) && Array.isArray(m.files))
+  );
+}
+
+export function isHfSearchResponse(v: unknown): v is HfSearchResponse {
+  return isObject(v) && isStr(v.query) && Array.isArray(v.repos) && v.repos.every((r) => isObject(r) && isStr(r.id));
+}
+
+export function isHfFacts(v: unknown): v is HfFacts {
+  return (
+    isObject(v) &&
+    isStr(v.name) &&
+    isNum(v.bytes) &&
+    isObject(v.model) &&
+    isBool(v.model.readable) &&
+    isObject(v.verdict) &&
+    isBool(v.verdict.downloadable) &&
+    isStr(v.verdict.mode) &&
+    isStr(v.verdict.disk) &&
+    isStr(v.verdict.memory)
+  );
+}
+
+export function isHfAdded(v: unknown): v is HfAdded {
+  return isObject(v) && isStr(v.id);
+}
+
 export function isPlan(v: unknown): v is Plan {
   if (!isObject(v) || !isBool(v.available)) return false;
-  // Available but with nothing to plan carries only `error`; a real plan carries its decisions.
-  return !v.available || isStr(v.error) || Array.isArray(v.decisions);
+  // Available but with nothing to plan carries only `error`, nothing held yet only `none`; a real
+  // plan carries its decisions.
+  return !v.available || isStr(v.error) || v.none === true || Array.isArray(v.decisions);
 }
 
 export function isDecideResult(v: unknown): v is DecideResult {
@@ -59,4 +107,8 @@ export function isDoneSummary(v: unknown): v is DoneSummary {
 
 export function isDownloadEvent(v: unknown): v is DownloadEvent {
   return isObject(v) && isStr(v.id) && isStr(v.state);
+}
+
+export function isPlanProgress(v: unknown): v is PlanProgress {
+  return isObject(v) && isStr(v.step);
 }

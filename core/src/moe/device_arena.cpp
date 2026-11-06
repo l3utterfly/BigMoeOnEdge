@@ -110,7 +110,7 @@ bool DeviceExpertArena::init(ggml_backend_dev_t dev,
     n_slots_ = n_slots;
 
     // The bound layers, in graph order, and the distinct (type, shape) variants of each projection.
-    std::vector<const ggml_tensor *> variants[MoeRecipe::max_exps];
+    std::vector<const ggml_tensor *> variants[ExpertLayout::max_slots];
     k_of_layer_.assign(layers.size(), -1);
     uint64_t max_nb2 = 0;
     for (size_t il = 0; il < layers.size(); ++il) {
@@ -119,9 +119,9 @@ bool DeviceExpertArena::init(ggml_backend_dev_t dev,
         Layer a;
         a.il = (int) il;
         int np = 0;
-        for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+        for (int p = 0; p < ExpertLayout::max_slots; ++p) {
             ggml_tensor * t = L.proj[p].tensor;
-            if (!t) break; // recipes fill their slots from the front
+            if (!t) break; // the layout fills its slots from the front
             if (n_expert_ == 0) n_expert_ = (int) t->ne[2];
             if (t->ne[2] != n_expert_) {
                 err = std::string("expert tensor ") + t->name + " has a different expert count";
@@ -164,7 +164,7 @@ bool DeviceExpertArena::init(ggml_backend_dev_t dev,
     // below, so it must divide evenly.
     ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
     const size_t align = ggml_backend_buft_get_alignment(buft);
-    size_t region_off[MoeRecipe::max_exps] = {};
+    size_t region_off[ExpertLayout::max_slots] = {};
     size_t slot_size = 0;
     size_t n_tensors = 0;
     for (int p = 0; p < n_proj_; ++p) {
@@ -176,6 +176,27 @@ bool DeviceExpertArena::init(ggml_backend_dev_t dev,
                       " in a way the arena cannot address one expert at a time";
                 return false;
             }
+            // A single expert is placed at e * (dev / n_expert) and must fit inside that share. A
+            // backend that pads every tensor by a fixed slack (OpenCL reserves carve room on each
+            // quantized tensor) makes one expert's allocation larger than its share, and the last
+            // expert would reach past the slot; ggml aborts on that rather than returning, so it is
+            // refused here, where the load can still fall back to the host.
+            {
+                ggml_init_params sp{};
+                sp.mem_size = ggml_tensor_overhead() * 2;
+                sp.no_alloc = true;
+                ggml_context * c = ggml_init(sp);
+                ggml_tensor * one = ggml_new_tensor_3d(c, v->type, v->ne[0], v->ne[1], 1);
+                const size_t one_size = ggml_backend_buft_get_alloc_size(buft, one);
+                ggml_free(c);
+                if (one_size > dev / (size_t) n_expert_) {
+                    err = std::string("the device pads a single expert of ") + v->name +
+                          " past its share of the whole tensor (" + std::to_string(one_size) + " against " +
+                          std::to_string(dev / (size_t) n_expert_) +
+                          " bytes), so the arena cannot address one expert at a time";
+                    return false;
+                }
+            }
             biggest = std::max(biggest, dev);
             n_tensors += 1 + (size_t) n_expert_;
         }
@@ -184,7 +205,7 @@ bool DeviceExpertArena::init(ggml_backend_dev_t dev,
     }
     slot_bytes_ = (size_t) n_slots_ * slot_size;
 
-    for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+    for (int p = 0; p < ExpertLayout::max_slots; ++p) {
         variants_[p] = variants[p];
         region_off_[p] = region_off[p];
     }
@@ -417,7 +438,7 @@ void DeviceExpertArena::free_slots() {
     for (int s = 0; s < max_slots; ++s) {
         if (slot_buf_[s]) ggml_backend_buffer_free(slot_buf_[s]);
         slot_buf_[s] = nullptr;
-        for (int p = 0; p < MoeRecipe::max_exps; ++p)
+        for (int p = 0; p < ExpertLayout::max_slots; ++p)
             twins_[s][p].clear();
     }
     if (ctx_) ggml_free(ctx_);
