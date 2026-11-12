@@ -139,15 +139,27 @@ too, so a device that compiles that graph differently can flip a near-tie token:
 laptop with Metal, a 35B-A3B's answer with `--mtp` diverged a few lines in, where `--ngram`, which
 leaves the graph alone, was identical.
 
+Layla's Hexagon backend exposes `ggml_backend_streaming_buffer_type_v1` through the backend
+registry. The arena requests matrix and flat streaming buffers explicitly. Their layout is fixed
+at allocation, and complete uploads into disjoint idle storage are safe on loader threads without
+draining the session queue. The scheduler synchronizes before routing/layer-end callbacks; the
+arena releases old slots there and waits for each incoming slot before its consumers run. This
+restores parallel read/repack overlap with NPU compute. Default HTP buffers are unchanged and no
+upload-repacking environment option is needed. Keep runtime repacking at its normal default and
+keep device confirmation enabled. Without the capability, the arena still serializes uploads on
+the graph thread; newer backends with graph-time tiling require `GGML_HEXAGON_RT_REPACK=0` as the
+slower compatibility workaround for reused slots.
+
 ### The arena: two layers of the model at a time
 
 A model larger than RAM cannot give the NPU a copy of itself. The NPU gets two layer-sized slots
 instead, and every layer's weights are bound to one of them, alternating. While the NPU computes
-layer k out of one slot, loader threads fill the other with layer k+1:
+layer k out of one slot, loader threads prepare the next uploads for layer k+1:
 
 - **experts** are read from the gguf with `O_DIRECT`, one expert at a time, and handed to the backend
-  with `ggml_backend_tensor_set` on a per-expert view. That call is where the Hexagon backend repacks
-  them into its matrix-engine tiles, so the repack runs in parallel across the loaders;
+  with `ggml_backend_tensor_set` on a per-expert view by the graph thread at a pacing point.
+  Backend uploads may synchronize the device command queue, so workers must never issue them
+  concurrently with graph execution. Each loader retains one staging buffer until its upload finishes;
 - **the other layer weights** (attention, norms, shared experts) are already resident on the host,
   so filling them is a copy, not a read.
 
@@ -255,9 +267,8 @@ Per-decision numbers: `bench-data/2026-09-29-prefill-routed/`.
   two Hexagon variables this section describes, `GGML_HEXAGON_HOSTBUF=1` and
   `GGML_HEXAGON_OPPOLL=1`; only that backend reads them.
 - `--prefill-loaders N` (default 8) sets the threads that fill the slots, apart from `--io-threads`,
-  which stays the decode's read lanes. Each loader reads and repacks, and a K-quant repack is
-  CPU-heavy: on a Q4_K_M, 4 loaders left the NPU waiting 10.3 s of a 15.1 s prefill, 8 left it 5.0 of
-  10.0.
+  which stays the decode's read lanes. Loaders read in parallel; backend uploads run on the graph
+  thread. Historical measurements with parallel backend repacking do not describe this upload policy.
 - On device: `ADSP_LIBRARY_PATH` pointing at the directory with the `libggml-htp-v*.so` skels (fastrpc
   resolves the one for the phone's NPU through it), and `GGML_HEXAGON_HOSTBUF=1`.
   `GGML_HEXAGON_OPPOLL=1` makes the host poll for the DSP instead of waiting on an interrupt, which

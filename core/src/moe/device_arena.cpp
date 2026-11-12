@@ -13,6 +13,14 @@
 namespace bmoe {
 
 namespace {
+// Optional backend capability: full uploads into disjoint idle storage are worker-safe;
+// layout metadata is fixed at allocation, and the caller owns graph synchronization.
+using StreamingBufferType = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t, bool);
+StreamingBufferType streaming_buffer_type(ggml_backend_dev_t dev) {
+    return reinterpret_cast<StreamingBufferType>(ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(dev), "ggml_backend_streaming_buffer_type_v1"));
+}
+
 // Whether the device runs a matmul whose weight is `type`, shaped like `w`, from its own buffer. Asked
 // of the device itself rather than read off a list, so any backend answers for its own kernels. The
 // probe weight is allocated: a backend may remember an unallocated weight (Hexagon notes it for
@@ -80,6 +88,7 @@ DeviceExpertArena::~DeviceExpertArena() {
         queue_.clear();
     }
     cv_work_.notify_all();
+    cv_done_.notify_all();
     for (std::thread & t : threads_)
         if (t.joinable()) t.join();
     for (void * s : staging_)
@@ -162,7 +171,9 @@ bool DeviceExpertArena::init(ggml_backend_dev_t dev,
     // does in the file: a backend that re-lays weights out (Hexagon tiles them, and holds a K-quant in
     // a wider tile format) puts expert e at e * (allocated size / n_expert). That is the stride used
     // below, so it must divide evenly.
-    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    const auto streaming = streaming_buffer_type(dev);
+    parallel_uploads_ = streaming != nullptr;
+    ggml_backend_buffer_type_t buft = streaming ? streaming(dev, true) : ggml_backend_dev_buffer_type(dev);
     const size_t align = ggml_backend_buft_get_alignment(buft);
     size_t region_off[ExpertLayout::max_slots] = {};
     size_t slot_size = 0;
@@ -261,7 +272,11 @@ bool DeviceExpertArena::init_dense(ggml_backend_dev_t dev,
                 return false;
             }
 
-    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    const auto streaming = streaming_buffer_type(dev);
+    ggml_backend_buffer_type_t bufts[2] = {
+        streaming ? streaming(dev, true) : ggml_backend_dev_buffer_type(dev),
+        streaming ? streaming(dev, false) : ggml_backend_dev_buffer_type(dev)};
+    ggml_backend_buffer_type_t buft = bufts[0];
     const size_t align = ggml_backend_buft_get_alignment(buft);
     // Each slot must hold the largest layer of its parity: layers differ (a hybrid model alternates
     // attention and recurrent blocks), and each layer is laid out from the start of its slot.
@@ -281,7 +296,7 @@ bool DeviceExpertArena::init_dense(ggml_backend_dev_t dev,
                 dtype[il].push_back(dt);
                 ggml_context * c = ggml_init(sp);
                 ggml_tensor * shaped = ggml_new_tensor(c, dt, GGML_MAX_DIMS, t->ne);
-                sz[data] += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, shaped), align);
+                sz[data] += GGML_PAD(ggml_backend_buft_get_alloc_size(bufts[data], shaped), align);
                 ggml_free(c);
             }
             for (int d = 0; d < 2; ++d)
@@ -292,7 +307,7 @@ bool DeviceExpertArena::init_dense(ggml_backend_dev_t dev,
         ggml_backend_buffer_t * bufs = dense_slot_[d];
         for (int s = 0; s < 2; ++s) {
             if (need[d][s] == 0) continue;
-            bufs[s] = ggml_backend_buft_alloc_buffer(buft, need[d][s] + align);
+            bufs[s] = ggml_backend_buft_alloc_buffer(bufts[d], need[d][s] + align);
             if (!bufs[s]) {
                 err = std::string("cannot allocate a dense layer slot on ") + ggml_backend_dev_name(dev);
                 return false;
@@ -453,7 +468,7 @@ bool DeviceExpertArena::acquire(std::string & err) {
 void DeviceExpertArena::release() {
     if (!on_demand_ || on_device_ || !slots_held()) return;
     std::unique_lock<std::mutex> lk(mu_);
-    cv_done_.wait(lk, [&] { return in_flight_ == 0; }); // no loader may still be writing into a slot
+    drain(lk, in_flight_); // no loader may still be writing into a slot
     lk.unlock();
     free_slots();
 }
@@ -568,7 +583,7 @@ void DeviceExpertArena::begin_graph() {
     for (int k = 0; k < n_slots_ && k < (int) order_.size(); ++k)
         schedule(k, routed_ && have_prev_[(size_t) k] ? &prev_[(size_t) k] : nullptr);
     if (!dense_.empty()) {
-        cv_done_.wait(lk, [&] { return dense_remaining_[0] == 0; });
+        drain(lk, dense_remaining_[0]);
         dense_waited_[0] = true;
     }
 }
@@ -580,7 +595,7 @@ void DeviceExpertArena::dense_barrier(int il) {
     // Layer il is done with its slot, which is the one layer il+2 goes into.
     schedule_dense(il + 1);
     schedule_dense(il + 2);
-    cv_done_.wait(lk, [&] { return dense_remaining_[(size_t) il + 1] == 0; });
+    drain(lk, dense_remaining_[(size_t) il + 1]);
     dense_waited_[(size_t) il + 1] = true;
     lk.unlock();
     stall_ns_ +=
@@ -643,7 +658,7 @@ void DeviceExpertArena::barrier(int il, const ggml_tensor * topk) {
         schedule(k);
         if (ahead) schedule(k + 1);
     }
-    cv_done_.wait(lk, [&] { return remaining_[(size_t) k] == 0; });
+    drain(lk, remaining_[(size_t) k]);
     lk.unlock();
     stall_ns_ +=
         (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
@@ -661,7 +676,38 @@ void DeviceExpertArena::end_graph() {
         --in_flight_;
     }
     queue_.clear();
-    cv_done_.wait(lk, [&] { return in_flight_ == 0; });
+    drain(lk, in_flight_);
+}
+
+void DeviceExpertArena::upload(ggml_tensor * tensor, const void * data, size_t size, ggml_tensor * bound) {
+    if (parallel_uploads_) {
+        ggml_backend_tensor_set(tensor, data, 0, size);
+        return;
+    }
+    Upload pending{tensor, data, size, bound};
+    std::unique_lock<std::mutex> lk(mu_);
+    if (stop_) return;
+    uploads_.push_back(&pending);
+    cv_done_.notify_all();
+    cv_done_.wait(lk, [&] { return stop_ || pending.done; });
+}
+
+void DeviceExpertArena::drain(std::unique_lock<std::mutex> & lk, const int & remaining) {
+    while (remaining != 0) {
+        cv_done_.wait(lk, [&] { return remaining == 0 || !uploads_.empty(); });
+        while (!uploads_.empty()) {
+            Upload * pending = uploads_.front();
+            uploads_.pop_front();
+            lk.unlock();
+            // Tensor writes may flush the device queue. Only the graph thread may touch it.
+            ggml_backend_tensor_set(pending->tensor, pending->data, 0, pending->size);
+            lk.lock();
+            // Upload-time layout metadata belongs to the tensor consumed by the graph too.
+            if (pending->bound && on_device_) pending->bound->extra = pending->tensor->extra;
+            pending->done = true;
+            cv_done_.notify_all();
+        }
+    }
 }
 
 void DeviceExpertArena::worker(int lane) {
@@ -681,8 +727,8 @@ void DeviceExpertArena::worker(int lane) {
                 std::this_thread::sleep_for(std::chrono::microseconds(test_delay_us_));
             // Host-resident bytes: a copy (and the backend's repack), no flash read.
             const DenseLayer & D = dense_[(size_t) task.k];
-            ggml_backend_tensor_set(D.twin[(size_t) task.p], D.src[(size_t) task.p], 0,
-                                    ggml_nbytes(D.t[(size_t) task.p]));
+            upload(D.twin[(size_t) task.p], D.src[(size_t) task.p], ggml_nbytes(D.t[(size_t) task.p]),
+                   D.t[(size_t) task.p]);
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 --dense_remaining_[(size_t) task.k];
@@ -702,7 +748,7 @@ void DeviceExpertArena::worker(int lane) {
             failed_ = true;
         } else {
             const Twin & w = twins_[task.k % n_slots_][task.p][(size_t) L.variant[task.p]];
-            ggml_backend_tensor_set(w.views[(size_t) task.e], stage, 0, (size_t) pr.nb2);
+            upload(w.views[(size_t) task.e], stage, (size_t) pr.nb2);
             read_bytes_ += pr.nb2;
         }
         {

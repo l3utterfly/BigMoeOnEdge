@@ -6,6 +6,13 @@
 
 add_executable(bmoe_moe_gates moe_gates.cpp)
 target_link_libraries(bmoe_moe_gates PRIVATE bmoe_core)
+add_executable(bmoe_device_arena_thread_test device_arena_thread_test.cpp)
+target_link_libraries(bmoe_device_arena_thread_test PRIVATE bmoe_core)
+get_target_property(_arena_ggml_source ggml-base SOURCE_DIR)
+target_include_directories(bmoe_device_arena_thread_test PRIVATE
+    ../core/src/moe ${_arena_ggml_source})
+add_test(NAME device_arena_thread COMMAND bmoe_device_arena_thread_test)
+set_tests_properties(device_arena_thread PROPERTIES TIMEOUT 30)
 # G16 probes the loopback rpc-server port before registering it.
 if(WIN32)
     target_link_libraries(bmoe_moe_gates PRIVATE ws2_32)

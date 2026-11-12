@@ -3,11 +3,10 @@
 // A model larger than RAM cannot give the device a resident copy of its experts, and a prefill graph
 // hundreds of tokens wide needs nearly every expert of every layer anyway. So the device gets TWO
 // layer-sized slots of expert weights and every MoE layer's expert tensors are bound to one of them,
-// alternating. While the device computes layer k out of one slot, a pool of loader threads fills the
-// other with layer k+1: read each expert's bytes from the gguf, hand them to the backend through
-// ggml_backend_tensor_set on a per-expert view (which is where a repacking backend lays them out in
-// its own format). One flash pass per graph, hidden behind compute when compute is the longer of the
-// two.
+// alternating. Loader threads read the next layer from the gguf into per-lane staging buffers.
+// A backend's streaming-buffer capability permits workers to upload into disjoint idle slots.
+// Otherwise the graph thread uploads at its barriers: ordinary writes may synchronize the command
+// queue. Each lane retains its staging bytes until the upload completes, bounding host staging memory.
 //
 // The pacing point is the layer's routing node, which the router hook already knows how to find and
 // isolate: when the scheduler stops there, every op of layer k-1 has finished, so the slot k+1 goes
@@ -184,6 +183,17 @@ private:
         std::vector<std::array<size_t, GGML_MAX_DIMS>> host_nb;
     };
 
+    struct Upload {
+        ggml_tensor * tensor;
+        const void * data;
+        size_t size;
+        ggml_tensor * bound;
+        bool done = false;
+    };
+    // Without the streaming capability, workers retain staging bytes until the graph thread uploads.
+    void upload(ggml_tensor * tensor, const void * data, size_t size, ggml_tensor * bound = nullptr);
+    void drain(std::unique_lock<std::mutex> & lock, const int & remaining);
+    std::deque<Upload *> uploads_;
     void worker(int lane);
     // Queue layer k's experts that `want` marks (all when null) and are not queued yet this graph;
     // `front` puts them ahead of everything waiting. Caller holds mu_.
@@ -237,6 +247,7 @@ private:
     int in_flight_ = 0;
     bool stop_ = false;
     bool on_device_ = false;
+    bool parallel_uploads_ = false;
     int test_delay_us_ = 0;
     bool test_skip_demand_ = false;
 

@@ -9,6 +9,9 @@ Semantic Versioning.
 Carried on `layla-build` on top of each upstream release.
 
 ### Added
+- Discover caller-synchronized streaming buffer types through the backend registry. Use parallel
+  full-tensor uploads only when the backend advertises immutable layouts and idle-slot writes;
+  retain graph-thread serialization otherwise. Normal HTP buffers remain unchanged.
 - Reuse an embedding application's existing llama/llama-common CMake targets and
   backend lifetime, with an optional public llama.cpp context adapter.
 - Per-request custom sampling, cancellation, prefill progress, and normal stop
@@ -16,6 +19,11 @@ Carried on `layla-build` on top of each upstream release.
   Cache save/restore is refused when a prefill device holds the model state.
 
 ### Changed
+- Revert the experimental Hexagon upload-repack backend extension; device prefill requires
+  the runtime-repacking workaround again. Graph-thread upload synchronization is retained.
+- Propagate dense upload layout metadata to graph tensors so upload-time tiling is not applied twice.
+- Prefill arena workers only read host bytes; the graph thread uploads them at synchronization
+  barriers. This prevents concurrent device-queue drains in backends whose tensor writes synchronize.
 - `BMOE_BUILD_CLI=OFF` also skips the iOS harness, so an iOS app embedding `bmoe_core`
   configures no second app bundle.
 
