@@ -43,6 +43,7 @@ public:
     // prefill on the device share one cache without a copy per turn. Left on the CPU, the attention of
     // every device graph would fall back to the CPU, which at prefill widths is most of the time. A
     // device without a host buffer type (RPC) gets a plain CPU buffer: nothing gained, same behaviour.
+    // The relocated buffer uses ANY usage even if the source shared a weight allocation.
     // Returns the buffer type used through `where`.
     //
     // llama.cpp keeps the buffers it allocated the state in, and nothing reads them after the move,

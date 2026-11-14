@@ -28,6 +28,8 @@ Carried on `layla-build` on top of each upstream release.
   configures no second app bundle.
 
 ### Fixed
+- Keep relocated prefill state in an `ANY` buffer even when its original allocation was
+  tagged as weights. Mutable KV state must not inherit extended weight placement on Hexagon.
 - Preserve token pieces larger than the generation loop's stack buffer.
 - Clear uncertain KV state after generation failures before another request can reuse it.
 

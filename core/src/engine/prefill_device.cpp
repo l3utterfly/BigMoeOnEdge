@@ -58,7 +58,9 @@ bool PrefillDevice::init_state(ggml_backend_dev_t dev,
         err = std::string("cannot allocate the model state in ") + where;
         return false;
     }
-    ggml_backend_buffer_set_usage(state_buf_, ggml_backend_buffer_get_usage(states[0]->buffer));
+    // Captured state can share its original buffer with weights. The new buffer is mutable
+    // (including KV writes), so it must not inherit a backend's read-only weight placement.
+    ggml_backend_buffer_set_usage(state_buf_, GGML_BACKEND_BUFFER_USAGE_ANY);
     std::vector<uint8_t> tmp;
     for (size_t i = 0; i < states.size(); ++i) {
         ggml_tensor * t = states[i];
