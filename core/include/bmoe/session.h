@@ -20,10 +20,13 @@
 #include "bmoe/metrics.h"
 #include "bmoe/runtime.h"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bmoe {
@@ -43,6 +46,7 @@ struct SessionConfig {
     // conversion), loaded beside the model. Empty: text only, and a request with images is refused.
     // See RunConfig::mmproj.
     std::string mmproj;
+    int image_max_tokens = 0; // the most tokens one image may take, 0 = the projector's own cap. See RunConfig.
     int n_threads = 4;
     int n_threads_batch = 0; // 0 = same as n_threads. See RunConfig::n_threads_batch.
     int n_ctx = 2048;
@@ -75,8 +79,11 @@ struct SessionConfig {
     // Wide prefill graphs on an accelerator, decode on the CPU. Fixed for the session: the device
     // joins the scheduler at load. See RunConfig::prefill.
     PrefillDeviceConfig prefill;
-    DecideConfig decide;          // decide()'s prefix-state policy. See RunConfig::decide.
-    KnobTrialConfig trial;        // lossless knobs measured on the first decodes. See RunConfig::trial.
+    DecideConfig decide;   // decide()'s prefix-state policy. See RunConfig::decide.
+    KnobTrialConfig trial; // lossless knobs measured on the first decodes. See RunConfig::trial.
+    // What the session opens where the device this one names does not keep the model. See
+    // RunConfig::fallback; empty, the same configuration on the cores.
+    std::shared_ptr<const SessionConfig> fallback;
     bool llama_debug_log = false; // See RunConfig::llama_debug_log.
     // Optional native embedding configuration, defined separately in llama_session.h.
     std::shared_ptr<const LlamaSessionConfig> native;
@@ -105,6 +112,32 @@ enum class ThinkControl {
 
 // Stable lowercase name ("template", "prefill", "none") for logs and the telemetry protocol.
 const char * think_control_name(ThinkControl c);
+
+// Where a turn's prefill stands (GenerateRequest::on_prefill). `total` is the whole prompt in
+// tokens, `cached` the part the context already held (reused, not decoded again), `processed` the
+// part decoded so far this turn; `seconds` since the prefill began.
+struct PrefillProgress {
+    int total = 0;
+    int cached = 0;
+    int processed = 0;
+    double seconds = 0.0;
+};
+
+// One request's own sampling, over the session's (SamplingConfig): a field left unset keeps the
+// session's value. A request that sets nothing here samples as the session does. temp <= 0 is greedy.
+// The penalties and the bias are applied before the cutoffs, as llama.cpp's sampler chain applies
+// them; a bias of -INFINITY forbids a token. With speculation armed (SpecConfig) the session decodes
+// greedily, since a draft is accepted by the target's argmax, and a request's sampling is not applied.
+struct RequestSampling {
+    std::optional<float> temp, top_p, min_p;
+    std::optional<int> top_k;
+    std::optional<uint32_t> seed;
+    float repeat_penalty = 1.0f;    // 1: off
+    float frequency_penalty = 0.0f; // 0: off
+    float presence_penalty = 0.0f;  // 0: off
+    int penalty_last_n = 64;        // how many recent tokens the penalties look back over (-1: the context)
+    std::vector<std::pair<int32_t, float>> logit_bias;
+};
 
 // Per-prompt request. clear_kv=true (the default) makes each prompt independent while the
 // expert cache stays warm; clear_kv=false continues the KV cache for multi-turn chat.
@@ -137,9 +170,31 @@ struct GenerateRequest {
     std::vector<ChatTool> tools{};
     ToolChoice tool_choice = ToolChoice::Auto;
     // The images `prompt` places with image_marker(), in order (the raw-prompt path; a message list
-    // carries each message's own). Needs a session opened with a projector. Right after tool_choice,
-    // so a request written as a positional aggregate before images existed still reads the same.
+    // carries each message's own). Needs a session opened with a projector. Kept after the earlier
+    // fields so existing positional aggregate initializers still read the same.
     std::vector<ChatImage> images{};
+    // Optional caller-owned stop flag. It must outlive generate(); the caller may raise it from
+    // another thread. Unlike Session::cancel()'s latch, it is never reset by the session.
+    const std::atomic<bool> * stop = nullptr;
+    // Told where the prompt's prefill stands: once before the first piece (processed 0) and after
+    // each piece decoded, on the generating thread. Nullable. A front-end shows it while a long
+    // prompt goes in, the stretch of a turn with no token to show.
+    std::function<void(const PrefillProgress &)> on_prefill{};
+    // This request's sampling over the session's (RequestSampling); unset samples as the session does.
+    std::optional<RequestSampling> sampling{};
+    // Text that ends the answer where it first appears; the answer stops before it (`stop` above is
+    // the caller's cancel flag, not this). Matched in the answer only: reasoning written before it is
+    // not searched, or a stop the reasoning contains would end the turn with no answer. While the text
+    // generated so far ends partway into one, that part is held back from TokenMetrics::text, so a
+    // streamed answer never shows a stop it then takes back.
+    std::vector<std::string> stop_text{};
+    // A GBNF grammar the whole answer must follow (rule `root`), in llama.cpp's grammar language.
+    // Exclusive of `tools` and `json_schema`, which build their own. The model is asked not to
+    // reason first; a token the grammar cannot take fails the turn, as for a response schema.
+    std::string grammar{};
+    // Report the top n_probs candidates and the chosen token's log-probability on every token
+    // (TokenMetrics::top_logprobs). 0: none.
+    int n_probs = 0;
 
     // Optional embedding hooks. Sampling receives the logits row; it must also accept
     // its chosen token. Custom sampling cannot be combined with speculative decoding.
@@ -231,14 +286,14 @@ public:
 
     // Generate one response. Serialized: one generation at a time per session. `on_token`
     // and `sink` receive the same per-token metrics as run(). Cache state carries over from
-    // the previous call. If cancel() fired, returns ok=true with cancelled=true.
+    // the previous call. If cancel() or req.stop ends the turn, returns ok=true with cancelled=true.
     RunResult generate(const GenerateRequest & req,
                        const std::function<void(const TokenMetrics &)> & on_token = nullptr,
                        IMetricsSink * sink = nullptr);
 
     // Request the in-flight generation to stop. Thread-safe; may be called from another
-    // thread while generate() runs. Takes effect at the next decode boundary via the abort
-    // callback and leaves the model/cache intact for the next generate().
+    // thread while generate() runs. Takes effect at an existing decode/encoder cancellation
+    // point and leaves the model/cache intact for the next generate().
     void cancel();
 
     double load_seconds() const;      // model load + streaming setup, measured once at open()
@@ -272,6 +327,21 @@ public:
     // encoder. What a front-end asks before offering an image control.
     bool vision() const;
 
+    // The model's tokenizer, outside any turn. Read-only on the vocabulary, so safe beside a running
+    // generate() on another thread, as llama.cpp's own server tokenizes beside its decode loop.
+    // `parse_special` reads control-token text ("<|im_start|>") as the token it names.
+    std::vector<int32_t> tokenize(const std::string & text, bool add_special, bool parse_special) const;
+    // The text of one token, special tokens spelled out. "" for an id outside the vocabulary.
+    std::string token_piece(int32_t token) const;
+    // The text of `tokens`, joined as the model would print them. False for an id outside the
+    // vocabulary, with `text` untouched.
+    bool detokenize(const std::vector<int32_t> & tokens, std::string & text) const;
+    // The prompt generate() would decode for req.messages (with its tools, tool_choice, think and
+    // json_schema), rendered by the model's own template; the engine-held conversation is not read
+    // or changed. False with `error` set when chat mode is off or the template refuses it. Safe
+    // beside a running generate(), like tokenize().
+    bool render_chat(const GenerateRequest & req, std::string & prompt, std::string & error) const;
+
     // Set the expert-cache budget in MiB and evict down to it now. PRECONDITION: no generate() in
     // flight — call it between generations (e.g. from an app's memory-pressure callback). A no-op
     // when the cache is off. The only way the budget moves after init sizes it.
@@ -290,6 +360,15 @@ public:
 private:
     friend struct LlamaSessionAccess;
     Session();
+    // One opening of a configuration as it stands; open() opens the cores after it where a device's
+    // answers for the model were not confirmed (KnobTrialConfig::answer_device).
+    struct AnswerCheck;
+    static std::unique_ptr<Session> open_placed(const SessionConfig & cfg,
+                                                std::string & error,
+                                                IRouteTraceSink * route_trace,
+                                                IComputeTraceSink * compute_trace,
+                                                IIoTraceSink * io_trace,
+                                                AnswerCheck * check);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

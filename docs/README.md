@@ -13,6 +13,7 @@ for the idea the project is built on.
 | [platforms.md](platforms.md) | What runs on each operating system and backend, how far each has been taken, and what each still owes. |
 | [backends.md](backends.md) | Every compute backend the pinned llama.cpp carries, which of them this engine has actually run on, and what each use of a device asks of one. |
 | [limitations.md](limitations.md) | What this does not do, what it cannot do, and the prior art it builds on. |
+| [model-architecture-trends.md](model-architecture-trends.md) | Where MoE model architecture is going (small experts, light attention, token-addressed tables, routers that run early), what the literature measured against this engine, and what to build next. |
 | [roadmap.md](roadmap.md) | Where the project is going as a product, in order; then the research themes, with what was measured and what was refuted. |
 
 ## Using and extending it
@@ -20,6 +21,7 @@ for the idea the project is built on.
 | Doc | What it answers |
 |---|---|
 | [application-framework.md](application-framework.md) | Why `bmoe-server` is the application framework every UI is a client of, and what a client may and may not do. |
+| [field-reports.md](field-reports.md) | Problems people reported from their own machines: how to recognise each, its cause, the version that fixes it, and what to do before it. |
 | [screens.md](screens.md) | The screens every UI shows (conversations, models, plan, skills, tasks, connected apps, settings, metrics, first run), specified once. |
 | [design.md](design.md) | The one visual language every UI uses. |
 | [which-models-stream.md](which-models-stream.md) | Which models stream: the rule read from the file, what is refused and why, what stays resident. |

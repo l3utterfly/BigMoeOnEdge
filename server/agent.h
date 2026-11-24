@@ -12,7 +12,7 @@
 // that thread waits on, answered by approve() or stop() from an HTTP worker. The scheduler is one
 // more thread. shutdown() raises every run's stop, which ends a waiting approval at once, a command
 // by killing its process group, an MCP call by ending its server, a provider's stream at its next
-// piece, and the engine's turn at its next token, then waits for all of them and ends the MCP
+// piece, and the engine's turn during encoding, prefill or decode, then waits for all of them and ends the MCP
 // servers: an embedding app's stop (server.h) returns only once nothing of the agent is running.
 #pragma once
 
@@ -50,8 +50,11 @@ inline constexpr int k_max_rounds_per_message = 30;
 inline constexpr int k_max_same_failed_calls = 3;
 // The most of a workspace's AGENTS.md the system prompt carries.
 inline constexpr size_t k_agents_md_max_bytes = 8 * 1024;
-// How long a stop waits for the run to end before answering anyway: the engine's turn ends at its
-// next token, which a long prompt's prefill can delay.
+// The most a person's own system prompt (a conversation's `system`) may hold: as AGENTS.md, a page of
+// instructions, not a document to answer from.
+inline constexpr size_t k_system_max_bytes = 8 * 1024;
+// How long a stop waits for the run to end before answering anyway. Local turns forward their
+// atomic stop signal while they own the session, including encoding and prefill.
 inline constexpr int k_stop_wait_s = 30;
 // How often the scheduler looks at the tasks when nothing wakes it.
 inline constexpr int k_scheduler_poll_s = 20;
@@ -62,11 +65,13 @@ inline constexpr size_t k_title_max_chars = 60;
 // The model a round asks: the engine's turn, or a test's stand-in.
 using ChatFn = std::function<ChatOutcome(const ChatRequest & req,
                                          const std::function<bool(const TokenMetrics &)> & on_token,
-                                         const std::function<bool()> & still_wanted)>;
+                                         const std::atomic<bool> & stop)>;
 
 struct AgentDeps {
     EventBus * bus = nullptr;
     AgentStore * store = nullptr;
+    // The run owns the atomic stop flag for the whole local_chat call; the adapter forwards it
+    // to the engine as well as withdrawing stopped requests from its queue.
     ChatFn local_chat;
     // n_predict and think for a round, from the server's settings; null keeps the server defaults.
     std::function<RunConfig()> config;
@@ -165,6 +170,12 @@ public:
     std::vector<std::pair<Skill, bool>> skills(const std::string & workspace_path,
                                                std::vector<std::string> * warnings = nullptr) const;
 
+    // The system prompt a built-in conversation's next message is given, for a run a local client
+    // starts or a remote one (`remote`: no workspace): the agent's own lines where it has a folder,
+    // then the person's (the conversation's `system`). GET /api/conversations/<id>/system serves
+    // exactly this, so nothing the model reads before the conversation is hidden (#625).
+    std::string system_prompt(const json & conv, bool remote) const;
+
     // Run a task now, as the scheduler would. False when it is already running or does not exist.
     Refusal run_task(const std::string & id);
     // A task was added, changed or removed: the scheduler looks again.
@@ -186,7 +197,8 @@ private:
                   json & item_out);
     // One conversation's rounds, on the run's thread; the final answer's text.
     std::string run_rounds(Run & run, const std::string & conv_id);
-    json run_tool(Run & run, const json & conv, const ChatToolCall & call);
+    // `item_id`: the card the call already has from while it was written; empty for a new one.
+    json run_tool(Run & run, const json & conv, const ChatToolCall & call, const std::string & item_id = "");
     bool wait_approval(Run & run, const std::string & conv_id, json & item);
     ChatOutcome ask_model(Run & run,
                           const json & conv,
@@ -200,7 +212,6 @@ private:
     // The tools a round offers; `mcp` gets the MCP tools among them, by the name the model calls.
     std::vector<ChatTool>
     tools_for(const json & conv, bool remote, std::map<std::string, McpTool> * mcp = nullptr) const;
-    std::string system_prompt(const json & conv, bool remote) const;
 
     // ---- a conversation whose agent is another program (agent_external.cpp) ----
     std::string run_external(Run & run, const std::string & conv_id);

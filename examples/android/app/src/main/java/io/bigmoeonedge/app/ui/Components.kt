@@ -1,6 +1,5 @@
 package io.bigmoeonedge.app.ui
 
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -77,16 +76,15 @@ fun Chip(text: String, colour: Color) {
 }
 
 /**
- * A card: the surface on the page, a 1 dp line and a soft shadow. One place, so every box on every
- * screen has the same edge, corner and elevation.
+ * A card: a sheet on the desk, lifted by a soft shadow with no frame. One place, so every box on
+ * every screen has the same corner and elevation.
  */
 @Composable
 fun BmoeCard(modifier: Modifier = Modifier, padding: Dp = 16.dp, colour: Color = tokens.surface, content: @Composable ColumnScope.() -> Unit) {
     Surface(
         color = colour,
-        shape = Corner,
-        shadowElevation = 1.dp,
-        border = BorderStroke(1.dp, tokens.line),
+        shape = SheetCorner,
+        shadowElevation = SheetElevation,
         modifier = modifier.fillMaxWidth(),
     ) {
         Column(Modifier.padding(padding), verticalArrangement = Arrangement.spacedBy(8.dp), content = content)
@@ -122,5 +120,27 @@ fun SwitchRow(label: String, description: String?, checked: Boolean, enabled: Bo
             }
         }
         Switch(checked = checked, onCheckedChange = onChange, enabled = enabled)
+    }
+}
+
+/**
+ * Where models are loaded or downloaded, the engine's state when that cannot happen, and the way
+ * back: an engine that is down says why and offers to start, so nobody has to find Start engine in
+ * Settings. While it starts (no reason yet) it says only that; a crash it came back from is said
+ * once, until the next load.
+ */
+@Composable
+fun EngineDown(engine: io.bigmoeonedge.app.engine.EngineUi) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    engine.crashNote?.let { Text(it, color = tokens.muted, fontSize = 13.sp) }
+    if (engine.serverUp) return
+    val why = engine.serverError?.lineSequence()?.firstOrNull()?.take(120)
+    if (why == null) {
+        Text("Starting the engine…", color = tokens.muted, fontSize = 13.sp)
+        return
+    }
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text(why, color = tokens.err, fontSize = 13.sp, modifier = Modifier.weight(1f))
+        OutlinedButton(shape = Corner, onClick = { io.bigmoeonedge.app.engine.Engine.start(context) }) { Text("Start engine") }
     }
 }

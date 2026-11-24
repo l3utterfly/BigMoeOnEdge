@@ -16,25 +16,31 @@
 
 デバイスのメモリより大きな Mixture-of-Experts モデルを実行します。エキスパートは、モデルが必要とするときにフラッシュから読み込まれます。
 Android、iOS、macOS、Windows、Linux に対応し、llama.cpp の上に構築されています。
+統合ストリーミングフレームワーク：スマートフォン、ノート PC から、コンシューマー向け GPU、データセンター向け GPU まで。あらゆるハードウェア、OS、モデル、量子化に対応します。
+リソースの割り当ては自動で、tok/s を最大化するようその構成に合わせて調整されます。
 
 <table align="center">
 <tr>
-<td align="center" width="50%"><img src="docs/assets/screens/android.gif" width="220" alt="12 GB の Android スマートフォンで Qwen3.6-35B-A3B がリアルタイムに回答を生成している様子。"></td>
-<td align="center" width="50%"><img src="docs/assets/screens/iphone.gif" width="220" alt="12 GB の iPhone で Qwen3.6-35B-A3B がリアルタイムに回答を生成している様子。"></td>
+<td align="center" width="50%"><img src="https://github.com/user-attachments/assets/7967bed2-6094-489f-bd60-05b0b1980102" width="220" alt="12 GB の Android スマートフォンで Qwen3.6-35B-A3B がリアルタイムに回答を生成している様子。"></td>
+<td align="center" width="50%"><img src="https://github.com/user-attachments/assets/26760326-2ef5-4b4a-950d-581c99e58206" width="220" alt="Qwen3.6-35B-A3B を読み込んだ 12 GB の iPhone の iPhone アプリ：画像についてのチャット、プラン、モデル、設定をリアルタイムで。"></td>
 </tr>
 <tr>
-<td align="center">12 GB Android スマートフォン</td>
-<td align="center">12 GB iPhone</td>
+<td align="center">12 GB Android スマートフォン<br>Qwen3.6-35B-A3B · 5-6 tok/s</td>
+<td align="center">12 GB iPhone<br>Qwen3.6-35B-A3B · 6 tok/s</td>
 </tr>
 <tr>
-<td align="center" colspan="2"><img src="docs/assets/screens/desktop.gif" width="620" alt="16 GB の Apple silicon ノート PC 上のデスクトップアプリで、Qwen3.6-35B-A3B が 20 tok/s でリアルタイムに回答を生成している様子。"></td>
+<td align="center" colspan="2"><img src="https://github.com/user-attachments/assets/0e1fd1d2-4976-4ecf-a56f-fee60f5dff74" width="620" alt="16 GB の Apple silicon ノート PC 上のデスクトップアプリで、Qwen3.6-35B-A3B が 21 tok/s でリアルタイムに回答を生成している様子。"></td>
 </tr>
 <tr>
-<td align="center" colspan="2">16 GB Apple silicon ノート PC</td>
+<td align="center" colspan="2">16 GB Apple silicon ノート PC<br>Qwen3.6-35B-A3B · 18-24 tok/s</td>
 </tr>
 </table>
 
-各デバイスでリアルタイムに動作する Qwen3.6-35B-A3B（21 GB）です。モデルはいずれのデバイスのメモリよりも大きいサイズです。
+Qwen3.6-35B-A3B は、いずれのデバイスのメモリよりも大きいモデルです。GGUF 形式の MoE モデルであれば、どの量子化でも動作します。デコード速度は[パフォーマンス](#パフォーマンス)の表の値です。
+
+**2021 年のノート PC、GPU なしでのエージェント**：話題のボクセル五重塔プロンプトを、16 GB の RAM を積んだ ThinkPad（CPU のみ）上の内蔵エージェントに、Qwen3.6-35B-A3B Q4_K_M で渡しました。2.3 tok/s で 988 行を書き、その後アプリのプレビューでページを表示します。早送りの箇所は画面に表示しています。
+
+<p align="center"><img src="https://github.com/user-attachments/assets/1da744d4-dd98-4d14-a76e-50bdf0d9aec4" width="640" alt="内蔵エージェントが、15 GB の RAM を積み専用 GPU のない 2021 年の ThinkPad で、ボクセルの五重塔の庭を 1 つの HTML ファイルとして書き、そのページがアプリのプレビューで回転します。"></p>
 
 ## できること
 
@@ -43,6 +49,7 @@ Android、iOS、macOS、Windows、Linux に対応し、llama.cpp の上に構築
 - **任意の MoE GGUF。** llama.cpp が読み込めるものなら、どの量子化でも使えます。モデルごとのコードはありません。
 - **すべてのバックエンド。** CPU、Metal、CUDA、HIP、Vulkan、OpenCL、Hexagon NPU。グラフィックカードでは、よく使われるエキスパートが VRAM に残ります。
 - **アプリとサーバー。** デスクトップアプリ、スマートフォンアプリ、そしてコーディングエージェント向けの OpenAI・Anthropic 互換サーバーがあります。
+- **画像を読めます。** モデルのプロジェクターファイル（`mmproj`）をモデルの横に置くと、サーバーはすべての API で画像を読み込みます。CLI では `--mmproj` と `--image` を使います。llama.cpp のプロジェクターライブラリが対応するビジョンモデルなら、どの量子化でも、すべてのバックエンドで動きます。
 
 ## パフォーマンス
 
@@ -50,14 +57,23 @@ Android、iOS、macOS、Windows、Linux に対応し、llama.cpp の上に構築
 |---|---|---|---:|---|---:|
 | **Android スマートフォン** | 12 GB | DeepSeek V4 Flash 284B | 91 GB | フラッシュ | 1 |
 |  |  | Qwen3.8-Flash-Next 125B | 80 GB | フラッシュ | 2-4 |
-|  |  | Qwen3.6-35B-A3B | 21 GB | フラッシュ | 5 |
-| **iPhone** | 12 GB | Qwen3.6-35B-A3B | 21 GB | フラッシュ | 3 |
+|  |  | Qwen3.6-35B-A3B | 21 GB | フラッシュ | 5-6 |
+| **iPhone** | 12 GB | Qwen3.6-35B-A3B | 21 GB | フラッシュ | 6 |
 | **Apple silicon ノート PC** | 16 GB | Qwen3.8-Flash-Next 125B | 76 GB | フラッシュ | 7-9 |
 |  |  | Qwen3.6-35B-A3B | 21 GB | フラッシュ | 18-24 |
 | **Windows ノート PC** | 16 GB | Qwen3.6-35B-A3B | 21 GB | フラッシュ | 5 |
+| **デスクトップ GPU**（NVIDIA） | 12 GB + 128 GB RAM | Qwen3.8-Flash-Next 125B | 84 GB | RAM、GPU キャッシュ | 16-17 |
 | **デスクトップ GPU**（NVIDIA） | 16 GB + 32 GB RAM | Qwen3.8-Flash-Next 125B | 66 GB | フラッシュ、GPU キャッシュ | 19-21 |
 | **デスクトップ GPU**（NVIDIA） | 24 GB + 96 GB RAM | Qwen3.8-Flash-Next 125B | 66 GB | RAM、GPU キャッシュ | 70 |
 |  |  | Qwen3.6-35B-A3B | 21 GB | GPU | 217 |
+| **デスクトップ GPU**（NVIDIA） | 24 GB + 62 GB RAM | Qwen3.6-35B-A3B | 21 GB | GPU | 154 |
+|  | うち 12 GB が空き | Qwen3.6-35B-A3B | 21 GB | RAM、GPU キャッシュ | 59-67 |
+|  |  | Gemma 4 26B-A4B | 17 GB | GPU | 114 |
+|  |  | Laguna XS 2.1 33B | 20 GB | GPU | 93-94 |
+| **デスクトップ GPU**（NVIDIA） | 8 GB + 31 GB RAM | Qwen3.8-Flash-Next 125B | 66 GB | フラッシュ、GPU キャッシュ | 16 |
+|  |  | Qwen3.6-35B-A3B | 21 GB | RAM、GPU キャッシュ | 37-44 |
+| **デスクトップ GPU ×2**（NVIDIA） | 2 × 16 GB + 60 GB RAM | Qwen3.8-Flash-Next 125B | 66 GB | RAM、GPU キャッシュ | 41-48 |
+|  |  | DeepSeek V4 Flash 284B | 91 GB | フラッシュ、GPU キャッシュ | 5 |
 | **データセンター GPU**（AMD、ROCm） | 192 GB | Qwen3.8-Flash-Next 125B | 66 GB | GPU | 53 |
 
 範囲は複数回の実行でのばらつきです。計測方法とすべての実行結果：
@@ -114,6 +130,21 @@ print(reply.choices[0].message.content)
 Claude Code には 65536 で足ります
 （[コンテキストのサイズ設定](docs/server-api.md#sizing-the-context-for-a-client)）。
 
+```jsonc
+// opencode, ~/.config/opencode/opencode.json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "bmoe": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8765/v1", "apiKey": "local" },
+      "models": { "<model id from /v1/models>": { "limit": { "context": 32768, "output": 8192 } } }
+    }
+  },
+  "model": "bmoe/<model id from /v1/models>"
+}
+```
+
 ```bash
 # Claude Code
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8765
@@ -136,8 +167,7 @@ wire_api = "responses"
 env_key = "BMOE_API_KEY"   # export BMOE_API_KEY=local
 ```
 
-opencode では、このサーバーを `http://127.0.0.1:8765/v1` の OpenAI 互換プロバイダーとして追加します。
-**Connect apps** では、アプリが Codex CLI と opencode 向けの設定を書き込み、Claude Code 向けの設定を表示します。
+**Connect apps** では、アプリが opencode と Codex CLI 向けの設定を書き込み、Claude Code 向けの設定を表示します。
 
 **エージェント。** デスクトップアプリには独自のエージェントがあります。選んだフォルダーの中で作業し、ファイルを読んで編集し、
 コマンドを実行します。許可しない限り、何かを変更する前に確認を求めます。会話は OpenCode、Claude Code、Codex、Pi で
@@ -164,12 +194,16 @@ Apple silicon の Mac では GPU が CPU と同じ RAM を使うため、階層�
 ## プランナー
 
 <p align="center">
-  <img src="docs/assets/screens/plan-mac.png" width="820" alt="16 GB Apple silicon ノート PC で Qwen3.6-35B-A3B Q4_K_M を動かした Plan 画面：エキスパートは 6.6 GiB のキャッシュ付きでフラッシュから読み込まれ、プロンプトは GPU、トークンは CPU で処理。実測 23.9 tok/s、キャッシュヒット率 94%、メモリの内訳。">
+  <img src="https://github.com/user-attachments/assets/98e6de3e-e27d-482d-bff1-26fc66074af4" width="820" alt="16 GB Apple silicon ノート PC で Qwen3.6-35B-A3B Q4_K_M を動かした Plan 画面：エキスパートは 6.6 GiB のキャッシュ付きでフラッシュから読み込まれ、プロンプトは GPU、トークンは CPU で処理。実測 23.9 tok/s、キャッシュヒット率 94%、メモリの内訳。">
 </p>
 
 プランナーはモデルのヘッダーを読み、マシンを計測します：メモリ、ストレージ速度、各 CPU・GPU・NPU。そのルールは
 特定のデバイスやプラットフォームを名指ししないため、同じコードからスマートフォンとデスクトップに異なるプランが
 導かれます。自分で設定した値は維持されます。[docs/hardware-planning.md](docs/hardware-planning.md) を参照してください。
+
+<p align="center">
+  <img src="docs/assets/diagrams/plan-ja.png" width="820" alt="プランナー：マシンとモデルからプランを作り、各重みの置き場所（VRAM、RAM、フラッシュ）、プロンプトを処理するデバイスとトークンを生成するデバイス、キャッシュサイズとスレッド数を決めます。最初の回答を計測し、速い方を次回の読み込みのために保存します。">
+</p>
 
 ## プラットフォーム
 
@@ -195,9 +229,7 @@ Apple silicon の Mac では GPU が CPU と同じ RAM を使うため、階層�
 | GGUF の任意の MoE モデル | ✅ | 少数のモデル | 少数のモデル | 独自形式 | 少数のモデル |
 | 自動設定 | ✅ `--auto` | メモリに応じてモデルを選択 | エキスパートキャッシュの予算 | `coli tune` | ❌ |
 
-モデルがゲーミング GPU と RAM の合計に収まる場合、Strata は 2〜4 倍速くなります。フラッシュからストリーミングする場合は、
-どのエンジンも毎秒 10 トークン未満で、速度を決めるのはドライブです。速度と出典：
-[docs/comparison.md](docs/comparison.md)。
+速度と出典：[docs/comparison.md](docs/comparison.md)。
 
 ## ソースからのビルド
 

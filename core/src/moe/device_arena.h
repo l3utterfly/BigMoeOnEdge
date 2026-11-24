@@ -3,10 +3,11 @@
 // A model larger than RAM cannot give the device a resident copy of its experts, and a prefill graph
 // hundreds of tokens wide needs nearly every expert of every layer anyway. So the device gets TWO
 // layer-sized slots of expert weights and every MoE layer's expert tensors are bound to one of them,
-// alternating. Loader threads read the next layer from the gguf into per-lane staging buffers.
-// A backend's streaming-buffer capability permits workers to upload into disjoint idle slots.
-// Otherwise the graph thread uploads at its barriers: ordinary writes may synchronize the command
-// queue. Each lane retains its staging bytes until the upload completes, bounding host staging memory.
+// alternating. While the device computes layer k out of one slot, a pool of loader threads fills the
+// other with layer k+1: read each expert's bytes from the gguf, hand them to the backend through
+// ggml_backend_tensor_set on a per-expert view (which is where a repacking backend lays them out in
+// its own format). One flash pass per graph, hidden behind compute when compute is the longer of the
+// two.
 //
 // The pacing point is the layer's routing node, which the router hook already knows how to find and
 // isolate: when the scheduler stops there, every op of layer k-1 has finished, so the slot k+1 goes
@@ -14,12 +15,13 @@
 // and waits for the current one. The routing itself is not read: at this width it selects nearly
 // every expert, and on the device it is not in host memory to read.
 //
-// The layer's other weights (attention, norms, shared experts) can ride the same two-slot scheme
-// (init_dense). They are resident on the host already, so filling them is a copy, not a read; what
-// they cost the device is two layers of them instead of all of them, which on unified memory is the
-// difference between fitting the device's session and not. They are needed before the layer's
-// routing, so they are paced one layer ahead, at the last node of the previous layer (learned from
-// the capture graph, since no node name is common to every architecture).
+// The layer's other matrices (attention, shared experts) can ride the same two-slot scheme
+// (init_dense; its few weights that are not a matmul's matrix stay on the device instead). They are
+// resident on the host already, so filling them is a copy, not a read; what they cost the device is
+// two layers of them instead of all of them, which on unified memory is the difference between
+// fitting the device's session and not. They are needed before the layer's routing, so they are
+// paced one layer ahead, at the last node of the previous layer (learned from the capture graph,
+// since no node name is common to every architecture).
 //
 // Decode never sees any of this. place(false) hands every expert tensor back to the binding it had
 // (the streamer's), and the slots are not a cache: each graph refills them from layer 0.
@@ -88,8 +90,12 @@ public:
     // `non_matrix` are the weights some op reads other than as a matmul's matrix (RouterHook::
     // non_matrix_weights). A backend may keep a WEIGHTS buffer in a form only its matmul kernels
     // address (Hexagon maps it for DMA only when DMA64 is on, and most other kernels refuse it), so
-    // these ride a second pair of slots marked as plain memory, in their own type. The matrices keep
-    // the WEIGHTS slots, where the backend lays them out for its matmul.
+    // these live in plain device memory, in their own type. They are not streamed: every layer's
+    // are written once, here, and stay. A backend may make a write to plain memory wait for its op
+    // queue (Hexagon flushes it, and that queue is not thread-safe), so the loaders, which write while
+    // a graph runs, must never write one; and they are norms, biases and convolution kernels, a few
+    // MiB in all. The matrices ride the two WEIGHTS slots, where the backend lays them out for its
+    // matmul and a write leaves the queue alone.
     bool init_dense(ggml_backend_dev_t dev,
                     const std::vector<std::vector<ggml_tensor *>> & per_layer,
                     const std::unordered_set<const ggml_tensor *> & non_matrix,
@@ -99,11 +105,22 @@ public:
     // binding is taken at the moment of the swap, so whatever the streamer bound stays authoritative.
     void place(bool on_device);
 
-    // Start of a device graph: queue the first two layers. Each graph refills from layer 0.
+    // The order the graph runs its layers in, and the block of weights each one computes from:
+    // `layers[i]` is the i-th layer the graph runs, by the graph's own index, and `blocks[i]` the
+    // layer id its weights are filed under (the index `init` and `init_dense` take). Read off the
+    // graph by whoever captured it. Without a call the graph is taken to run layer 0, 1, 2... each
+    // on its own weights, which is every model whose blocks run once; with one, a routing node of a
+    // layer the lists do not name fails its graph. A graph that comes back to a block (a looped core) names it again:
+    // what is "next" is then the next entry here, not the next index, and a block the slots still hold is not read
+    // twice. Call after init and init_dense, between graphs.
+    void set_graph_order(const std::vector<int> & layers, const std::vector<int> & blocks);
+
+    // Start of a device graph: queue the first layers the graph runs. Each graph refills from its
+    // first layer.
     void begin_graph();
-    // At layer il's routing node: queue the next layer into the slot the previous one just freed,
-    // then wait until il's experts are in place. A layer with no slot passes straight through.
-    // `topk` is that node (the routed ids); only the routed mode reads it.
+    // At the routing node of graph layer `il`: queue the layer the graph runs next into the slot the
+    // previous one just freed, then wait until this one's experts are in place. A layer with no slot
+    // passes straight through. `topk` is that node (the routed ids); only the routed mode reads it.
     void barrier(int il, const ggml_tensor * topk = nullptr);
 
     // Routed mode (the session's default). Off, every layer's whole expert set is read, ahead of its
@@ -121,8 +138,8 @@ public:
     // reads the prediction missed, which the graph waited for).
     uint64_t routed_used() const { return routed_used_.load(); }
     uint64_t routed_demand() const { return routed_demand_.load(); }
-    // At the last node of layer il: its dense slot is free, so queue layer il+2 into it, and wait
-    // for layer il+1's. With no dense slots this is a no-op.
+    // At the last node of graph layer `il`: its dense slot is free, so queue the layer after the
+    // next into it, and wait for the next one's. With no dense slots this is a no-op.
     void dense_barrier(int il);
     // End of a device graph: wait out anything still in flight (only a graph that stopped early
     // leaves any), so the next graph starts from empty queues.
@@ -133,12 +150,18 @@ public:
     // Test hook: routed mode skips its reads at the routing node (PrefillDeviceConfig::test_routed_skip_demand).
     void set_test_skip_demand(bool on) { test_skip_demand_ = on; }
 
+    // Fill from the expert cache where it holds the expert (PrefillDeviceConfig::from_cache): a copy
+    // from RAM instead of a flash read, same bytes. Null turns it off. Between graphs only.
+    void set_cache(const ExpertStreamSource * cache) { cache_ = cache; }
+
     bool failed() const { return failed_.load(); }
     uint64_t read_bytes() const { return read_bytes_.load(); }
+    uint64_t cache_bytes() const { return cache_bytes_.load(); } // copied from the expert cache
     double stall_seconds() const { return stall_ns_.load() * 1e-9; }
     size_t slot_bytes() const { return slot_bytes_; }
     int n_slots() const { return n_slots_; }
-    size_t dense_slot_bytes() const { return dense_slot_bytes_; }
+    size_t dense_slot_bytes() const { return dense_slot_bytes_; }         // both slots and the resident buffer
+    size_t dense_resident_bytes() const { return dense_resident_bytes_; } // of which the non-matrix weights
     int dense_converted() const { return dense_converted_; }
     size_t dense_converted_bytes() const { return dense_converted_bytes_; }
     bool has_dense() const { return !dense_.empty(); }
@@ -172,7 +195,8 @@ private:
     };
     struct DenseLayer {
         std::vector<ggml_tensor *> t;    // the model's tensors
-        std::vector<ggml_tensor *> twin; // their places in dense slot il % 2
+        std::vector<ggml_tensor *> twin; // their places: dense slot il % 2, or the resident buffer
+        std::vector<int> streamed;       // which of them a graph writes again (the matrices)
         std::vector<const void *> src;   // host bytes, taken at init: t is rebound while filling
         std::vector<ggml_backend_buffer_t> host_buffer;
         std::vector<void *> host_data, host_extra;
@@ -183,25 +207,33 @@ private:
         std::vector<std::array<size_t, GGML_MAX_DIMS>> host_nb;
     };
 
-    struct Upload {
-        ggml_tensor * tensor;
-        const void * data;
-        size_t size;
-        ggml_tensor * bound;
-        bool done = false;
-    };
-    // Without the streaming capability, workers retain staging bytes until the graph thread uploads.
-    void upload(ggml_tensor * tensor, const void * data, size_t size, ggml_tensor * bound = nullptr);
-    void drain(std::unique_lock<std::mutex> & lock, const int & remaining);
-    std::deque<Upload *> uploads_;
     void worker(int lane);
     // Queue layer k's experts that `want` marks (all when null) and are not queued yet this graph;
     // `front` puts them ahead of everything waiting. Caller holds mu_.
     void schedule(int k, const std::vector<uint8_t> * want = nullptr, bool front = false);
     void schedule_dense(int il); // caller holds mu_
+    // The block graph layer `il` computes from, and the one the graph runs `ahead` layers after it
+    // (-1 past the end). Identity where set_graph_order named nothing.
+    int block_at(int il, int ahead) const;
+    // Index into order_ of a block, -1 for one with no experts or out of range.
+    int k_of(int block) const {
+        return block >= 0 && block < (int) k_of_layer_.size() ? k_of_layer_[(size_t) block] : -1;
+    }
+    // The next expert-carrying block the graph runs after graph layer `il`, as an index into order_.
+    int next_k(int il) const;
+    void rebuild_order(); // identity for the layers set_graph_order did not name
 
-    std::vector<Layer> order_;    // bound layers in graph order
+    std::vector<Layer> order_;    // bound layers, ascending by layer id
     std::vector<int> k_of_layer_; // layer id -> index into order_, -1 for dense layers
+    // The graph's run order (set_graph_order): position -> block, and graph layer -> position.
+    std::vector<int> run_block_;
+    std::vector<int> pos_of_layer_;
+    std::vector<int> given_layers_, given_blocks_; // what set_graph_order was handed, kept for a rebuild
+    // Which block's weights each slot holds, or is being filled with (-1: none). A block that is
+    // queued into a slot another block held starts from nothing; one queued again into its own slot
+    // keeps what this graph already put there.
+    int expert_owner_[max_slots] = {-1, -1};
+    int dense_owner_[2] = {-1, -1};
     int n_expert_ = 0;
     int n_proj_ = 0;
 
@@ -247,7 +279,6 @@ private:
     int in_flight_ = 0;
     bool stop_ = false;
     bool on_device_ = false;
-    bool parallel_uploads_ = false;
     int test_delay_us_ = 0;
     bool test_skip_demand_ = false;
 
@@ -257,6 +288,7 @@ private:
     // matrices (usage WEIGHTS), data 1 every other layer weight (plain memory).
     ggml_backend_buffer_t dense_slot_[2][2] = {};
     size_t dense_slot_bytes_ = 0;
+    size_t dense_resident_bytes_ = 0;
     int dense_converted_ = 0;
     size_t dense_converted_bytes_ = 0;
     std::vector<int> dense_remaining_;
@@ -265,6 +297,8 @@ private:
 
     std::atomic<bool> failed_{false};
     std::atomic<uint64_t> read_bytes_{0};
+    std::atomic<uint64_t> cache_bytes_{0};
+    const ExpertStreamSource * cache_ = nullptr;
     std::atomic<uint64_t> stall_ns_{0};
 };
 

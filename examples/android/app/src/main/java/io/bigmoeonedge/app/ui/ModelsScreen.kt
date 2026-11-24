@@ -1,6 +1,8 @@
 package io.bigmoeonedge.app.ui
 
 import androidx.compose.ui.draw.shadow
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.background
 
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -19,8 +21,11 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -145,7 +150,8 @@ fun ModelsScreen(modifier: Modifier = Modifier, onOpenChat: () -> Unit = {}) {
             TopAppBar(
                 title = { Text("Models") },
                 navigationIcon = { Box(Modifier.padding(start = 16.dp)) { BrandMark(wordmark = false) } },
-                actions = { TextButton(shape = Corner, onClick = { requestSharedStorageAccess(context); refreshKey++ }) { Text("Refresh") } },
+                actions = { TextButton(shape = Corner, colors = shellActionColors(), onClick = { requestSharedStorageAccess(context); refreshKey++ }) { Text("Refresh") } },
+                colors = shellTopBarColors(),
             )
         },
         snackbarHost = { SnackbarHost(snackbar) },
@@ -154,22 +160,22 @@ fun ModelsScreen(modifier: Modifier = Modifier, onOpenChat: () -> Unit = {}) {
             Modifier.padding(padding).fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            if (!engine.serverUp) {
-                Text("The engine is not running.", color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
-            }
+            EngineDown(engine)
             if (engine.info?.state == "error") {
                 Text("Last load failed: ${engine.info?.error.orEmpty()}", color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
             }
             if (engine.loading) {
                 // Seconds since the load began, so a long load reads as progress rather than as a hang.
-                var elapsed by remember { mutableStateOf(0) }
-                LaunchedEffect(Unit) {
-                    val t0 = System.currentTimeMillis()
+                // Counted from the engine's own start time, not this screen's: leaving and coming back
+                // used to restart the count at zero.
+                var now by remember { mutableStateOf(System.currentTimeMillis()) }
+                LaunchedEffect(engine.loadStartedAt) {
                     while (true) {
-                        elapsed = ((System.currentTimeMillis() - t0) / 1000).toInt()
+                        now = System.currentTimeMillis()
                         delay(1000)
                     }
                 }
+                val elapsed = if (engine.loadStartedAt > 0) ((now - engine.loadStartedAt) / 1000).toInt().coerceAtLeast(0) else 0
                 val planning = engine.info?.state == "planning"
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
@@ -402,7 +408,8 @@ private fun ModelRow(
                 e?.quant?.ifEmpty { null },
                 gbLabel(size),
                 m?.arch?.ifEmpty { null },
-                m?.takeIf { it.complete }?.let { if (it.streamable) "streams" else "not a MoE this build streams" },
+                // How it runs is the header's to say: nothing while shards are missing or it is unread.
+                m?.takeIf { it.complete && it.arch.isNotEmpty() }?.let { if (it.streamable) "streams" else "not a MoE this build streams" },
                 m?.takeIf { r.state == RowState.INCOMPLETE || r.state == RowState.PARTIAL }?.let { "${it.files.size} of ${it.shards} shards here" }
                     ?: m?.shards?.takeIf { it > 1 }?.let { "$it shards" },
                 m?.name?.takeIf { it != r.title },
@@ -425,12 +432,12 @@ private fun ModelRow(
                 r.state == RowState.LOADED && m != null -> {
                     OutlinedButton(shape = Corner, onClick = { onLoad(m.path) }, enabled = canLoad) { Text("Reload") }
                     OutlinedButton(shape = Corner, onClick = onUnload) { Text("Unload") }
-                    Button(shape = Corner, onClick = onOpenChat) { Text("Go to Chat") }
+                    Button(shape = Corner, colors = primaryButtonColors(), onClick = onOpenChat) { Text("Go to Chat") }
                 }
-                r.state == RowState.ON_DEVICE && m != null -> Button(shape = Corner, onClick = { onLoad(m.path) }, enabled = canLoad) { Text("Load") }
+                r.state == RowState.ON_DEVICE && m != null -> Button(shape = Corner, colors = primaryButtonColors(), onClick = { onLoad(m.path) }, enabled = canLoad) { Text("Load") }
                 r.state == RowState.DOWNLOADING && e != null -> OutlinedButton(shape = Corner, onClick = { onCancel(e) }) { Text("Cancel") }
                 e != null && r.state in setOf(RowState.AVAILABLE, RowState.PARTIAL, RowState.INCOMPLETE) -> {
-                    Button(shape = Corner, onClick = { onDownload(e) }) {
+                    Button(shape = Corner, colors = primaryButtonColors(), onClick = { onDownload(e) }) {
                         Text(if (e.partial) resumeLabel(e.received, e.bytes) else "Download", maxLines = 1, softWrap = false)
                     }
                     if (e.partial) TextButton(shape = Corner, onClick = { onDeletePartial(e) }) { Text("Delete partial") }
@@ -480,12 +487,16 @@ private fun LinkImport(onAdded: suspend (CatalogEntry) -> Unit) {
         busy = false
     }
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        val canAdd = url.isNotBlank() && !busy
+        val focus = LocalFocusManager.current
         OutlinedTextField(
             value = url, onValueChange = { url = it },
             label = { Text("https://…/model.gguf") },
             singleLine = true, modifier = Modifier.fillMaxWidth(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),
+            keyboardActions = KeyboardActions(onGo = { if (canAdd) { focus.clearFocus(); add() } }),
         )
-        Button(shape = Corner, onClick = { add() }, enabled = url.isNotBlank() && !busy, modifier = Modifier.fillMaxWidth()) {
+        Button(shape = Corner, colors = primaryButtonColors(), onClick = { add() }, enabled = canAdd, modifier = Modifier.fillMaxWidth()) {
             Text(if (busy) "Checking the link…" else "Download")
         }
         Hint("A link to one file, or to any shard of a split set (the other shards are fetched beside it). It is added to Your models and downloads like any other.")

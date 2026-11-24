@@ -18,9 +18,11 @@ add_library(bmoe_core STATIC
     src/plan/backend_choice.cpp
     src/plan/routing.cpp
     src/engine/logits.cpp
+    src/engine/logit_agreement.cpp
     src/engine/cache_brake.cpp
     src/engine/knob_trial.cpp
     src/plan/measured_knobs.cpp
+    src/plan/model_records.cpp
     src/engine/decide/prompt_split.cpp
     src/engine/decide/choice_scorer.cpp
     src/engine/decide/prefix_cache.cpp
@@ -42,6 +44,7 @@ if(BMOE_HAVE_LLAMA)
         src/io/platform_io.cpp
         src/io/file_reader.cpp
         src/io/mapping_release.cpp
+        src/io/parallel_copy.cpp
         src/moe/dense_weights.cpp
         src/moe/row_stream.cpp
         src/moe/gguf_offsets.cpp
@@ -56,6 +59,7 @@ if(BMOE_HAVE_LLAMA)
         src/plan/placement_probe.cpp
         src/plan/model_probe.cpp
         src/plan/auto_plan.cpp
+        src/moe/discardable_entries.cpp
         src/moe/expert_stream_source.cpp
         src/moe/gate_gemv.cpp
         src/moe/router_hook.cpp
@@ -67,8 +71,10 @@ if(BMOE_HAVE_LLAMA)
         src/engine/media_input.cpp
         src/engine/image_probe.cpp
         src/engine/llama_log.cpp
+        src/engine/device_answer.cpp
         src/engine/prefill_device.cpp
         src/engine/prefill_path.cpp
+        src/engine/compute_reservation.cpp
         src/engine/decide/llama_backend.cpp
         src/engine/chat_parse.cpp
         src/engine/chat_messages.cpp
@@ -92,6 +98,23 @@ if(BMOE_HAVE_LLAMA)
     find_package(Threads REQUIRED)
     target_link_libraries(bmoe_core PUBLIC Threads::Threads)
 
+    # The native memory-topology answers (memory_topology.h): one source per API, compiled where the
+    # backend is, and nothing linked for them - OpenCL is read through the library its backend loaded.
+    target_sources(bmoe_core PRIVATE src/plan/native_memory_probe.cpp)
+    if(GGML_OPENCL)
+        find_path(BMOE_OPENCL_INCLUDE CL/cl.h HINTS ${OpenCL_INCLUDE_DIR} ${OpenCL_INCLUDE_DIRS})
+        if(BMOE_OPENCL_INCLUDE)
+            target_sources(bmoe_core PRIVATE src/plan/opencl_memory_probe.cpp)
+            target_include_directories(bmoe_core PRIVATE ${BMOE_OPENCL_INCLUDE})
+            target_compile_definitions(bmoe_core PRIVATE BMOE_HAVE_OPENCL_MEMORY_PROBE=1)
+            if(NOT WIN32)
+                target_link_libraries(bmoe_core PRIVATE ${CMAKE_DL_LIBS})
+            endif()
+        else()
+            message(STATUS "bmoe: OpenCL headers not found; the OpenCL memory-topology answer is left out")
+        endif()
+    endif()
+
     if(APPLE AND GGML_METAL)
         target_sources(bmoe_core PRIVATE src/plan/metal_memory_probe.mm)
         set_source_files_properties(src/plan/metal_memory_probe.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
@@ -103,6 +126,13 @@ if(BMOE_HAVE_LLAMA)
         # libandroid carries AHardwareBuffer_*, Android's reclaim-exempt allocation behind
         # `--dense-weights pinned` (pio::pinned_alloc; Darwin's needs no extra library).
         target_link_libraries(bmoe_core PUBLIC android)
+        # The API is 26 and up. A build for an older minimum (Termux's toolchain targets 24, where the
+        # header marks the calls unavailable) binds it weakly, and platform_io.cpp asks the device in
+        # one place before any use. The error turns a call without that check into a build failure
+        # instead of a crash on an older device. At a minimum of 26 or more neither changes anything.
+        set_property(SOURCE src/io/platform_io.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                     __ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__)
+        set_property(SOURCE src/io/platform_io.cpp APPEND PROPERTY COMPILE_OPTIONS -Werror=unguarded-availability)
     endif()
     if(WIN32)
         # QueryWorkingSetEx, behind the dense residency sensor (pio::vm_resident_sample). Newer SDKs

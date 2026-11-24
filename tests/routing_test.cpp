@@ -72,7 +72,7 @@ static void replay_matches_script(const char * tag,
 
     // The curve: from nothing to the whole set, non-decreasing, and at the run's budget where the
     // replay put it (interpolation between two points never leaves the two points' range).
-    const HitCurve c = hit_curve(t, k_hit_curve_points);
+    const HitCurve c = hit_curve(t, k_hit_curve_points, 0);
     bool mono = c.measured && c.points.size() == k_hit_curve_points + 1 && c.points.front().cache_bytes == 0;
     for (size_t i = 1; i < c.points.size(); ++i)
         mono = mono && c.points[i].hit >= c.points[i - 1].hit && c.points[i].cache_bytes > c.points[i - 1].cache_bytes;
@@ -86,6 +86,45 @@ static void replay_matches_script(const char * tag,
         last = h;
     }
     check(share_mono, std::string(tag) + ": hit_share is monotone in [0, 1] at any size");
+
+    // The decayed-frequency replay (the engine's default eviction): where LRU's first row hits
+    // nothing (a budget under one token's experts), it hits; at every budget it reads no more than
+    // the miss count allows; and with a half-life of 0 it is the LRU replay exactly.
+    const ReplayCounts lru0 = replay_cache(t, (uint64_t) (rows.front().budget_mib * MiB), 0);
+    const ReplayCounts lru1 = replay_lru(t, (uint64_t) (rows.front().budget_mib * MiB));
+    check(lru0.hits == lru1.hits && lru0.read_bytes == lru1.read_bytes,
+          std::string(tag) + ": replay_cache at half-life 0 is the LRU replay");
+    if (rows.front().hit_pct_decode == 0.0) {
+        const ReplayCounts f = replay_cache(t, (uint64_t) (rows.front().budget_mib * MiB), 8);
+        char got[64];
+        std::snprintf(got, sizeof(got), "%.2f%% decode hit", 100.0 * f.decode_hit());
+        check(f.decode_hit() > 0.05,
+              std::string(tag) + ": under one token cycle, decayed frequency hits where LRU does not", got);
+    }
+    const HitCurve fc = hit_curve(t, k_hit_curve_points, 8);
+    bool fmono = fc.measured && fc.points.size() == k_hit_curve_points + 1;
+    for (size_t i = 1; i < fc.points.size(); ++i)
+        fmono = fmono && fc.points[i].hit >= fc.points[i - 1].hit;
+    check(fmono, std::string(tag) + ": the decayed-frequency curve is non-decreasing");
+    // Every point is the replay at its size, whether or not the curve replayed it: it stops at the
+    // first size nothing was evicted at, and the sizes past it must be what a replay would have said.
+    for (const int half_life : {0, 8}) {
+        const HitCurve & curve = half_life ? fc : c;
+        bool same = curve.points.size() == k_hit_curve_points + 1;
+        double best = 0.0;
+        uint32_t unbound = 0;
+        for (uint32_t i = 1; same && i <= k_hit_curve_points; ++i) {
+            const ReplayCounts r = replay_cache(t, curve.points[i].cache_bytes, half_life);
+            best = std::max(best, r.decode_hit());
+            unbound += r.evictions == 0;
+            same = curve.points[i].hit == best;
+        }
+        check(same, std::string(tag) + ": every curve point is the replay at its size, half-life " +
+                        std::to_string(half_life));
+        check(unbound > 0 && replay_cache(t, 0, half_life).evictions > 0,
+              std::string(tag) + ": the record leaves part of the set untouched, so some sizes never evict (" +
+                  std::to_string(unbound) + " of " + std::to_string(k_hit_curve_points) + ")");
+    }
 }
 
 int main() {
@@ -161,22 +200,17 @@ int main() {
         check(!parse_routing_trace("hello\n", bad, err), "text that is not a trace is refused", err);
         check(!parse_routing_trace("# bmoe routing v1\n# n_layer=1 n_expert=4 n_expert_used=1\np 0 1\n", bad, err),
               "a layer without expert bytes is refused, never priced as free", err);
-    }
-
-    // The hottest experts: every routing is a use, ranked by uses, ties by block then id.
-    {
-        const std::vector<HotExpert> hot = hottest_experts(t);
-        // block 0: e0 3, e1 5, e2 2; block 1: e3 5, e0 2, e1 2, e2 1.
-        check(hot.size() == 7, "every expert used is listed", std::to_string(hot.size()));
-        check(hot.size() == 7 && hot[0].layer == 0 && hot[0].expert == 1 && hot[0].uses == 5 && hot[1].layer == 1 &&
-                  hot[1].expert == 3 && hot[1].uses == 5 && hot[2].layer == 0 && hot[2].expert == 0 && hot[2].uses == 3,
-              "ranked by uses, a tie by block then expert id");
-        const std::vector<HotExpert> top2 = hottest_experts(t, 2);
-        check(top2.size() == 2 && top2[0].expert == 1 && top2[1].expert == 3, "a limit keeps the hottest");
-        uint64_t total = 0;
-        for (const HotExpert & h : hot)
-            total += h.uses;
-        check(total == 20, "the uses add up to every routing in the trace", std::to_string(total));
+        // An id past the model's experts, in the route-trace CSV: the replay indexes its tables by
+        // layer and id, so this used to write past them. The preamble may come after the rows.
+        const std::string csv_head = "# route_trace v1\nturn,phase,step,layer,slot,expert,w,x,y\n";
+        const std::string csv_tail = "# n_layer=1 n_expert=4 n_expert_used=1\n# layer=0 expert_bytes=10\n";
+        check(parse_routing_trace(csv_head + "0,1,0,0,0,3,0,0,0\n" + csv_tail, bad, err) && bad.batches.size() == 1,
+              "a route-trace CSV with its ids in range is read", err);
+        check(!parse_routing_trace(csv_head + "0,1,0,0,0,300,0,0,0\n" + csv_tail, bad, err) &&
+                  err.find("out of range") != std::string::npos,
+              "a route-trace CSV row with an id past the experts is refused", err);
+        check(!parse_routing_trace(csv_head + "0,1,0,0,0,4294967297,0,0,0\n" + csv_tail, bad, err),
+              "a route-trace CSV row with an id past 32 bits is refused, not wrapped", err);
     }
 
     // attach_routing: a trace is this model's only if it matches the file and the run.
@@ -194,23 +228,23 @@ int main() {
             longer.batches.push_back({1, true, {3, 0}});
         }
         longer.decode_tokens = 43;
-        attach_routing(m, longer, 2);
+        attach_routing(m, longer, 2, 0);
         check(m.hit_curve.measured && m.hit_curve.rejected.empty(), "a matching trace gives the model its curve",
               m.hit_curve.rejected);
         check(m.hit_curve.hit_share(80) > 0.9, "the whole set serves nearly every decode lookup");
-        attach_routing(m, longer, 1);
+        attach_routing(m, longer, 1, 0);
         check(!m.hit_curve.measured && !m.hit_curve.rejected.empty(), "another top-k is another routing: refused",
               m.hit_curve.rejected);
-        attach_routing(m, t, 2);
+        attach_routing(m, t, 2, 0);
         check(!m.hit_curve.measured && !m.hit_curve.rejected.empty(), "a trace too short to be a curve is refused",
               m.hit_curve.rejected);
         ModelProfile other = m;
         other.expert_bytes = 160;
-        attach_routing(other, longer, 2);
+        attach_routing(other, longer, 2, 0);
         check(!other.hit_curve.measured, "another model's expert set is refused", other.hit_curve.rejected);
         other = m;
         other.moe_layers = {0, 1, 2};
-        attach_routing(other, longer, 2);
+        attach_routing(other, longer, 2, 0);
         check(!other.hit_curve.measured, "another model's blocks are refused", other.hit_curve.rejected);
         check(HitCurve{}.hit_share(1ull << 40) == 0.0, "an absent curve credits nothing by itself");
     }

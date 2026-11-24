@@ -8,20 +8,24 @@
 #pragma once
 
 #include "chat_turn.h"
+#include "engine_thread.h"
 #include "hosted_session.h"
 #include "turn_queue.h"
 #include "event_bus.h"
 #include "json_util.h"
+#include "llama_compat.h"
 
 #include "bmoe/config.h"
 #include "bmoe/log.h"
 #include "bmoe/session.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -106,12 +110,31 @@ public:
     // compares against. Returns an error for a config that cannot start, "" once the load is under
     // way.
     std::string load(const RunConfig & effective, const RunConfig & requested);
+
+    // What a load opens when `effective` cannot be opened: the plan's other side, where the plan names
+    // a side of a decision across loads (docs/measured-planning.md). Not tried for a load an unload
+    // cancelled. `taken` hears why the first open failed, on the loader thread, once the fallback has
+    // opened; the session then runs `requested`. Where the fallback fails too, the load ends in error
+    // with the first open's reason and `taken` is not called.
+    struct OpenFallback {
+        RunConfig effective, requested;
+        std::function<void(const std::string & error)> taken;
+    };
+    // load() with a fallback.
+    std::string load(const RunConfig & effective, const RunConfig & requested, std::optional<OpenFallback> fallback);
     void unload();
     void cancel();
 
     json info() const;
     bool ready() const;
     bool loaded_or_loading() const;
+    // A load under way: the engine's thread is taken until it ends.
+    bool loading() const;
+    // A model is or will soon be there: loaded, loading, or a load in auto mode measuring first. What
+    // a request waits for rather than being refused.
+    bool model_coming() const;
+    // Why the last load failed, for a person; empty unless the host is in its error state.
+    std::string load_error() const;
     bool generating() const { return generating_; }
     std::string model_name() const;
     // Whether the loaded model reads images (a projector was paired or named at load).
@@ -134,15 +157,33 @@ public:
     // turn is gone: the host then cancels this turn, and only this one. A front-end never cancels on
     // a failed write itself, since it cannot tell whose turn is running when the write fails (a
     // keep-alive while queued, the last frames after the turn ended). `still_wanted` (nullable) is
-    // asked while the turn waits its place and gives it up by returning false.
+    // asked while the turn waits its place and gives it up by returning false. It may write a
+    // keepalive, so it is never called concurrently with on_token. `stop` (nullable) is the caller's
+    // atomic flag, borrowed until return and forwarded to the engine's cancellation points,
+    // including encoding and prefill before any token exists. It never targets another turn.
     ChatOutcome chat(const ChatRequest & req,
                      const std::function<bool(const TokenMetrics &)> & on_token,
-                     const std::function<bool()> & still_wanted = nullptr);
+                     const std::function<bool()> & still_wanted = nullptr,
+                     const std::atomic<bool> * stop = nullptr,
+                     const std::function<void(const PrefillProgress &)> & on_prefill = nullptr);
+
+    // Run `f` on the loaded session's tokenizer and template (HostedSession::tokenize and kin), on
+    // the calling thread and beside any turn: they read the model and change nothing. False, with `f`
+    // not called, when no model is ready. The session cannot be closed while `f` runs.
+    bool with_session(const std::function<void(const HostedSession &)> & f) const;
+    // What /metrics reports (llama_compat.h), its rate window emptied by the read, as a scrape does.
+    std::string scrape_metrics();
+    // Turns waiting their place behind the running one.
+    size_t waiting() const { return turns_.waiting(); }
 
     // Read one decision (bmoe/decide.h) on the calling thread, in the same line as the chat turns:
     // one prefill, no decode. A refused request (no choices, colliding choices, a prompt past
     // n_ctx) is a 400 and leaves the session usable; a failed prefill closes it, as a failed turn does.
     DecideOutcome decide(const DecideRequest & req, const std::function<bool()> & still_wanted = nullptr);
+
+    // Run `f` on the thread every computation of the engine runs on (engine_thread.h), and return its
+    // result: what a front-end computes beside the session (a plan's probes) goes through here too.
+    template <class F> auto on_engine(F && f) { return engine_.run(std::forward<F>(f)); }
 
 private:
     enum class State { Empty, Loading, Ready, Error };
@@ -165,12 +206,21 @@ private:
     // Likewise the knob trial's verdicts, when a new one came in.
     void keep_knobs(const HostedSession & s);
 
+    // Start the loader thread for `effective`. The caller holds life_m_ and has set the state to Loading.
+    void start_loader(const RunConfig & effective, std::optional<OpenFallback> fallback);
+
+    // Raised by unload() and the host's end: a load under way then opens no fallback, since the
+    // session it would open is not wanted by anyone. Cleared as a load starts.
+    std::atomic<bool> load_cancelled_{false};
+
     std::function<void(const std::string &, const MeasuredKnobs &)> knobs_sink_;
     int knobs_kept_ = 0; // verdicts in the record last handed on; under gen_m_
 
     std::function<void(const std::string &, const RoutingTrace &)> routing_sink_;
     uint32_t routing_kept_ = 0; // decoded tokens of the record last handed on; under gen_m_
 
+    // Declared before the loader and the sessions, so it outlives everything that hands it work.
+    EngineThread engine_;
     EventBus & bus_;
     const SessionOpener open_;
     std::function<json()> host_info_;
@@ -188,11 +238,15 @@ private:
     mutable std::mutex m_;                     // guards everything below except loader_ (see life_m_)
     mutable std::condition_variable state_cv_; // signalled by publish_state(), after any change
     State state_ = State::Empty;
+    // When the load under way began (its planning, where it plans first): what `load_elapsed_s`
+    // in info() counts from, so every UI shows the same seconds and none keeps a clock of its own.
+    std::chrono::steady_clock::time_point load_started_{};
     std::string error_;
     std::shared_ptr<HostedSession> session_;
     RunConfig requested_;
     json model_ = nullptr;
     json last_turn_ = nullptr;
+    ServeTotals totals_; // every answered turn since the server started, for /metrics
     std::thread loader_;
 
     std::mutex gen_m_; // held for a whole generation, and by a load while it swaps the session

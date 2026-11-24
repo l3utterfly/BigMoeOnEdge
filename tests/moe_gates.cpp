@@ -7,6 +7,8 @@
 //
 //   G1  resident (no streaming)        == streaming, cache off
 //   G2  streaming, cache off           == streaming, small LRU cache (forces evictions)
+//   G2l same, the cache evicting by plain LRU (G4l: under overlap); the default is decayed frequency
+//   G2p same, a prompt's misses admitted cold, under LRU and decayed frequency (G4p: under overlap)
 //   G3  streaming, selective           == streaming, --load-all (every expert each token)
 //   G6  resident                       == streaming + --dense-odirect (dense weights rebound to
 //                                          O_DIRECT anon buffers — the rebind must be byte-identical)
@@ -61,6 +63,14 @@
 //       previous answer (the client resent it edited) restarts from the checkpoint at the end of the
 //       previous prompt where the memory refuses the cut, and answers exactly as the same pieces
 //       prefilled without any restore (a); with checkpoints off such a memory prefills it all (b).
+//       (c) a follow-up that diverges further back than a sliding window does not reuse the window's
+//       memory, which accepts the cut but no longer holds what the next token reads: it starts again
+//       and answers as a fresh session does.
+//   G27 checkpoints where llama.cpp's server places them: on a memory that refuses the cut, a new
+//       conversation with the same system message restores the checkpoint at the start of its user
+//       message and answers exactly as a fresh session does, and a follow-up that sends the answer
+//       back reuses at least the preamble, and (c) the preamble's checkpoint outlives a conversation
+//       that fills the list; a memory that cuts anywhere needs none.
 //   G23 the KV cache at f16, llama.cpp's type: streaming == resident. q8_0 is the default, so every
 //       other gate runs on a quantized cache; this one keeps the lossless type covered. The cache
 //       type changes the output, never what streaming the experts produces.
@@ -69,12 +79,28 @@
 //       (a) and under --overlap (b). The router's ids are then read through a host copy.
 //   G24 the knob trial switches the decode thread count and overlap between timed windows of the
 //       answer it decodes: == resident over one long answer (a) and over four turns that each end
-//       inside a window (b), and the trial must have reached its verdicts.
+//       inside a window (b), and the trial must have reached its verdicts. The graph width's side
+//       timed for a decision across loads (c) == resident, with its rates and request in the record.
+//       A load with the width's trade and no side timed records its requests, no rate (g).
 //   G25 the device tier: llama.cpp's device-side expert cache over resident experts (a), over
-//       streamed experts (b) and streamed under n-gram speculation (c), each == the resident
-//       placement.
+//       streamed experts (b) and streamed under n-gram speculation (c), and over resident experts
+//       with half the cache's misses computed on the host (d), each == the resident placement; and
+//       each side of the device tier timed for a decision across loads (e), with its rate in the
+//       record.
 //   G26 the real-layer probe fills every device's facts and agrees with the host on the layer's
 //       matmuls; it is timed, not gated, on the tiny models.
+//   G28 the answer check of a model held whole on a device (KnobTrialConfig::answer_device): answers
+//       that match the cores' are confirmed and the placement serves (a); answers made to differ
+//       reopen the session on the cores, which serve (b); the record carries each word.
+//   G29 a new chat after another, longer conversation == the same chat in a fresh session, resident
+//       (a) and streamed (b). Dropping a conversation forgets the cells but does not zero the
+//       buffers, so the chat decodes over stale KV and, on a hybrid stack, over an advanced recurrent
+//       state. Both must stay invisible. The control (c) continues the first conversation instead
+//       and must differ, or the gate could not see a leak. (d) the same with a prefill device, whose
+//       moved state is not zeroed either, at load or on a drop: the new chat, prefilled on the
+//       device, == the fresh session, with the same control. (e) perplexity after the other
+//       conversation == in a fresh session, nll/top1 bit for bit, resident and with the device:
+//       every position's logits, so a leak that moves them without flipping a greedy token shows.
 //
 // G15 needs no separate "did it do anything" check of the G10 kind: the tensor is bound to
 // RESERVED address space, so a row the policy fails to fetch is not a slightly wrong weight but
@@ -96,13 +122,17 @@
 #include "bmoe/probe.h"
 #include "bmoe/session.h"
 #include "gguf_offsets.h"
+#include "platform_io.h"
 
 #include "ggml-backend.h"
+#include "gguf.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <memory>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -328,6 +358,83 @@ session_shrink_gen(const RunConfig & c, int shrink_mib, std::string & out1, std:
     return true;
 }
 
+// G29's other conversation, about twice as long as the reference one (prompt and answer), so the
+// reference decodes into cells it wrote and leaves cells it wrote behind, unused but not zeroed. It
+// has to fit the gates' 256-token context: the tiny models spend more than a token per byte.
+static const char * const k_other_conversation =
+    "A longer, different conversation comes first and fills the cache past where the reference ends.";
+
+// Open a Session, run `first` as a conversation of its own, then c.prompt. With `new_chat` the
+// second generate drops the first conversation (clear_kv) and must read like a fresh session; without
+// it the second continues the first, which is G29's control. `device_tokens`, when given, gets the
+// second generate's prompt tokens a prefill device computed.
+static bool session_after_other(const RunConfig & c,
+                                const std::string & first,
+                                bool new_chat,
+                                std::string & out,
+                                std::string & err,
+                                int * device_tokens = nullptr) {
+    std::unique_ptr<Session> s = Session::open(session_config_from(c), err);
+    if (!s) return false;
+    GenerateRequest g1;
+    g1.prompt = first;
+    g1.n_predict = c.n_predict;
+    g1.clear_kv = true;
+    RunResult r1 = s->generate(g1);
+    if (!r1) {
+        err = r1.error;
+        return false;
+    }
+    GenerateRequest g2;
+    g2.prompt = c.prompt;
+    g2.n_predict = c.n_predict;
+    g2.clear_kv = new_chat;
+    RunResult r2 = s->generate(g2);
+    if (!r2) {
+        err = r2.error;
+        return false;
+    }
+    out = r2.generated_text;
+    if (device_tokens) *device_tokens = r2.summary.prefill_device_tokens;
+    return true;
+}
+
+// The text G16c and G29e score, one constant so the two stay in step.
+static const char * const k_ppl_text =
+    "The quick brown fox jumps over the lazy dog, and then it runs back home to sleep.";
+
+// G29e: the perplexity of k_ppl_text in a Session that first held `first` as a conversation of its
+// own ("" for none), as nll/top1 to compare bit for bit. perplexity() drops the memory itself, so
+// every position's logits read the drop, where a greedy answer shows only the leaks that flip a
+// token.
+static bool ppl_after_other(const RunConfig & c, const std::string & first, std::string & out, std::string & err) {
+    std::unique_ptr<Session> s = Session::open(session_config_from(c), err);
+    if (!s) return false;
+    if (!first.empty()) {
+        GenerateRequest g;
+        g.prompt = first;
+        g.n_predict = c.n_predict;
+        g.clear_kv = true;
+        RunResult r = s->generate(g);
+        if (!r) {
+            err = r.error;
+            return false;
+        }
+    }
+    PplRequest pr;
+    pr.text = k_ppl_text;
+    pr.skip = 2;
+    PplResult p = s->perplexity(pr);
+    if (!p.ok) {
+        err = p.error;
+        return false;
+    }
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.17g/%d", p.nll, p.n_top1);
+    out = buf;
+    return true;
+}
+
 static int check(const char * name, const std::string & a, const std::string & b) {
     if (a == b) {
         std::printf("[PASS] %s\n", name);
@@ -483,17 +590,60 @@ int main(int argc, char ** argv) {
     fails += check("G1 resident == streaming(cache off)", s_res, s_s0);
     fails += check("G2 streaming(cache off) == streaming(LRU cache)", s_s0, s_sc);
 
-    // G2r — the routing record the planner prices the cache from is the engine's own: replayed
-    // through the planner's LRU (bmoe/routing.h) at the run's budget, it must give the hit rate the
-    // engine's cache measured, prompt included and decode alone. Bounded by the record's own limit.
+    // G2l — plain LRU picks other victims from the same tiny budget than the default decayed
+    // frequency; the bytes a token consumes, and so its output, must not move.
     {
-        RunResult r = run(streamc);
+        RunConfig lru = streamc;
+        lru.moe.cache_freq_half_life = 0;
+        std::string s_lru;
+        if (!gen(lru, s_lru, err)) {
+            std::fprintf(stderr, "streaming(LRU cache) run failed: %s\n", err.c_str());
+            return 2;
+        }
+        fails += check("G2l streaming(cache off) == streaming(LRU cache)", s_s0, s_lru);
+    }
+
+    // G2p — a prompt's misses admitted cold, under LRU and under decayed frequency. The width that
+    // makes a graph a prompt is lowered so the gate reaches the cold path whatever its template, and
+    // the run must show it went there: a cold path never taken would pass vacuously.
+    for (int hl : {0, MoeStreamConfig::cache_freq_half_life_default}) {
+        RunConfig cold = streamc;
+        cold.moe.cache_prefill_cold = true;
+        cold.moe.test_prefill_cold_min_tokens = 2;
+        cold.moe.cache_freq_half_life = hl;
+        RunResult r = run(cold);
+        if (!r) {
+            std::fprintf(stderr, "streaming(prefill-cold cache) run failed: %s\n", r.error.c_str());
+            return 2;
+        }
+        const std::string label = hl ? "G2p streaming(cache off) == streaming(prompt admitted cold, decayed frequency)"
+                                     : "G2p streaming(cache off) == streaming(prompt admitted cold, LRU)";
+        fails += check(label.c_str(), s_s0, r.generated_text);
+        if (r.summary.cache_cold_admits <= 0) {
+            std::printf("[FAIL] %s: no miss was admitted cold\n", label.c_str());
+            ++fails;
+        } else {
+            std::printf("[PASS] %s: %lld misses admitted cold\n", label.c_str(), r.summary.cache_cold_admits);
+        }
+    }
+
+    // G2r — the routing record the planner prices the cache from is the engine's own: replayed
+    // through the planner's replay (bmoe/routing.h) at the run's budget and eviction policy, it must give the hit rate
+    // the engine's cache measured, prompt included and decode alone. Bounded by the record's own limit.
+    {
+        // The run's own eviction policy. The prompt is admitted hot here: the replay keeps it as one
+        // batch, where the engine's last narrow piece re-promotes what a cold admission put at the
+        // drop end (bmoe/routing.h), so the identity is held with the cold admission off.
+        RunConfig recc = streamc;
+        recc.moe.cache_prefill_cold = false;
+        RunResult r = run(recc);
         const RoutingTrace & rec = r.routing;
-        const ReplayCounts rp = replay_lru(rec, (uint64_t) streamc.moe.cache_mb << 20);
+        const int hl = recc.moe.cache_freq_half_life;
+        const ReplayCounts rp = replay_cache(rec, (uint64_t) recc.moe.cache_mb << 20, hl);
         RoutingTrace back;
         std::string perr;
         const bool round = parse_routing_trace(format_routing_trace(rec), back, perr) &&
-                           replay_lru(back, (uint64_t) streamc.moe.cache_mb << 20).hits == rp.hits;
+                           replay_cache(back, (uint64_t) recc.moe.cache_mb << 20, hl).hits == rp.hits;
         const double cum = 100.0 * rp.hit(), dec = 100.0 * rp.decode_hit();
         if (!r || rec.empty() || rec.decode_tokens == 0 || rec.decode_tokens > (uint32_t) r.summary.n_generated ||
             rec.prefill_tokens == 0 || std::fabs(cum - r.summary.cache_hit_pct) > 0.05 ||
@@ -522,6 +672,38 @@ int main(int argc, char ** argv) {
             ++fails;
         } else {
             std::printf("[PASS] G2r' the record stops at its bound, is off at 0, and changes no output\n");
+        }
+        // G2v — the plan counts a token's routed layers, and the bytes it routes through, as the
+        // engine routes them. The profile a plan is made from (the file, with the engine's own layer
+        // count) against the record of this run: a model whose graph runs a block more than once
+        // routes at every run, and a plan that counted its blocks would price half the token.
+        {
+            const ModelProfile planned = probe_model(model.c_str(), probe_engine_layers(model.c_str()));
+            uint64_t routings = 0, bytes = 0;
+            for (const RoutingBatch & b : rec.batches) {
+                if (!b.decode) continue;
+                ++routings;
+                if (b.layer < rec.expert_bytes.size()) bytes += (uint64_t) b.experts.size() * rec.expert_bytes[b.layer];
+            }
+            const uint64_t tokens = rec.decode_tokens;
+            const uint64_t want_bytes = planned.token_cycle_bytes * tokens;
+            // The profile averages the runs over the blocks, so it may be a byte per token short.
+            const bool bytes_ok = bytes >= want_bytes && bytes - want_bytes <= tokens;
+            if (!planned.ok || tokens == 0 || routings != (uint64_t) planned.moe_layer_runs() * tokens || !bytes_ok) {
+                std::printf(
+                    "[FAIL] G2v the plan's token is the engine's: %llu routings and %llu bytes over %llu decoded "
+                    "tokens, planned %u routings and %llu bytes a token (%u layers over %u blocks)\n",
+                    (unsigned long long) routings, (unsigned long long) bytes, (unsigned long long) tokens,
+                    planned.moe_layer_runs(), (unsigned long long) planned.token_cycle_bytes, planned.n_layer,
+                    planned.n_block);
+                ++fails;
+            } else {
+                std::printf(
+                    "[PASS] G2v the plan's token is the engine's: %u routings and %llu bytes a token (%u layers "
+                    "over %u blocks)\n",
+                    planned.moe_layer_runs(), (unsigned long long) planned.token_cycle_bytes, planned.n_layer,
+                    planned.n_block);
+            }
         }
     }
     // G2u — a run that does not stream records its routing only when asked to, and the record is the
@@ -573,6 +755,65 @@ int main(int argc, char ** argv) {
     fails += check("G7 dense=anon + expert O_DIRECT off == resident", s_res, s_dodb);
     fails += check("G15a row-stream(row-gathered tables from flash) == resident", s_res, s_rows);
     fails += check("G15b row-stream(one-slab window, evicting) == resident", s_res, s_rows_tight);
+
+    // G21 — the discardable cache. An entry nothing used for one pass of the stack is offered to the
+    // kernel, which may drop it; a lookup then has to notice and read it again. Pressure cannot be
+    // summoned in a test, so cache_discard_drop drops an offered entry just before a lookup takes
+    // it back: each such hit is a re-read, and a lost entry served as a hit would be zeros in a
+    // weight, which no output survives. The cache holds every expert, so nothing is evicted and every
+    // drop is a would-be hit. G21a also proves the drops happened - a gate whose path never ran
+    // would pass the same way. G18b is the same cache offered and never dropped (reclaim intact).
+    // A platform without the mechanism (pio::vm_discard_supported) keeps an ordinary cache: nothing
+    // is offered, so there is no re-read path to prove.
+    if (!pio::vm_discard_supported()) {
+        std::printf("[SKIP] G21a-d (this platform offers no memory for the kernel to drop)\n");
+    } else {
+        RunConfig dropall = base(model);
+        dropall.moe.enabled = true;
+        dropall.moe.cache_mb = 64;
+        dropall.moe.force_cache = true;
+        dropall.moe.io_threads = 4;
+        dropall.moe.cache_discard = true;
+        dropall.moe.cache_discard_drop = true;
+        RunConfig offered = dropall;
+        offered.moe.cache_discard_drop = false;
+        const RunResult rd = run(dropall);
+        const RunResult ro = run(offered);
+        if (!rd || !ro) {
+            std::fprintf(stderr, "G21 run failed: %s\n", (!rd ? rd.error : ro.error).c_str());
+            return 2;
+        }
+        fails += check("G21a discardable cache, every offered entry dropped == streaming(cache off)", s_s0,
+                       rd.generated_text);
+        fails += check("G21b discardable cache, offered and kept == streaming(cache off)", s_s0, ro.generated_text);
+        // The re-read path must have run: a gate whose drops were never looked up would pass the
+        // same way. (The tail sweep is the policy's, proven without a model in discardable_entries.)
+        if (rd.summary.cache_discarded_on_hit == 0) {
+            std::printf("[FAIL] G21a no lookup found an entry dropped: the re-read path never ran\n");
+            ++fails;
+        } else {
+            std::printf("[PASS] G21a %lld lookups found their entry dropped and read it again\n",
+                        rd.summary.cache_discarded_on_hit);
+        }
+        // G21d - #505's cold admission and the discard together: a dropped entry looked up by a wide
+        // graph is that graph's miss, admitted at the cold end like the others, so a prompt still
+        // cannot flush what decode reuses, and the re-read is still byte-identical.
+        RunConfig coldrop = dropall;
+        coldrop.moe.cache_prefill_cold = true;
+        coldrop.moe.test_prefill_cold_min_tokens = 2;
+        const RunResult rc = run(coldrop);
+        if (!rc) {
+            std::fprintf(stderr, "G21d run failed: %s\n", rc.error.c_str());
+            return 2;
+        }
+        fails += check("G21d discardable cache dropped, prompt admitted cold == streaming(cache off)", s_s0,
+                       rc.generated_text);
+        if (rc.summary.cache_discarded_on_hit == 0 || rc.summary.cache_cold_admits == 0) {
+            std::printf("[FAIL] G21d the cold re-read path never ran (%lld dropped hits, %lld cold admits)\n",
+                        rc.summary.cache_discarded_on_hit, rc.summary.cache_cold_admits);
+            ++fails;
+        }
+    }
 
     if (!have_hook) {
         std::printf("[SKIP] G4 (the CPU backend here has no expert-ready hook)\n");
@@ -631,6 +872,47 @@ int main(int argc, char ** argv) {
         fails += check("G4b overlap(LRU cache) == streaming(cache off)", s_s0, s_ovc);
         fails += check("G4c overlap(io_threads=1) == streaming(cache off)", s_s0, s_ov1);
         fails += check("G4d overlap(two-wave publish) == streaming(cache off)", s_s0, s_ov2w);
+        {
+            RunConfig ovl = ovc;
+            ovl.moe.cache_freq_half_life = 0;
+            std::string s_ovl;
+            if (!gen(ovl, s_ovl, err)) {
+                std::fprintf(stderr, "overlap(LRU cache) run failed: %s\n", err.c_str());
+                return 2;
+            }
+            fails += check("G4l overlap(LRU cache) == streaming(cache off)", s_s0, s_ovl);
+        }
+        {
+            RunConfig ovp = ovc;
+            ovp.moe.cache_prefill_cold = true;
+            ovp.moe.test_prefill_cold_min_tokens = 2;
+            std::string s_ovp;
+            if (!gen(ovp, s_ovp, err)) {
+                std::fprintf(stderr, "overlap(prompt admitted cold) run failed: %s\n", err.c_str());
+                return 2;
+            }
+            fails += check("G4p overlap(prompt admitted cold) == streaming(cache off)", s_s0, s_ovp);
+        }
+
+        // G21c — the discard re-read on the async path: a dropped hit has to become a miss whose
+        // reads are published and waited on per expert, with two-wave splitting its commits.
+        if (pio::vm_discard_supported()) {
+            RunConfig ovdrop = ov2w;
+            ovdrop.moe.cache_mb = 64;
+            ovdrop.moe.cache_discard = true;
+            ovdrop.moe.cache_discard_drop = true;
+            const RunResult rod = run(ovdrop);
+            if (!rod) {
+                std::fprintf(stderr, "G21c run failed: %s\n", rod.error.c_str());
+                return 2;
+            }
+            fails += check("G21c overlap + two-wave, every offered entry dropped == streaming(cache off)", s_s0,
+                           rod.generated_text);
+            if (rod.summary.cache_discarded_on_hit == 0) {
+                std::printf("[FAIL] G21c no entry was dropped and read again on the async path\n");
+                ++fails;
+            }
+        }
     }
 
     // ── S1/S2: warm cache across Session generates must not change bytes ──
@@ -661,6 +943,38 @@ int main(int argc, char ** argv) {
     }
     fails += check("S3a session generate #1 == resident", s_res, s_sh1);
     fails += check("S3b session generate #2 (after budget shrink) == resident", s_res, s_sh2);
+
+    // ── G29: a new chat after another conversation must read like a fresh session ──
+    // (d), the same with a prefill device, runs in the G16 block, which has the device.
+    {
+        const std::string other = k_other_conversation;
+        std::string s_nc_res, s_nc_str, s_cont;
+        if (!session_after_other(resident, other, /*new_chat=*/true, s_nc_res, err) ||
+            !session_after_other(sess, other, /*new_chat=*/true, s_nc_str, err) ||
+            !session_after_other(resident, other, /*new_chat=*/false, s_cont, err)) {
+            std::fprintf(stderr, "G29 session run failed: %s\n", err.c_str());
+            return 2;
+        }
+        fails += check("G29a resident: new chat after another conversation == fresh", s_res, s_nc_res);
+        fails += check("G29b streaming(LRU cache): new chat after another conversation == fresh", s_res, s_nc_str);
+        // A tiny model may answer the reference prompt with the same greedy bytes whatever came
+        // before it, and there the control can show nothing: G29a/b only prove the drop is
+        // consistent. The models whose answer does depend on their past (the hybrid stacks among
+        // them) are the runs that show the gate would see a leak.
+        if (s_cont == s_res) {
+            std::printf("[N/A]  G29c control: this model's greedy output ignores earlier context, so a leak "
+                        "would not show here; the runs where the control passes cover it\n");
+        } else {
+            std::printf("[PASS] G29c control: continuing the other conversation changes the output\n");
+        }
+        std::string p_fresh, p_after;
+        if (!ppl_after_other(resident, "", p_fresh, err) || !ppl_after_other(resident, other, p_after, err)) {
+            std::fprintf(stderr, "G29e perplexity run failed: %s\n", err.c_str());
+            return 2;
+        }
+        fails += check("G29e resident: perplexity after another conversation == fresh (nll/top1, bit for bit)", p_fresh,
+                       p_after);
+    }
 
     // ── G5: temporal prefetch must not change bytes ──
     // A forced cache (prefetch needs one) plus a couple of look-ahead layers, exercising the
@@ -1136,7 +1450,7 @@ int main(int argc, char ** argv) {
             fails += check("G16b session generate #2 (device prefill again) == all CPU", s_pref, g2.generated_text);
 
             PplRequest pr;
-            pr.text = "The quick brown fox jumps over the lazy dog, and then it runs back home to sleep.";
+            pr.text = k_ppl_text;
             pr.skip = 2;
             std::unique_ptr<Session> sc = Session::open(session_config_from(pref), open_err);
             if (!sc) {
@@ -1194,6 +1508,43 @@ int main(int argc, char ** argv) {
                 }
             }
 
+            // G29d: G29 with the prefill device. The model state lives in the device's buffer from
+            // load on, and neither the reservation decode at load nor the drop of the other
+            // conversation zeroes it: the new chat, prefilled on the device, reads its stale bytes as
+            // the CPU does and must answer as the fresh session (G16b's first generate). The device
+            // must have prefilled it, or the gate would only repeat G29a. The control is G29c's.
+            {
+                std::string s_nc_dev, s_cont_dev;
+                int nc_dev_tokens = 0;
+                if (!session_after_other(pdev, k_other_conversation, /*new_chat=*/true, s_nc_dev, err,
+                                         &nc_dev_tokens) ||
+                    !session_after_other(pdev, k_other_conversation, /*new_chat=*/false, s_cont_dev, err)) {
+                    std::fprintf(stderr, "G29d session run failed: %s\n", err.c_str());
+                    return 2;
+                }
+                fails += check("G29d prefill device: new chat after another conversation == fresh", g1.generated_text,
+                               s_nc_dev);
+                if (nc_dev_tokens <= 0) {
+                    std::printf("[FAIL] G29d the device did not prefill the new chat\n");
+                    ++fails;
+                }
+                if (s_cont_dev == g1.generated_text) {
+                    std::printf("[N/A]  G29d control: this model's greedy output ignores earlier context, so a "
+                                "leak would not show here; the runs where the control passes cover it\n");
+                } else {
+                    std::printf("[PASS] G29d control: continuing the other conversation changes the output\n");
+                }
+                std::string p_fresh_dev, p_after_dev;
+                if (!ppl_after_other(pdev, "", p_fresh_dev, err) ||
+                    !ppl_after_other(pdev, k_other_conversation, p_after_dev, err)) {
+                    std::fprintf(stderr, "G29e prefill-device perplexity run failed: %s\n", err.c_str());
+                    return 2;
+                }
+                fails += check("G29e prefill device: perplexity after another conversation == fresh (nll/top1, bit "
+                               "for bit)",
+                               p_fresh_dev, p_after_dev);
+            }
+
             // ── G17: streamed experts through the device arena ──
             // The model streams; the device prefill gets its experts from two slots refilled layer by
             // layer while decode keeps the streamer's cache. Same reference, same pieces. Variants: no
@@ -1239,6 +1590,13 @@ int main(int argc, char ** argv) {
             // same bytes as the first: a graph that outran its loads reads less, since the drained
             // queue is dropped.
             double arena_mib_ref = -1.0;
+            // A model whose graph runs a block more than once comes back to experts the slots held
+            // earlier. Two slots still hold them where the loop is as long as the slots are many, and
+            // one slot never does: it reads a block again at every return, so there it must read MORE
+            // than the reference, and a count equal to it would mean a return computed on what the
+            // slot held.
+            const ModelProfile arena_mp = probe_model(model.c_str(), probe_engine_layers(model.c_str()));
+            const bool revisits = arena_mp.n_layer > arena_mp.n_block;
             for (const Variant & v : variants) {
                 RunConfig c = pdev;
                 c.moe.enabled = true;
@@ -1252,6 +1610,11 @@ int main(int argc, char ** argv) {
                 c.prefill.slots = v.slots;
                 c.prefill.slots_on_demand = v.on_demand;
                 std::unique_ptr<Session> vs = Session::open(session_config_from(c), open_err);
+                if (!vs && v.sabotage) {
+                    // The load's own comparison with the host refused the device: caught, and sooner.
+                    std::printf("[PASS] %s: caught at the load (%s)\n", v.name, open_err.c_str());
+                    continue;
+                }
                 if (!vs) {
                     std::fprintf(stderr, "%s open failed: %s\n", v.name, open_err.c_str());
                     return 2;
@@ -1277,16 +1640,35 @@ int main(int argc, char ** argv) {
                     continue;
                 }
                 fails += check(v.name, s_pref, rr.generated_text);
-                const double mib = rr.summary.prefill_device_read_mib;
+                // What the arena filled its slots with, from flash or copied from the expert cache
+                // (PrefillDeviceConfig::from_cache): the same bytes whichever way they came.
+                const double cached = rr.summary.prefill_device_cache_mib;
+                const double mib = rr.summary.prefill_device_read_mib + cached;
                 if (arena_mib_ref < 0.0) arena_mib_ref = mib;
-                const bool mib_ok = v.routed ? (mib > 0.0 && mib < arena_mib_ref) : mib == arena_mib_ref;
+                const bool again = revisits && v.slots == 1;
+                const bool mib_ok = v.routed ? (mib > 0.0 && mib < arena_mib_ref)
+                                    : again  ? mib > arena_mib_ref
+                                             : mib == arena_mib_ref;
                 if (mib <= 0.0 || !mib_ok || rr.summary.prefill_device_nodes <= 0) {
                     std::printf("[FAIL] %s: the arena read %.3f MiB (expected %.3f), the device computed %lld nodes\n",
                                 v.name, mib, arena_mib_ref, rr.summary.prefill_device_nodes);
                     ++fails;
                 } else {
-                    std::printf("[PASS] %s: the arena read %.3f MiB, the device computed %lld nodes\n", v.name, mib,
-                                rr.summary.prefill_device_nodes);
+                    std::printf("[PASS] %s: the arena filled %.3f MiB (%.3f from the cache), the device computed "
+                                "%lld nodes\n",
+                                v.name, mib, cached, rr.summary.prefill_device_nodes);
+                }
+                // With a cache held through the prefill, some of what the arena needs is resident (the
+                // load's confirmation pass filled it), so the cache path must have run: a copy that
+                // never happened would leave the identity above proving nothing about it. Slots on
+                // demand take their memory from the cache first, so there it may hold nothing.
+                if (v.cache_mb > 0 && !v.on_demand) {
+                    if (cached <= 0.0) {
+                        std::printf("[FAIL] %s: the arena copied nothing from the expert cache\n", v.name);
+                        ++fails;
+                    } else {
+                        std::printf("[PASS] %s: the arena copied %.3f MiB from the expert cache\n", v.name, cached);
+                    }
                 }
                 PplResult pv = vs->perplexity(pr);
                 if (!pv.ok) {
@@ -1436,9 +1818,12 @@ int main(int argc, char ** argv) {
                 return 2;
             }
             // The choices go through a wide prefill here and one row at a time there (G18 c): the
-            // same distribution, to within the kernels' batch-shape rounding.
+            // same distribution, to within the kernels' batch-shape rounding. The logits are 32-bit
+            // floats, so that rounding is bounded by one float's: two models here agree bit for bit,
+            // and the two that do not are 4e-12 and 8e-9 apart, the wider on a graph that runs
+            // blocks more than once. A wrong row or a stale state is orders of magnitude outside it.
             fails += check_close("G18c decide(whole prefill) == perplexity(choices)", pr.choice_logp,
-                                 whole[0].choice_logp, 1e-9);
+                                 whole[0].choice_logp, (double) std::numeric_limits<float>::epsilon());
 
             // f) off by default: the same session (decide not enabled) refuses, without harm.
             const DecideResult off = s->decide(q1);
@@ -1676,6 +2061,20 @@ int main(int argc, char ** argv) {
                 } else {
                     fails += check("G25a device cache over resident experts == resident experts", s_placed, s_cached);
                     fails += check("G25b device cache over streamed experts == resident experts", s_placed, s_cached_s);
+                    // d) part of the misses computed on the host from the resident copy instead of
+                    // uploaded: llama.cpp builds the layer's experts on both and adds the halves, each
+                    // weighted only for the experts it computed. The 4 MiB cache is full within the
+                    // first tokens, which is where the share starts to apply.
+                    RunConfig cached_cpu = cached;
+                    cached_cpu.moe.device_cache_cpu_share = 0.5f;
+                    std::string s_cached_cpu;
+                    if (!gen(cached_cpu, s_cached_cpu, err)) {
+                        std::printf("[FAIL] G25d a device cache run with a host share failed: %s\n", err.c_str());
+                        ++fails;
+                    } else {
+                        fails += check("G25d device cache, half the misses on the host == resident experts", s_placed,
+                                       s_cached_cpu);
+                    }
                     // c) with speculation: a verify batch is a few positions wide, served by the same
                     // slots, and greedy drafting accepts only what the target would have produced.
                     RunConfig cached_spec = cached_s;
@@ -1687,6 +2086,144 @@ int main(int argc, char ** argv) {
                     } else {
                         fails += check("G25c device cache, streamed, n-gram speculation == resident experts", s_placed,
                                        s_cached_spec);
+                    }
+                    // e) each side of the device tier timed for a decision across loads
+                    // (KnobTrialConfig::device_tier): the rate probe switches nothing, so each answer is
+                    // its placement's, and the record must carry the rate, or a plan has nothing to
+                    // compare. Long enough for the longest settle the probe makes and its windows.
+                    RunConfig ref_t = placed;
+                    ref_t.n_predict = 64;
+                    std::string s_ref_t;
+                    if (!gen(ref_t, s_ref_t, err)) {
+                        std::printf("[FAIL] G25e the reference run failed: %s\n", err.c_str());
+                        ++fails;
+                    } else {
+                        for (int side : {1, 0}) {
+                            RunConfig timed = side ? cached : placed;
+                            timed.n_predict = ref_t.n_predict;
+                            timed.trial.device_tier = side;
+                            timed.trial.window_tokens = 2;
+                            const RunResult rt = run(timed);
+                            const double tps = side ? rt.knobs.device_cache_tps : rt.knobs.no_device_cache_tps;
+                            const std::string what =
+                                std::string("G25e ") + (side ? "with" : "without") + " a device cache, timed";
+                            if (!rt) {
+                                std::printf("[FAIL] %s: the run failed: %s\n", what.c_str(), rt.error.c_str());
+                                ++fails;
+                                continue;
+                            }
+                            fails += check((what + " == resident experts").c_str(), s_ref_t, rt.generated_text);
+                            if (!(tps > 0.0)) {
+                                std::printf("[FAIL] %s: no rate in the record\n", what.c_str());
+                                ++fails;
+                            } else {
+                                std::printf("[PASS] %s: %.1f tok/s in the record\n", what.c_str(), tps);
+                            }
+                        }
+                    }
+                }
+            }
+            // G28 — the answer check: a model held whole in memory with every block on the device, its
+            // answers compared with the cores' before the session serves. a) The loopback device computes
+            // what the cores do: the check confirms, the record carries it, and the output is the same
+            // placement's without the check. b) The comparison made to see a differing answer: the
+            // session reopens on the cores, serves their bytes, and the record says differs.
+            {
+                RunConfig whole = base(model);
+                whole.moe.enabled = false;
+                whole.n_gpu_layers = read_gguf_model_info(model.c_str()).n_block;
+                whole.device_split = {{dev, whole.n_gpu_layers}};
+                RunConfig cores = base(model);
+                cores.moe.enabled = false;
+                RunConfig checked = whole;
+                checked.trial.answer_device = dev;
+                RunConfig refused = checked;
+                refused.trial.test_answer_differs = true;
+                std::string s_whole, s_cores;
+                if (!gen(whole, s_whole, err) || !gen(cores, s_cores, err)) {
+                    std::fprintf(stderr, "G28 reference run failed: %s\n", err.c_str());
+                    return 2;
+                }
+                const ValidationResult vc = validate(checked);
+                const RunResult rc = run(checked), rr = run(refused);
+                if (!vc.ok || !rc || !rr) {
+                    std::printf("[FAIL] G28 an answer-check run failed: %s\n", !vc.ok ? vc.error.c_str()
+                                                                               : !rc  ? rc.error.c_str()
+                                                                                      : rr.error.c_str());
+                    ++fails;
+                } else {
+                    fails += check("G28a answers confirmed on the device == the same placement unchecked", s_whole,
+                                   rc.generated_text);
+                    fails += check("G28b answers that differ: served from the cores == all on the cores", s_cores,
+                                   rr.generated_text);
+                    // c) The check also asked to keep the faster side: whichever the loopback device
+                    // and the cores come to here, the session serves one of the two placements' bytes,
+                    // the answers are still confirmed, and both sides' rates are in the record, so the
+                    // plan after this load reads a measurement.
+                    RunConfig weighed = checked;
+                    weighed.trial.answer_prompt_per_token = 0.0f;
+                    const ValidationResult vw = validate(weighed);
+                    const RunResult rw = vw.ok ? run(weighed) : RunResult{};
+                    if (!vw.ok || !rw) {
+                        std::printf("[FAIL] G28c the weighed answer check failed: %s\n",
+                                    !vw.ok ? vw.error.c_str() : rw.error.c_str());
+                        ++fails;
+                    } else if ((rw.generated_text == s_whole || rw.generated_text == s_cores) &&
+                               rw.knobs.device_answer(dev) == 1 && rw.knobs.shared_device_tps > 0.0 &&
+                               rw.knobs.no_shared_device_tps > 0.0) {
+                        std::printf("[PASS] G28c both sides timed on the model: %.1f tok/s on %s, %.1f on the cores, "
+                                    "and one of the two serves\n",
+                                    rw.knobs.shared_device_tps, dev.c_str(), rw.knobs.no_shared_device_tps);
+                    } else {
+                        std::printf("[FAIL] G28c weighed check: word %d, rates %.2f / %.2f, text matches a placement: "
+                                    "%d\n",
+                                    rw.knobs.device_answer(dev), rw.knobs.shared_device_tps,
+                                    rw.knobs.no_shared_device_tps,
+                                    (int) (rw.generated_text == s_whole || rw.generated_text == s_cores));
+                        ++fails;
+                    }
+                    // d) The plan in two parts (RunConfig::fallback): the model held whole on the
+                    // device, and the streaming plan behind it. Where the device does not keep the
+                    // model, the session reopens as the stream and serves its bytes, which are the
+                    // resident model's: once because the cores are faster (the loopback device is the
+                    // cores behind a socket), once because its answers were made to differ.
+                    RunConfig stream = base(model);
+                    stream.moe.enabled = true;
+                    for (const bool differs : {false, true}) {
+                        RunConfig two = weighed;
+                        two.trial.test_answer_differs = differs;
+                        two.fallback = std::make_shared<const RunConfig>(stream);
+                        const ValidationResult vt = validate(two);
+                        const RunResult rt2 = vt.ok ? run(two) : RunResult{};
+                        const char * why = differs ? "answers differ" : "the cores faster";
+                        const bool on_device = rt2 && rt2.knobs.device_answer(dev) == 1 && !differs &&
+                                               rt2.knobs.shared_device_tps >= rt2.knobs.no_shared_device_tps;
+                        if (!vt.ok || !rt2) {
+                            std::printf("[FAIL] G28d two-part plan (%s) failed: %s\n", why,
+                                        !vt.ok ? vt.error.c_str() : rt2.error.c_str());
+                            ++fails;
+                        } else if (on_device) {
+                            // The device kept the model here: nothing to reopen, and that is the rule too.
+                            fails += check("G28d two-part plan, the device kept the model == the same placement",
+                                           s_whole, rt2.generated_text);
+                        } else if (rt2.generated_text == s_cores && rt2.summary.moe_read_mib > 0.0) {
+                            std::printf("[PASS] G28d two-part plan, %s: reopened as the stream (%.1f MiB of experts "
+                                        "read), the resident model's bytes\n",
+                                        why, rt2.summary.moe_read_mib);
+                        } else {
+                            std::printf("[FAIL] G28d two-part plan, %s: %.1f MiB of experts read, text matches the "
+                                        "resident model: %d\n",
+                                        why, rt2.summary.moe_read_mib, (int) (rt2.generated_text == s_cores));
+                            ++fails;
+                        }
+                    }
+                    const int wa = rc.knobs.device_answer(dev), wb = rr.knobs.device_answer(dev);
+                    if (wa == 1 && wb == -1 && rc.knobs.verdicts() > 0) {
+                        std::printf("[PASS] G28 the record says confirmed, then differs, for %s\n", dev.c_str());
+                    } else {
+                        std::printf("[FAIL] G28 the record's word for %s: %d after a match, %d after a difference\n",
+                                    dev.c_str(), wa, wb);
+                        ++fails;
                     }
                 }
             }
@@ -1790,6 +2327,115 @@ int main(int argc, char ** argv) {
                         : mt.overlap   ? "on"
                                        : "off");
         }
+
+        // G24c: the graph width's side timed for a decision across loads (KnobTrialConfig::width_side).
+        // It switches nothing, so the answer is the resident one; the record must carry the decode, the
+        // prefill of the prompt (longer than the narrow width here) and the request it served.
+        RunConfig wref = resident;
+        wref.n_predict = 64;
+        std::string s_wref;
+        if (!gen(wref, s_wref, err)) {
+            std::fprintf(stderr, "G24c reference run failed: %s\n", err.c_str());
+            return 2;
+        }
+        RunConfig wt = wref;
+        wt.trial.width_side = 1;
+        wt.trial.width_narrow = 2;
+        wt.trial.window_tokens = 2;
+        const RunResult rw = run(wt);
+        if (!rw) {
+            std::fprintf(stderr, "G24c run failed: %s\n", rw.error.c_str());
+            return 2;
+        }
+        fails += check("G24c graph width timed == resident", s_wref, rw.generated_text);
+        const MeasuredKnobs & mw = rw.knobs;
+        if (!(mw.wide_decode_tps > 0.0) || !(mw.wide_prefill_tps > 0.0) || mw.usage_requests != 1 ||
+            mw.width_narrow != 2) {
+            std::printf("[FAIL] G24c the record lacks the width's side: decode %.1f, prefill %.1f, %d requests, "
+                        "narrow %d\n",
+                        mw.wide_decode_tps, mw.wide_prefill_tps, mw.usage_requests, mw.width_narrow);
+            ++fails;
+        } else {
+            std::printf("[PASS] G24c the record holds the width's side: decode %.1f tok/s, prefill %.1f tok/s, "
+                        "%.0f tokens a request\n",
+                        mw.wide_decode_tps, mw.wide_prefill_tps, mw.usage_gen_tokens);
+        }
+
+        // G24g: a load whose plan has the width's trade and times no side (a width already decided)
+        // records its requests against the narrow width all the same, and no rate: a width decided on
+        // the decode alone is weighed again once the requests are seen.
+        {
+            RunConfig wu = wref;
+            wu.trial.width_narrow = 2;
+            const RunResult ru = run(wu);
+            if (!ru) {
+                std::fprintf(stderr, "G24g run failed: %s\n", ru.error.c_str());
+                return 2;
+            }
+            fails += check("G24g width recorded, no side timed == resident", s_wref, ru.generated_text);
+            const MeasuredKnobs & mu = ru.knobs;
+            if (mu.usage_requests != 1 || mu.width_narrow != 2 || mu.wide_decode_tps > 0.0 ||
+                mu.wide_prefill_tps > 0.0 || mu.narrow_prefill_tps > 0.0) {
+                std::printf("[FAIL] G24g the record lacks the requests, or times a side: %d requests, narrow %d\n",
+                            mu.usage_requests, mu.width_narrow);
+                ++fails;
+            } else {
+                std::printf("[PASS] G24g the requests recorded with no side timed: %.0f tokens a request\n",
+                            mu.usage_gen_tokens);
+            }
+        }
+
+        // G24d: the decode's own cost (MeasuredKnobs::decode_*), timed on a load that arms no trial at
+        // all. It switches nothing, so the answer is the resident one; the record must carry the
+        // compute, the thread count, and the cache's hits at the budget they were measured at.
+        RunConfig cref = resident;
+        cref.n_predict = 64;
+        std::string s_cref;
+        if (!gen(cref, s_cref, err)) {
+            std::fprintf(stderr, "G24d reference run failed: %s\n", err.c_str());
+            return 2;
+        }
+        RunConfig ct = streamc;
+        ct.n_predict = cref.n_predict;
+        ct.trial.window_tokens = 2;
+        const RunResult rc = run(ct);
+        if (!rc) {
+            std::fprintf(stderr, "G24d run failed: %s\n", rc.error.c_str());
+            return 2;
+        }
+        fails += check("G24d decode cost timed == resident", s_cref, rc.generated_text);
+        const MeasuredKnobs & mc = rc.knobs;
+        if (!(mc.decode_compute_s > 0.0) || mc.decode_threads != ct.n_threads || !(mc.decode_hit >= 0.0) ||
+            mc.decode_hit > 1.0 || !(mc.decode_cache_mib > 0.0) || mc.decode_gpu_layers != 0 ||
+            mc.verdicts() != 2 + mc.mix_requests + (mc.host_prefill_tps > 0.0)) {
+            std::printf("[FAIL] G24d the record lacks the decode's cost: %.3f ms/token at %d threads, hits %.2f at "
+                        "%.0f MiB\n",
+                        1e3 * mc.decode_compute_s, mc.decode_threads, mc.decode_hit, mc.decode_cache_mib);
+            ++fails;
+        } else {
+            std::printf("[PASS] G24d the record holds the decode's cost: %.3f ms/token at %d threads, %.0f%% hits "
+                        "at %.0f MiB\n",
+                        1e3 * mc.decode_compute_s, mc.decode_threads, 100.0 * mc.decode_hit, mc.decode_cache_mib);
+        }
+
+        // G24e: the request mix (MeasuredKnobs::mix_*), recorded on the same load, which arms no trial:
+        // the one request, its tokens decoded, its prompt as the part a device would take (or none, under
+        // the narrowest graph a device is handed), and the host's prefill rate over it.
+        const RunSummary & sc = rc.summary;
+        const bool wide_prompt = sc.n_prompt >= ct.prefill.min_tokens;
+        if (mc.mix_requests != 1 || mc.mix_gen_tokens != (double) sc.n_generated ||
+            mc.mix_wide_prompt_tokens != (wide_prompt ? (double) sc.n_prompt : 0.0) ||
+            (mc.host_prefill_tps > 0.0) != wide_prompt) {
+            std::printf("[FAIL] G24e the record lacks the request mix: %d requests, %.0f decoded, %.0f prompt tokens, "
+                        "host prefill %.1f tok/s (the run: %d decoded, %d prompt tokens)\n",
+                        mc.mix_requests, mc.mix_gen_tokens, mc.mix_wide_prompt_tokens, mc.host_prefill_tps,
+                        sc.n_generated, sc.n_prompt);
+            ++fails;
+        } else {
+            std::printf("[PASS] G24e the record holds the request mix: %d request, %.0f decoded, %.0f prompt tokens, "
+                        "host prefill %.1f tok/s\n",
+                        mc.mix_requests, mc.mix_gen_tokens, mc.mix_wide_prompt_tokens, mc.host_prefill_tps);
+        }
     }
 
     // G22 — context checkpoints (context_checkpoints.h). Turn 1 answers u1; turn 2 resends a
@@ -1865,6 +2511,232 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // G22c — a cut further back than a sliding window. llama.cpp's sliding-window cache accepts any cut
+    // and keeps only its window (and the cells a ubatch needs), so a follow-up that diverges near the
+    // start of a long conversation must not reuse the window's memory: the first token after the cut
+    // would read cells already gone, and nothing would fail. It has to start again from a checkpoint
+    // that reaches back far enough, or from nothing, and answer what a fresh session answers.
+    {
+        int n_swa = 0;
+        {
+            gguf_init_params gp{/*no_alloc*/ true, /*ctx*/ nullptr};
+            if (gguf_context * g = gguf_init_from_file(model.c_str(), gp)) {
+                const int64_t ka = gguf_find_key(g, "general.architecture");
+                if (ka >= 0) {
+                    const int64_t kw =
+                        gguf_find_key(g, (std::string(gguf_get_val_str(g, ka)) + ".attention.sliding_window").c_str());
+                    if (kw >= 0) n_swa = (int) gguf_get_val_u32(g, kw);
+                }
+                gguf_free(g);
+            }
+        }
+        // A window the context outgrows: the cache keeps at least 256 cells, so the conversation is
+        // made longer than that and the window, and the follow-up diverges near its start.
+        const int n_ctx = 1024;
+        if (n_swa <= 0 || n_swa >= 256) {
+            std::printf("[PASS] G22c this model has no sliding window shorter than its cache (%d): nothing to cut\n",
+                        n_swa);
+        } else {
+            auto msgs = [](std::initializer_list<std::pair<const char *, std::string>> l) {
+                std::vector<ChatMessage> v;
+                for (const auto & m : l)
+                    v.push_back(ChatMessage{m.first, m.second});
+                return v;
+            };
+            std::string long1;
+            while (long1.size() < 600)
+                long1 += "Tell me about the river, the hills and the old town by the sea. ";
+            std::string long2 = long1;
+            long2[8] = 'X'; // the divergence, a few tokens into the conversation
+            // With checkpoints, a restore may still land before the divergence (at the start of the
+            // user message, where the prefill stops for one); without, the window's memory is all
+            // there is, and it must not be reused.
+            auto config = [&](int checkpoints = 32) {
+                RunConfig c = stream0;
+                c.chatml = true;
+                c.ctx_checkpoints = checkpoints;
+                c.n_ctx = n_ctx;
+                c.n_ubatch = 64; // the window's cache is the window and one ubatch, padded
+                return c;
+            };
+            std::string out_cut, out_cut_off, out_ref;
+            int prefilled = 0, n_prompt2 = 0;
+            for (const int checkpoints : {0, 32}) {
+                std::unique_ptr<Session> s = Session::open(session_config_from(config(checkpoints)), err);
+                if (!s) {
+                    std::fprintf(stderr, "G22c open failed: %s\n", err.c_str());
+                    return 2;
+                }
+                GenerateRequest q;
+                q.messages = msgs({{"user", long1}});
+                q.n_predict = 4;
+                RunResult r1 = s->generate(q);
+                q.messages = msgs({{"user", long2}});
+                q.n_predict = 8;
+                q.clear_kv = false;
+                RunResult r2 = s->generate(q);
+                if (!r1 || !r2) {
+                    std::fprintf(stderr, "G22c run failed: %s\n", (!r1 ? r1.error : r2.error).c_str());
+                    return 2;
+                }
+                if (checkpoints > 0) {
+                    out_cut = r2.generated_text;
+                    continue;
+                }
+                out_cut_off = r2.generated_text;
+                prefilled = r2.summary.n_prompt;
+                n_prompt2 = r2.summary.n_past - r2.summary.n_generated;
+            }
+            {
+                std::unique_ptr<Session> s = Session::open(session_config_from(config()), err);
+                GenerateRequest q;
+                q.messages = msgs({{"user", long2}});
+                q.n_predict = 8;
+                RunResult r = s ? s->generate(q) : RunResult{};
+                if (!s || !r) {
+                    std::fprintf(stderr, "G22c reference failed: %s\n", err.c_str());
+                    return 2;
+                }
+                out_ref = r.generated_text;
+            }
+            if (prefilled != n_prompt2) {
+                std::printf("[FAIL] G22c without checkpoints a cut %d tokens past a window of %d reused the window's "
+                            "memory (prefilled "
+                            "%d of %d)\n",
+                            n_prompt2 - prefilled, n_swa, prefilled, n_prompt2);
+                ++fails;
+            } else {
+                std::printf("[PASS] G22c a cut past the window of %d starts again (prefilled all %d)\n", n_swa,
+                            n_prompt2);
+            }
+            fails += check("G22c the follow-up past the window == a fresh session", out_ref, out_cut_off);
+            fails += check("G22c the same with checkpoints == a fresh session", out_ref, out_cut);
+        }
+    }
+
+    // G27 — checkpoints at the start of a user message and a few tokens before a prompt's end
+    // (ContextCheckpoints::next_stop), the way llama.cpp's server places them. A new conversation
+    // with the same system message diverges right after the start of its user message; a follow-up
+    // diverges where the template renders the previous answer again. The reference for the new
+    // conversation is a fresh session: its prefill stops at the same places, so both decode the
+    // same pieces and the restored state is the one those pieces computed.
+    {
+        auto msgs = [](std::initializer_list<std::pair<const char *, std::string>> l) {
+            std::vector<ChatMessage> v;
+            for (const auto & m : l)
+                v.push_back(ChatMessage{m.first, m.second});
+            return v;
+        };
+        std::string sys;
+        while (sys.size() < 2400)
+            sys += "You answer briefly and name the river, the hills and the old town by the sea. ";
+        const std::string u1 = "Name a colour.";
+        const std::string u2 = "And a fruit?";
+        auto config = [&](int checkpoints) {
+            RunConfig c = stream0;
+            c.chatml = true;
+            c.n_ctx = 8192;
+            c.n_ubatch = 512; // a phone's: the n_ubatch + 4 checkpoint lands inside a long follow-up
+            c.ctx_checkpoints = checkpoints;
+            return c;
+        };
+        struct Step {
+            std::string out;
+            int prefilled = 0, n_prompt = 0;
+        };
+        // The requests in order, in one session; each a whole conversation. False (with err) on failure.
+        auto run = [&](int checkpoints, const std::vector<std::vector<ChatMessage>> & reqs, std::vector<Step> & steps) {
+            std::unique_ptr<Session> s = Session::open(session_config_from(config(checkpoints)), err);
+            if (!s) return false;
+            for (const auto & m : reqs) {
+                GenerateRequest q;
+                q.messages = m;
+                q.n_predict = 8;
+                q.clear_kv = false;
+                RunResult r = s->generate(q);
+                if (!r) {
+                    err = r.error;
+                    return false;
+                }
+                steps.push_back(Step{r.generated_text, r.summary.n_prompt, r.summary.n_past - r.summary.n_generated});
+            }
+            return true;
+        };
+        const auto first = msgs({{"system", sys}, {"user", u1}});
+        const auto fresh = msgs({{"system", sys}, {"user", u2}});
+        std::vector<Step> off, on, ref;
+        if (!run(0, {first, fresh}, off) || !run(8, {first, fresh}, on) || !run(8, {fresh}, ref)) {
+            std::fprintf(stderr, "G27 run failed: %s\n", err.c_str());
+            return 2;
+        }
+        // The follow-up: the first conversation, its answer sent back as text, and a second question.
+        std::vector<Step> follow;
+        {
+            std::vector<Step> t1;
+            if (!run(8, {first}, t1)) {
+                std::fprintf(stderr, "G27 run failed: %s\n", err.c_str());
+                return 2;
+            }
+            auto next = first;
+            next.push_back(ChatMessage{"assistant", t1[0].out});
+            next.push_back(ChatMessage{"user", u2});
+            if (!run(8, {first, next}, follow)) {
+                std::fprintf(stderr, "G27 run failed: %s\n", err.c_str());
+                return 2;
+            }
+        }
+        const int floor = 256; // the system message alone is longer than this
+        if (off[1].prefilled < off[1].n_prompt) {
+            std::printf("[PASS] G27 this model's context cuts anywhere (a new conversation prefilled %d of %d without "
+                        "checkpoints): nothing to place\n",
+                        off[1].prefilled, off[1].n_prompt);
+        } else {
+            const bool restored = on[1].prefilled <= on[1].n_prompt - floor;
+            std::printf("[%s] G27a a new conversation restored the checkpoint at its user message (prefilled %d of "
+                        "%d; %d of %d without checkpoints)\n",
+                        restored ? "PASS" : "FAIL", on[1].prefilled, on[1].n_prompt, off[1].prefilled, off[1].n_prompt);
+            fails += restored ? 0 : 1;
+            fails += check("G27a a restored conversation == a fresh session", ref[0].out, on[1].out);
+            const bool reused = follow[1].prefilled <= follow[1].n_prompt - floor;
+            std::printf("[%s] G27b a follow-up reused at least the preamble (prefilled %d of %d)\n",
+                        reused ? "PASS" : "FAIL", follow[1].prefilled, follow[1].n_prompt);
+            fails += reused ? 0 : 1;
+            // G27c — the preamble's checkpoint outlives a conversation that fills the list: with 4
+            // kept, a follow-up longer than a ubatch takes 4 of its own (its user message, n_ubatch + 4
+            // and 4 before its end, its end), and the oldest-first rule dropped the preamble's, so a new
+            // conversation after it prefilled the system message again.
+            std::string long_u;
+            while (long_u.size() < 1200)
+                long_u += "Now list the towns along the river, from the hills down to the sea. ";
+            auto next = msgs({{"system", sys}, {"user", u1}});
+            std::vector<std::vector<ChatMessage>> reqs{next};
+            std::vector<Step> prev;
+            for (const std::string & u : {long_u, std::string("And a bird?")}) {
+                prev.clear();
+                if (!run(4, reqs, prev)) {
+                    std::fprintf(stderr, "G27c run failed: %s\n", err.c_str());
+                    return 2;
+                }
+                next.push_back(ChatMessage{"assistant", prev.back().out});
+                next.push_back(ChatMessage{"user", u});
+                reqs.push_back(next);
+            }
+            reqs.push_back(fresh);
+            std::vector<Step> held;
+            if (!run(4, reqs, held)) {
+                std::fprintf(stderr, "G27c run failed: %s\n", err.c_str());
+                return 2;
+            }
+            const Step & last = held.back();
+            const bool kept = last.prefilled <= last.n_prompt - floor;
+            std::printf("[%s] G27c a new conversation after %zu turns with 4 checkpoints kept its preamble "
+                        "(prefilled %d of %d)\n",
+                        kept ? "PASS" : "FAIL", reqs.size() - 1, last.prefilled, last.n_prompt);
+            fails += kept ? 0 : 1;
+            fails += check("G27c a restored conversation == a fresh session", ref[0].out, last.out);
+        }
+    }
+
     // G23 — the KV cache's element type is orthogonal to streaming: with f16 keys and values, the
     // streamed run and the resident one must still agree to the byte, as they do at the q8_0 default.
     {
@@ -1892,6 +2764,21 @@ int main(int argc, char ** argv) {
         const std::string rpc = loopback_rpc_device(); // registered once per process; "" without RPC
         HardwareProfile hw = probe_hardware(model.c_str());
         const ModelProfile mp = probe_model(model.c_str());
+        {
+            // Each block's dense bytes, by llama.cpp's layer index: one per layer, the largest the one
+            // the bound reads (a plan that moves layers between devices charges these).
+            const uint64_t top = mp.layer_dense_bytes.empty()
+                                     ? 0
+                                     : *std::max_element(mp.layer_dense_bytes.begin(), mp.layer_dense_bytes.end());
+            if (mp.layer_dense_bytes.size() != mp.n_layer || top != mp.largest_layer_dense_bytes || top == 0) {
+                std::printf("[FAIL] G26 per-layer dense bytes: %zu for %u layers, largest %llu against %llu\n",
+                            mp.layer_dense_bytes.size(), mp.n_layer, (unsigned long long) top,
+                            (unsigned long long) mp.largest_layer_dense_bytes);
+                ++fails;
+            } else {
+                std::printf("[PASS] G26 per-layer dense bytes: one per layer, the largest the bound's\n");
+            }
+        }
         probe_device_support(hw, mp);
         const auto t0 = std::chrono::steady_clock::now();
         probe_bandwidth(hw, mp);

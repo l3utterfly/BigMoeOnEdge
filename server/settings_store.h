@@ -17,6 +17,7 @@
 
 #include "bmoe/config.h"
 
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -41,6 +42,18 @@ public:
     // Replace the plan layer and remember the decisions behind it.
     void apply_plan(std::map<std::string, std::string> values, json decisions);
 
+    // What config() would build with `values` as the plan layer: the settings a load of another plan
+    // runs, before that plan is applied.
+    RunConfig config_with_plan(const std::map<std::string, std::string> & values) const;
+
+    // The model the user layer names is what a load opens and what a Plan page measures for while
+    // nothing is loaded. One whose file is gone - deleted through the server, or removed from
+    // outside it - names neither, and a page offering to measure the machine "for" it describes a
+    // model that is not there. Drops it from the user layer when `exists` says the file is gone, and
+    // says whether it did. A model the server was LAUNCHED with is the operator's word for this run
+    // and is never dropped: the load then says the file is missing.
+    bool forget_missing_model(const std::function<bool(const std::string &)> & exists);
+
     RunConfig config() const;
     // The configuration with the plan layer left out (defaults < user < launch): what a plan is
     // made from and measured against. A plan made from the config that holds the previous plan
@@ -60,9 +73,22 @@ public:
     json plan_decisions() const;
 
     // Whether every load plans first. A server setting, not an engine parameter, so it lives beside
-    // the values rather than in the table. `fallback` is the answer until someone sets it.
+    // the values rather than in the table. `fallback` is the answer until someone sets it. Layered as
+    // the values are: what the server was launched with (--auto, --no-auto) holds for this run over
+    // the saved choice and is never saved; a person's choice is saved and replaces it.
     bool auto_plan(bool fallback) const;
-    void set_auto_plan(bool on); // persists
+    void set_auto_plan(bool on); // persists, and drops the launch layer's
+    void set_launch_auto_plan(bool on);
+
+    // The folders a person chose for models: where downloads land ("" for the server's default,
+    // <data dir>/models) and the other folders listed beside it. Server settings like auto_plan;
+    // what the server was launched with (--models-dir, --scan-dir) is added over them at start.
+    struct ModelFolders {
+        std::string models_dir;
+        std::vector<std::string> scan_dirs;
+    };
+    ModelFolders model_folders() const;
+    void set_model_folders(ModelFolders f); // persists
 
 private:
     RunConfig build_locked() const;
@@ -75,6 +101,9 @@ private:
     json decisions_ = nullptr;
     bool auto_plan_set_ = false;
     bool auto_plan_ = false;
+    bool launch_auto_plan_set_ = false;
+    bool launch_auto_plan_ = false;
+    ModelFolders folders_;
 };
 
 } // namespace bmoe::server

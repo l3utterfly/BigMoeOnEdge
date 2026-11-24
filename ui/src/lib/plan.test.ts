@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { appliedChanges, deviceTone, diagnosticText, groupDecisions, memorySegments, rateScale, speedCheck } from './plan';
+import { appliedChanges, deviceTone, diagnosticText, groupDecisions, memoryCells, memorySegments, rateScale, rateText, speedCheck } from './plan';
 import type { ParamSpec, PlanDecision, PlanDevice, PlanMemoryPool } from './types';
 
 describe('appliedChanges', () => {
@@ -68,6 +68,22 @@ describe('groupDecisions', () => {
   });
 });
 
+describe('memoryCells', () => {
+  const seg = (slot: number, frac: number, bytes = 1) => ({ label: String(slot), bytes, frac, locked: false, slot });
+  it('counts each part in cells that add up to the row', () => {
+    const c = memoryCells([seg(0, 0.125), seg(1, 0.6), seg(-1, 0.275)], 40);
+    expect(c).toHaveLength(40);
+    expect(c.filter((x) => x === 0)).toHaveLength(5);
+    expect(c.filter((x) => x === 1)).toHaveLength(24);
+    expect(c.filter((x) => x === -1)).toHaveLength(11);
+  });
+  it('keeps a cell for a part too small to round to one', () => {
+    const c = memoryCells([seg(0, 0.005), seg(1, 0.995)], 40);
+    expect(c.filter((x) => x === 0)).toHaveLength(1);
+    expect(c).toHaveLength(40);
+  });
+});
+
 describe('memorySegments', () => {
   const pool = (cap: number, rows: PlanMemoryPool['rows']): PlanMemoryPool => ({
     name: 'host',
@@ -120,18 +136,29 @@ describe('rateScale', () => {
   });
 });
 
+describe('rateText', () => {
+  it('keeps one decimal, and two significant digits where one would read 0.0', () => {
+    expect(rateText(1.7)).toBe('1.7');
+    expect(rateText(0.1)).toBe('0.1');
+    expect(rateText(0.0202)).toBe('0.020');
+    expect(rateText(0.0049)).toBe('0.0049');
+    expect(rateText(0)).toBe('-');
+  });
+});
+
 describe('speedCheck', () => {
-  it('reads as bmoe-cli prints it', () => {
+  it('reads the figures the tiles draw', () => {
     const c = speedCheck({ s_per_token: 0.302, cache_hit_pct: 38 }, { s_per_token: 0.24, cache_hit_pct: 63, tokens: 50 });
-    expect(c.deltaPct).toBeCloseTo(25.8, 1);
+    expect(c.predictedTokS).toBeCloseTo(3.31, 2);
     expect(c.measuredTokS).toBeCloseTo(4.17, 2);
     expect(c.predictedHitPct).toBe(38);
     expect(c.measuredHitPct).toBe(63);
+    // Measured against predicted in words is the server's (`speed_check`), never worked out here.
+    expect(c).not.toHaveProperty('delta');
   });
   it('has no measured figures before a turn, and no hit rate without a cache', () => {
     const c = speedCheck({ s_per_token: 0.5 }, undefined);
     expect(c.measuredTokS).toBeNull();
-    expect(c.deltaPct).toBeNull();
     expect(speedCheck(undefined, { s_per_token: 1, cache_hit_pct: -1, tokens: 1 }).measuredHitPct).toBeNull();
   });
 });

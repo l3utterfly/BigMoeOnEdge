@@ -4,8 +4,9 @@ import SwiftUI
 /// Settings (docs/screens.md): the engine tunables a form offers, rendered from the parameter
 /// table, and the few settings that are the app's own. "Set by you" first, every row holding a
 /// value the person set, then one card per group of the table, in its order, listing the other
-/// rows the table puts on a form; every card starts closed. A link (`Navigator.openSetting`) opens
-/// its row's card and lands on it. Each row appears once.
+/// rows the table puts on a form; every card starts closed. Below them, Advanced settings: every
+/// other row a client may set, folded and cut into the same groups. A link (`Navigator.openSetting`)
+/// opens its row's card and lands on it. Each row appears once.
 struct SettingsView: View {
     @EnvironmentObject private var engine: Engine
     @EnvironmentObject private var nav: Navigator
@@ -16,8 +17,7 @@ struct SettingsView: View {
     @State private var shareOpen = false
     @State private var appearanceOpen = false
     @State private var mineOpen = false
-    /// A row a link landed on that the form does not offer, shown for this visit.
-    @State private var revealed: String?
+    @State private var advancedOpen = false
     @State private var focusKey: String?
     @State private var failure: String?
     @State private var confirmReset = false
@@ -39,10 +39,12 @@ struct SettingsView: View {
                     tools
                     let mine = SettingsForm.setByYou(engine.params, config: engine.config)
                     if !mine.isEmpty { setByYouCard(mine) }
-                    ForEach(SettingsForm.cards(engine.params, revealed: revealed.map { [$0] } ?? [],
-                                               setByYou: Set(mine.map(\.key)))) { c in card(c) }
+                    ForEach(SettingsForm.cards(engine.params, setByYou: Set(mine.map(\.key)))) { c in card(c) }
+                    let advanced = SettingsForm.advancedCards(engine.params, setByYou: Set(mine.map(\.key)))
+                    if !advanced.isEmpty { advancedSection(advanced) }
                 }
                 AppSettingsSection(open: $appOpen)
+                UpdatesSection()
                 // Always here, on every front-end: a switch elsewhere hid it (#465).
                 NavigationLink {
                     MetricsView()
@@ -64,11 +66,7 @@ struct SettingsView: View {
             .onChange(of: nav.settingTarget) { _ in land(proxy) }
             .onChange(of: engine.params.count) { _ in land(proxy) }
             .onChange(of: engine.config == nil) { _ in land(proxy) }
-            // A row a link revealed is shown for that visit only.
-            .onDisappear {
-                revealed = nil
-                focusKey = nil
-            }
+            .onDisappear { focusKey = nil }
         }
         .confirmationDialog(resetTitle, isPresented: $confirmReset, titleVisibility: .visible) {
             Button("Reset", role: .destructive) { resetAll() }
@@ -114,11 +112,28 @@ struct SettingsView: View {
 
     // MARK: a card
 
-    private func card(_ c: SettingsForm.Card) -> some View {
-        let open = openCards.contains(c.group)
+    /// Everything else a client may set, behind one fold and cut into the same groups: the plan sets
+    /// these, and a person who wants to choose (the devices that run the prompt and the answer, the
+    /// cache, the reads) finds them all here.
+    private func advancedSection(_ cards: [SettingsForm.Card]) -> some View {
+        VStack(alignment: .leading, spacing: Grid.s) {
+            CardHeader(title: "Advanced settings · \(cards.reduce(0) { $0 + $1.rows.count })",
+                       detail: "Everything else the engine lets you set, which the plan usually decides: the devices that "
+                           + "run the prompt and the answer, the cache, the reads, and the experimental and debug options.",
+                       open: $advancedOpen)
+            if advancedOpen { ForEach(cards) { c in card(c, key: Self.advancedKey(c.group), showLevel: true) } }
+        }
+        .card(padding: 12)
+    }
+
+    private static func advancedKey(_ group: String) -> String { " advanced:\(group)" }
+
+    private func card(_ c: SettingsForm.Card, key: String? = nil, showLevel: Bool = false) -> some View {
+        let id = key ?? c.group
+        let open = openCards.contains(id)
         return VStack(alignment: .leading, spacing: Grid.s) {
             Button {
-                if open { openCards.remove(c.group) } else { openCards.insert(c.group) }
+                if open { openCards.remove(id) } else { openCards.insert(id) }
             } label: {
                 HStack(alignment: .firstTextBaseline, spacing: Grid.s) {
                     Text(c.label).font(.ui(18, bold: true)).foregroundStyle(Palette.accentInk)
@@ -131,7 +146,7 @@ struct SettingsView: View {
             if !c.help.isEmpty {
                 Text(c.help).font(.ui(12)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
             }
-            if open { rows(c.rows, readOnly: c.readOnly) }
+            if open { rows(c.rows, readOnly: c.readOnly, showLevel: showLevel) }
         }
         .card(padding: 12)
     }
@@ -145,14 +160,14 @@ struct SettingsView: View {
         .card(padding: 12)
     }
 
-    private func rows(_ specs: [ParamSpec], readOnly: Bool) -> some View {
+    private func rows(_ specs: [ParamSpec], readOnly: Bool, showLevel: Bool = false) -> some View {
         let decisions = Dictionary((engine.config?.plan ?? []).map { ($0.knob, $0) }, uniquingKeysWith: { _, last in last })
         let reload = Set(engine.config?.reloadKeys ?? [])
         return VStack(alignment: .leading, spacing: 0) {
             ForEach(Array(specs.enumerated()), id: \.element.key) { i, spec in
                 if i > 0 { Rectangle().fill(Palette.line).frame(height: 1) }
-                ParamRow(spec: spec, readOnly: readOnly, decision: decisions[spec.key], needsReload: reload.contains(spec.key),
-                         focusRequest: focusKey == spec.key, onError: { failure = $0 })
+                ParamRow(spec: spec, readOnly: readOnly, showLevel: showLevel, decision: decisions[spec.key],
+                         needsReload: reload.contains(spec.key), focusRequest: focusKey == spec.key, onError: { failure = $0 })
                     .id("param-\(spec.key)")
             }
         }
@@ -161,17 +176,19 @@ struct SettingsView: View {
     // MARK: actions
 
     /// A link to one setting lands on it: "Set by you" opened when the person set it, else its group's
-    /// card, with the row shown even where the form does not offer it; the row scrolled into view
-    /// and its field focused. Once per link.
+    /// card (under Advanced settings for a row the form leaves to the plan); the row scrolled into
+    /// view and its field focused. Once per link.
     private func land(_ proxy: ScrollViewProxy) {
         guard let key = nav.settingTarget, engine.config != nil,
               let spec = engine.params.first(where: { $0.key == key }) else { return }
         nav.settingTarget = nil
         if SettingsForm.setByYou(engine.params, config: engine.config).contains(where: { $0.key == key }) {
             mineOpen = true
-        } else {
-            if !spec.form { revealed = key }
+        } else if spec.form || spec.groupReadOnly {
             openCards.insert(spec.group)
+        } else {
+            advancedOpen = true
+            openCards.insert(Self.advancedKey(spec.group))
         }
         focusKey = nil
         // After the cards above have opened, so the row is there to scroll to.
@@ -205,6 +222,8 @@ struct ParamRow: View {
     let spec: ParamSpec
     /// Shown, not edited: its group is set elsewhere (the model, from Models).
     var readOnly = false
+    /// Say when the row is experimental or a debug aid (Advanced settings, where those rows live).
+    var showLevel = false
     /// The applied plan's decision on this row, if it made one.
     var decision: PlanDecision?
     /// The value differs from the one the loaded session runs with (the server says which).
@@ -314,12 +333,20 @@ struct ParamRow: View {
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .focused($focused)
-                    .onSubmit(commit)
+                    .onSubmit { commit() }
                     .onChange(of: focused) { f in if !f { commit() } }
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
-                    .overlay(RoundedRectangle(cornerRadius: Grid.radius, style: .continuous).strokeBorder(focused ? Palette.accent : Palette.line, lineWidth: Grid.line))
+                    .overlay(RoundedRectangle(cornerRadius: Grid.control, style: .continuous).strokeBorder(focused ? Palette.accent : Palette.lineStrong, lineWidth: Grid.line))
                 if let unit = spec.unit { Text(unit).font(.ui(14)).foregroundStyle(Palette.muted) }
+                // Tapping beside the field or leaving the screen keeps the focus, so Return and the
+                // focus alone could lose a typed value: the check saves it in one tap. Not a pause in
+                // typing, which saved a value still being typed ("0" on the way to "0.5").
+                if text != value.display {
+                    Button { commit() } label: { Image(systemName: "checkmark") }
+                        .buttonStyle(.appSecondary)
+                        .accessibilityLabel("Save")
+                }
                 if spec.acceptsAuto && value.string != "auto" {
                     Button("auto") { set(.string("auto")) }.buttonStyle(.appSecondary)
                 }
@@ -344,6 +371,9 @@ struct ParamRow: View {
                 if !readOnly {
                     Badge(text: source.text, color: source == .you ? Palette.accent : source == .plan ? Palette.ok : Palette.muted)
                 }
+                if showLevel, spec.level == .experimental || spec.level == .debug {
+                    Badge(text: spec.level.rawValue, color: Palette.warn)
+                }
                 if spec.lossy { Badge(text: "changes the reply", color: Palette.warn) }
                 if spec.scope == .request { Badge(text: "per message", color: Palette.accentInk) }
                 if needsReload { Badge(text: "needs reload", color: Palette.warn) }
@@ -365,6 +395,8 @@ struct ParamRow: View {
         Button(title) { reset() }.font(.ui(13)).foregroundStyle(Palette.accentInk).buttonStyle(.borderless)
     }
 
+    /// Saves the typed value: the check, Return, or leaving the field. A value that does not parse is
+    /// refused with the reason.
     private func commit() {
         guard text != value.display else { return }
         guard let v = spec.value(fromText: text) else {
@@ -415,6 +447,57 @@ private struct CardHeader: View {
     }
 }
 
+/// The port the person prefers for the server, empty for the server's own default. Applied by
+/// restarting the engine; the server moves past a port another program holds, and the field then says
+/// where it went, so a client set up for the chosen port is pointed at the one in use.
+struct PortField: View {
+    @EnvironmentObject private var engine: Engine
+    @EnvironmentObject private var preferences: Preferences
+    @State private var text = ""
+    @State private var error: String?
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Port").font(.ui(13)).foregroundStyle(Palette.muted).padding(.top, 4)
+            TextField("Default", text: $text)
+                .font(.mono(15))
+                .keyboardType(.numberPad)
+                .focused($focused)
+                .onSubmit(commit)
+                .onChange(of: focused) { f in if !f { commit() } }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .overlay(RoundedRectangle(cornerRadius: Grid.radius, style: .continuous)
+                    .strokeBorder(error != nil ? Palette.warn : focused ? Palette.accent : Palette.line, lineWidth: Grid.line))
+            if let hint = error ?? hint {
+                Text(hint).font(.ui(12)).foregroundStyle(error != nil ? Palette.warn : Palette.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .onAppear { text = preferences.port > 0 ? String(preferences.port) : "" }
+    }
+
+    private var hint: String? {
+        guard let listening = engine.port else { return nil }
+        if preferences.port > 0, listening != preferences.port {
+            return "Port \(preferences.port) is in use, so the engine is on \(listening)."
+        }
+        return "The engine listens on port \(listening). Changing it restarts the engine."
+    }
+
+    private func commit() {
+        guard let p = ListenPort.chosen(text) else {
+            error = "A port from \(ListenPort.min) to \(ListenPort.max), or empty for the default."
+            return
+        }
+        error = nil
+        guard p != preferences.port else { return }
+        preferences.port = p
+        engine.restart()
+    }
+}
+
 /// Serving the engine to other devices (docs/screens.md): first in Settings, since it is what makes
 /// the phone a server. Its header says the state while the card is closed: whether it serves, and
 /// where. The key is the one kept in the keychain; the addresses are read when the card is drawn.
@@ -426,15 +509,20 @@ struct ShareSection: View {
     @State private var showKey = false
     @State private var copied: String?
 
-    private var urls: [String] { NetworkAddress.all().map { "http://\($0):\(EngineServer.port)" } }
+    /// The addresses with the port the server took: none until it has taken one.
+    private var urls: [String] {
+        guard let port = engine.port else { return [] }
+        return NetworkAddress.all().map { "http://\($0):\(port)" }
+    }
 
     var body: some View {
         let on = preferences.shareOnNetwork
         let urls = on ? urls : []
+        let starting = on && engine.port == nil && !NetworkAddress.all().isEmpty
         VStack(alignment: .leading, spacing: Grid.m) {
             CardHeader(title: "Serve on the network",
-                       detail: !on ? "Off" : urls.first.map { "On · \($0)" } ?? "On · not on a network",
-                       detailColor: on && urls.isEmpty ? Palette.warn : Palette.muted,
+                       detail: !on ? "Off" : starting ? "On · starting" : urls.first.map { "On · \($0)" } ?? "On · not on a network",
+                       detailColor: on && urls.isEmpty && !starting ? Palette.warn : Palette.muted,
                        open: $open)
             if open {
                 Toggle(isOn: Binding(get: { preferences.shareOnNetwork }, set: {
@@ -458,7 +546,10 @@ struct ShareSection: View {
     private func details(_ urls: [String]) -> some View {
         VStack(alignment: .leading, spacing: Grid.s) {
             Text("Address").font(.ui(13)).foregroundStyle(Palette.muted)
-            if urls.isEmpty {
+            if engine.port == nil {
+                Text("The engine is starting; its address appears once it listens.")
+                    .font(.ui(12)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
+            } else if urls.isEmpty {
                 Text("Not on a Wi-Fi or wired network: no other device can reach the engine until this one joins one.")
                     .font(.ui(12)).foregroundStyle(Palette.warn).fixedSize(horizontal: false, vertical: true)
             }
@@ -471,7 +562,8 @@ struct ShareSection: View {
             }
             Text("API key").font(.ui(13)).foregroundStyle(Palette.muted).padding(.top, 4)
             // Masked by default: the screen may be seen or recorded by someone the key is not for.
-            Text(showKey ? engine.networkKey : String(repeating: "•", count: min(engine.networkKey.count, 24)))
+            // On its own full-width line, wrapping if it must, so no part of it is ever cut off.
+            Text(keyBlocks(showKey ? engine.networkKey : String(repeating: "•", count: min(engine.networkKey.count, 24))))
                 .font(.mono(15)).foregroundStyle(Palette.text).textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: Grid.s) {
@@ -498,9 +590,22 @@ struct ShareSection: View {
                         .font(.ui(13, bold: true)).foregroundStyle(Palette.accentInk).buttonStyle(.borderless)
                 }
             }
+            PortField()
             Text("Prompts and answers cross the network unencrypted: use it on a network you trust.")
                 .font(.ui(12)).foregroundStyle(Palette.warn).fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    /// The key in blocks of four, to read it off the screen. Spaced by kerning rather than a
+    /// character, so a selection copies the raw key, as Copy does.
+    private func keyBlocks(_ key: String) -> AttributedString {
+        var out = AttributedString()
+        for (i, c) in key.enumerated() {
+            var ch = AttributedString(String(c))
+            if i % 4 == 3, i < key.count - 1 { ch.kern = 8 }
+            out += ch
+        }
+        return out
     }
 
     private func copyButton(_ text: String, id: String) -> some View {
@@ -532,6 +637,57 @@ struct AppearanceSection: View {
             }
         }
         .card(padding: 12)
+    }
+}
+
+/// Updates, as on every front-end (docs/screens.md): nothing checks in the background; the button
+/// asks the server to read the signed release feed. This app is built from source with Xcode, so a
+/// newer release opens its page, which says what changed.
+struct UpdatesSection: View {
+    @EnvironmentObject private var engine: Engine
+    @Environment(\.openURL) private var openURL
+    @State private var info: UpdateInfo?
+    @State private var checking = false
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Grid.m) {
+            Text("Updates").font(.ui(18, bold: true)).foregroundStyle(Palette.accentInk)
+            HStack(spacing: Grid.s) {
+                VStack(alignment: .leading, spacing: 2) {
+                    if let i = info {
+                        Text("This is version \(i.current)").foregroundStyle(Palette.text)
+                        Text(i.available ? "Version \(i.latest) is available." : "It is the latest.")
+                            .font(.ui(12)).foregroundStyle(Palette.muted)
+                    } else {
+                        Text("Nothing checks in the background. Check when you want to.")
+                            .font(.ui(12)).foregroundStyle(Palette.muted)
+                    }
+                }
+                Spacer()
+                Button(checking ? "Checking…" : "Check for updates") { check() }
+                    .buttonStyle(.appSecondary)
+                    .disabled(!engine.serverUp || checking)
+            }
+            if let i = info, i.available, let url = i.releasePage {
+                Button("What is new in \(i.latest)") { openURL(url) }.buttonStyle(.appPrimary)
+                Text("Pull the release and build the app again in Xcode.").font(.ui(12)).foregroundStyle(Palette.muted)
+            }
+            if let e = error {
+                Text("The check did not work. Check the connection and try again: \(e)")
+                    .font(.ui(12)).foregroundStyle(Palette.warn)
+            }
+        }
+        .card(padding: 12)
+    }
+
+    private func check() {
+        checking = true
+        error = nil
+        Task {
+            do { info = try await engine.api.update() } catch { self.error = error.localizedDescription }
+            checking = false
+        }
     }
 }
 

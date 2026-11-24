@@ -34,7 +34,18 @@ HardwareProfile probe_hardware(const char * model_path);
 // The model, from its gguf metadata and tensor shapes alone: no tensor data is read and the model
 // is never loaded. Returns ok=false when the file cannot be parsed, which every planning rule then
 // declines on.
-ModelProfile probe_model(const char * model_path);
+//
+// `engine_layers` is how many layers the engine numbers for this model (probe_engine_layers), for a
+// caller that plans a run. A model whose graph runs some blocks more than once per token has more
+// of them than the file has blocks, and its per-token demand is counted over the layers. Without
+// it (0) every block is counted once, which is what the file alone says: enough to describe a file,
+// not to plan a run of it.
+ModelProfile probe_model(const char * model_path, uint32_t engine_layers = 0);
+
+// How many layers the engine numbers for this model: llama.cpp's own count, read from the file's
+// metadata by its loader with no weight loaded. It is the coordinate a placement is expressed in
+// and the count a context's memory is held for. 0 when the file does not load.
+uint32_t probe_engine_layers(const char * model_path);
 
 // The file's header alone: its architecture and expert counts, with ok=false when it is not a
 // gguf that parses. A MoE whose expert layout probe_model refuses to plan still reads here, so a
@@ -114,12 +125,22 @@ bool expert_ready_hook_available();
 // optimise for a machine with no accelerator and never say why. The fields keep the three answers
 // apart: how many came linked, how many were loaded at run time, and whether anyone looked at all.
 // Only meaningful after register_backends().
+// A device on this machine that is a graphics card, discrete or integrated, as its backend
+// describes it: what a person is told the engine can compute on beside the processor.
+struct GraphicsDevice {
+    std::string backend;     // the registered backend that offers it
+    std::string description; // the device's own description (its product name, where the backend gives one)
+};
+
 struct BackendInventory {
     uint32_t linked = 0;            // compiled into this binary
     uint32_t loaded_at_runtime = 0; // found as separate shared libraries beside the executable
     bool looked = false;            // register_backends() ran; false means nobody went to look
     uint32_t placeable = 0; // of those, the ones that could offer a local device (HardwareProfile::backends_placeable)
     std::vector<std::string> names; // every registered backend, for the rationale and the CSV header
+    // The local devices of type GPU or integrated GPU, by what each backend offers, never by its
+    // name; a remote backend's devices are not here.
+    std::vector<GraphicsDevice> graphics;
 
     uint32_t total() const { return linked + loaded_at_runtime; }
 };

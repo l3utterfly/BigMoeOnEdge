@@ -36,10 +36,11 @@ SessionConfig session_config_from(const RunConfig & cfg) {
     SessionConfig sc;
     sc.model_path = cfg.model_path;
     sc.mmproj = cfg.mmproj;
+    sc.image_max_tokens = cfg.image_max_tokens;
     sc.n_threads = cfg.n_threads;
     sc.n_ctx = cfg.n_ctx;
-    sc.n_batch = cfg.n_ctx;     // one-batch prefill for any prompt that fits the context
-    sc.n_ubatch = cfg.n_ubatch; // 0 = follow n_batch; smaller trades prefill speed for memory
+    sc.n_batch = cfg.n_ctx;          // one-batch prefill for any prompt that fits the context
+    sc.n_ubatch = cfg.graph_width(); // never 0 here: the default width is RunConfig's to decide
     sc.ctx_checkpoints = cfg.ctx_checkpoints;
     sc.checkpoint_min_step = cfg.checkpoint_min_step;
     sc.cache_type_k = cfg.cache_type_k;
@@ -59,6 +60,7 @@ SessionConfig session_config_from(const RunConfig & cfg) {
     sc.decide = cfg.decide;
     sc.trial = cfg.trial;
     sc.llama_debug_log = cfg.llama_debug_log;
+    if (cfg.fallback) sc.fallback = std::make_shared<const SessionConfig>(session_config_from(*cfg.fallback));
     return sc;
 }
 
@@ -100,6 +102,7 @@ RunResult run(const RunConfig & cfg, const RunOutputs & out) {
         r.error_kind = RunError::Failed;
         return r;
     }
+    if (out.on_open) out.on_open(session->measured_knobs());
 
     GenerateRequest req;
     req.prompt = cfg.prompt;

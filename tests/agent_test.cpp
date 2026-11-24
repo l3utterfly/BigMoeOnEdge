@@ -35,12 +35,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -97,6 +99,10 @@ struct Turn {
     std::string text;
     std::vector<ChatToolCall> calls;
     bool context_full = false;
+    bool hold_before_token = false;
+    // The calls also travel with the tokens, half written on the first: what a model writing a
+    // long call looks like to the agent (TokenMetrics::tool_calls).
+    bool stream_calls = false;
 };
 
 struct Script {
@@ -105,6 +111,12 @@ struct Script {
     Turn fallback{"(the script ran out)", {}, false};
     std::vector<GenerateRequest> requests;
     int n_ctx = 32768;
+    std::condition_variable before_token_cv;
+    bool before_token_started = false;
+    bool before_token_release = false;
+    bool before_token_timed_out = false;
+    std::atomic<int> cancels{0};
+    std::atomic<int> tokens{0};
 };
 
 class ScriptedSession final : public HostedSession {
@@ -113,6 +125,8 @@ public:
     RunResult generate(const GenerateRequest & req,
                        const std::function<void(const TokenMetrics &)> & on_token) override {
         Turn t;
+        const auto stopped = [&] { return cancelled_.load() || (req.stop && req.stop->load()); };
+        cancelled_ = false; // a cancel belongs to the generation it lands in
         {
             std::lock_guard<std::mutex> lk(s_.m);
             s_.requests.push_back(req);
@@ -129,21 +143,49 @@ public:
             r.error_kind = RunError::ContextFull;
             return r;
         }
+        if (t.hold_before_token) {
+            std::unique_lock<std::mutex> lk(s_.m);
+            s_.before_token_started = true;
+            s_.before_token_cv.notify_all();
+            const auto deadline = std::chrono::steady_clock::now() + 5s;
+            while (!stopped() && !s_.before_token_release && std::chrono::steady_clock::now() < deadline)
+                s_.before_token_cv.wait_for(lk, 1ms);
+            const bool ended = stopped() || s_.before_token_release;
+            s_.before_token_timed_out = !ended;
+            if (stopped()) {
+                r.ok = true;
+                r.cancelled = true;
+                return r;
+            }
+        }
         // The answer arrives as two tokens, as a stream would show it.
         TokenMetrics m;
         m.text = t.text.substr(0, t.text.size() / 2);
+        if (t.stream_calls && !t.calls.empty()) {
+            ChatToolCall half = t.calls[0];
+            half.arguments.resize(half.arguments.size() / 2);
+            m.tool_calls = {half};
+        }
+        ++s_.tokens;
         if (on_token) on_token(m);
         m.text = t.text;
+        if (t.stream_calls) m.tool_calls = t.calls;
+        ++s_.tokens;
         if (on_token) on_token(m);
         r.ok = true;
-        r.cancelled = cancelled_.exchange(false);
+        r.cancelled = cancelled_.exchange(false) || (req.stop && req.stop->load());
         r.generated_text = t.text;
         r.tool_calls = t.calls;
         r.summary.n_generated = 2;
         return r;
     }
     DecideResult decide(const DecideRequest &) override { return {}; }
-    void cancel() override { cancelled_ = true; }
+    void cancel() override {
+        std::lock_guard<std::mutex> lk(s_.m);
+        ++s_.cancels;
+        cancelled_ = true;
+        s_.before_token_cv.notify_all();
+    }
     const std::string & arch() const override { return arch_; }
     int n_ctx() const override { return s_.n_ctx; }
     int n_expert_used() const override { return 8; }
@@ -190,7 +232,9 @@ struct Rig {
         d.bus = bus.get();
         d.store = store.get();
         d.local_chat = [this](const ChatRequest & r, const std::function<bool(const TokenMetrics &)> & t,
-                              const std::function<bool()> & w) { return host->chat(r, t, w); };
+                              const std::atomic<bool> & stop) {
+            return host->chat(r, t, [&stop] { return !stop.load(); }, &stop);
+        };
         d.bundled_skills_dir = (data.path / "bundled").u8string();
         d.user_skills_dir = (data.path / "skills").u8string();
         d.tools = tools;
@@ -366,8 +410,10 @@ static void loop_tests() {
         check(slurp(rig->ws.path / "notes" / "hello.txt") == "hi\n", "the approved write happened");
         const json done = rig->items_of(c, "tool")[0];
         check(done.value("state", "") == "done", "the tool item reads done");
-        check(last_tool_message(rig->last_request()).find("File written successfully.") == 0,
-              "the model reads the result in the next round");
+        check(last_tool_message(rig->last_request()) ==
+                  "File written successfully: created notes/hello.txt, 1 line (3 bytes).",
+              "the model reads the effect in the next round, not the content it wrote");
+        check(done.value("diff", "").find("+hi") != std::string::npos, "the card still shows the whole diff");
         const json answers = rig->items_of(c, "assistant");
         check(answers.size() == 2 && answers[1].value("text", "") == "Written." && !answers[1].value("streaming", true),
               "the final answer is the last assistant item, no longer streaming");
@@ -388,6 +434,21 @@ static void loop_tests() {
         }
         check(first.messages[0].content == r.messages[0].content && first.messages.size() < r.messages.size(),
               "rounds of one message share the system prompt and only append");
+        // What the person can read is what the model read (#625), and a remote client is shown the prompt
+        // its own run would get: no workspace.
+        check(rig->agent->system_prompt(rig->conv(c), false) == r.messages[0].content,
+              "the system prompt shown is the one sent");
+        check(rig->agent->system_prompt(rig->conv(c), true).empty(),
+              "a remote client is shown the prompt of its own run: plain chat, none");
+        // The person's own system prompt follows the agent's lines with a folder, and is the whole
+        // prompt without one.
+        rig->store->edit_conversation(c, [](json & conv) { conv["system"] = "Answer in French."; }, false);
+        const std::string with_own = rig->agent->system_prompt(rig->conv(c), false);
+        check(with_own.rfind(r.messages[0].content, 0) == 0 && with_own.size() > r.messages[0].content.size() &&
+                  with_own.substr(with_own.size() - 17) == "Answer in French.",
+              "a person's system prompt comes after the agent's, at its end");
+        check(rig->agent->system_prompt(rig->conv(c), true) == "Answer in French.",
+              "without a folder the person's system prompt is the whole prompt");
     }
     {
         auto rig = std::make_unique<Rig>();
@@ -472,6 +533,19 @@ static void loop_tests() {
         check(rig->items_of(c, "notice").size() == 1, "a notice says the results were shortened");
     }
     {
+        // A file written over another: the model is told what it replaced, in counts.
+        auto rig = std::make_unique<Rig>();
+        spit(rig->ws.path / "a.txt", "one\ntwo\nthree\n");
+        const std::string c = rig->conversation("full");
+        rig->say({{"", {call("write_file", {{"path", "a.txt"}, {"content", "one\n2\n"}})}}, {"Done.", {}}});
+        json item;
+        rig->agent->send(c, "rewrite", json::array(), false, false, item);
+        check(rig->wait_done(c), "the run ends");
+        check(last_tool_message(rig->last_request()) ==
+                  "File written successfully: replaced a.txt, 2 lines (6 bytes). The changed span: 2 lines became 1.",
+              "a replaced file is reported with how much of it changed");
+    }
+    {
         auto rig = std::make_unique<Rig>(false);
         const std::string c = rig->conversation("ask", false);
         json item;
@@ -541,6 +615,13 @@ static void loop_tests() {
         const GenerateRequest r = rig->last_request();
         check(r.tools.empty() && !r.messages.empty() && r.messages[0].role == "user",
               "chat only: no tools and no agent prompt, even with a workspace and full access");
+        rig->store->edit_conversation(c, [](json & conv) { conv["system"] = "Be brief."; }, false);
+        rig->say({{"Hi.", {}}});
+        rig->agent->send(c, "again", json::array(), false, false, item);
+        check(rig->wait_done(c), "chat only: a second message is answered");
+        const GenerateRequest r2 = rig->last_request();
+        check(r2.tools.empty() && r2.messages[0].role == "system" && r2.messages[0].content == "Be brief.",
+              "chat only: the person's own system prompt is sent, and nothing else");
     }
     {
         // A model that keeps asking for the same refused call is stopped, not left to loop.
@@ -558,8 +639,8 @@ static void loop_tests() {
         const json notices = rig->items_of(c, "notice");
         check(!notices.empty() && notices.back().value("text", "").find("same thing") != std::string::npos,
               "and says why");
-        check(rig->last_request().messages[0].content.find("pick a folder") != std::string::npos,
-              "without a workspace the prompt says to pick a folder for files");
+        check(rig->last_request().tools.empty() && rig->last_request().messages[0].role == "user",
+              "without a workspace the conversation is plain chat: no agent prompt and no tools");
     }
     {
         auto rig = std::make_unique<Rig>();
@@ -850,12 +931,16 @@ static void schedule_tests() {
           "a time of day that does not exist is refused");
     check(!parse_schedule(json{{"kind", "weekly"}, {"at", "10:00"}}, s, err), "weekly without a weekday is refused");
     check(!parse_schedule(json{{"kind", "hourly"}}, s, err), "an unknown kind is refused");
+#if !defined(_WIN32)
+    // The C runtime on Windows reads no zone names from TZ (only a US-rule "CET-1CEST" form), and
+    // the scheduler there follows the system's zone, so the daylight-saving case is POSIX's to prove.
     set_tz("Europe/Rome");
     check(parse_schedule(json{{"kind", "daily"}, {"at", "09:00"}}, s, err) &&
               next_run(s, 1792735200 /* 2026-10-23 08:00 Rome, CEST */, true) == 1792735200 + 3600,
           "daily in a zone with daylight saving: local time of day");
     check(next_run(s, 1792825200 /* 2026-10-24 09:00 CEST */, true) == 1792825200 + day + 3600,
           "across the change to winter time the day is 25 hours");
+#endif
     set_tz("UTC");
 }
 
@@ -1104,6 +1189,52 @@ static void access_tests() {
 }
 
 // An event for local clients only never reaches a stream from the network.
+// A call the model is still writing is its tool's card from the first piece, and the same card runs it.
+static void composing_tests() {
+    auto rig = std::make_unique<Rig>();
+    auto q = rig->bus->subscribe(true);
+    const std::string c = rig->conversation("full");
+    Turn writes{"", {call("write_file", {{"path", "page.html"}, {"content", "<p>hi</p>\n"}})}};
+    writes.stream_calls = true;
+    rig->say({writes, {"Written.", {}}});
+    json item;
+    check(rig->agent->send(c, "write a page", json::array(), false, false, item).ok(), "a message starts a run");
+    check(rig->wait_done(c), "the run ends");
+    std::string all, f;
+    while (EventBus::next(*q, f, 20ms) && !f.empty())
+        all += f;
+    rig->bus->unsubscribe(q);
+    std::vector<json> composing;
+    const std::string head = "event: item\ndata: ";
+    for (size_t at = all.find(head); at != std::string::npos; at = all.find(head, at + 1)) {
+        const size_t from = at + head.size();
+        const json ev = json::parse(all.substr(from, all.find('\n', from) - from));
+        if (ev["item"].value("state", "") == "composing") composing.push_back(ev["item"]);
+    }
+    const json tool = rig->items_of(c, "tool")[0];
+    check(!composing.empty() && composing.front().value("tool", "") == "write_file" &&
+              composing.front().value("id", "") == tool.value("id", ""),
+          "the card appears while the call is written, and the call runs on the same card");
+    check(composing.back().value("title", "") == "Write page.html" && composing.back().value("bytes", 0) > 0,
+          "the card's title follows the arguments as far as they go, with the size written so far");
+    // The arguments stream as `delta` events on the card: joined, they are the call the card ran.
+    std::string arguments;
+    const std::string dhead = "event: delta\ndata: ";
+    for (size_t at = all.find(dhead); at != std::string::npos; at = all.find(dhead, at + 1)) {
+        const size_t from = at + dhead.size();
+        const json ev = json::parse(all.substr(from, all.find('\n', from) - from));
+        if (ev.value("item", "") == tool.value("id", "")) arguments += ev.value("arguments", "");
+    }
+    check(json::parse(arguments, nullptr, false) == tool["args"],
+          "the call's arguments stream to the card as they are written, each piece once");
+    check(tool.value("state", "") == "done" && tool.value("title", "") == "Write page.html" &&
+              slurp(rig->ws.path / "page.html") == "<p>hi</p>\n",
+          "the stored card is the call that ran");
+    const json answers = rig->items_of(c, "assistant");
+    check(answers[0]["tool_calls"][0].value("id", "") == tool.value("call_id", ""),
+          "the round's call and its card share the id the card announced");
+}
+
 static void audience_tests() {
     EventBus bus;
     auto here = bus.subscribe(true);
@@ -1563,6 +1694,72 @@ static void prompt_tests() {
           "a request from the network does not get the workspace's AGENTS.md");
 }
 
+// A conversation Stop has to reach local image encoding/prefill, before an on_token callback
+// exists. Drive the real Agent -> local_chat -> EngineHost path and retain the loaded session.
+static void pretoken_stop_tests() {
+    {
+        auto rig = std::make_unique<Rig>(true, false);
+        const std::string c = rig->conversation("ask", false);
+        rig->say({{"must not be emitted", {}, false, true}, {"Recovered.", {}}});
+        json item;
+        check(rig->agent->send(c, "describe an image", json::array(), false, false, item).ok(),
+              "pre-token stop: the conversation starts");
+        {
+            std::unique_lock<std::mutex> lk(rig->script.m);
+            check(rig->script.before_token_cv.wait_for(lk, 2s, [&] { return rig->script.before_token_started; }),
+                  "pre-token stop: the local session is held before any token");
+        }
+        auto stopping = std::async(std::launch::async, [&] { return rig->agent->stop(c); });
+        const bool ended = stopping.wait_for(2s) == std::future_status::ready;
+        check(ended, "pre-token stop: conversation Stop finishes without releasing the fake or an API cancel");
+        if (!ended) rig->host->cancel(); // bound a failed regression without counting this as success
+        check(stopping.get() && rig->wait_done(c), "pre-token stop: the stopped conversation is idle");
+        check(rig->script.cancels == 0 && rig->last_request().stop != nullptr && rig->script.tokens == 0 &&
+                  !rig->script.before_token_timed_out && rig->host->ready() && !rig->host->generating(),
+              "pre-token stop: the session was cancelled with zero tokens and remains loaded");
+        const json notices = rig->items_of(c, "notice");
+        check(!notices.empty() && notices.back().value("text", "") == "Stopped.",
+              "pre-token stop: the conversation records the requested stop");
+        check(rig->agent->send(c, "answer again", json::array(), false, false, item).ok() && rig->wait_done(c),
+              "pre-token stop: a follow-up in the same conversation completes");
+        const json answers = rig->items_of(c, "assistant");
+        check(!answers.empty() && answers.back().value("text", "") == "Recovered." &&
+                  !answers.back().value("streaming", true) && rig->requests() == 2,
+              "pre-token stop: the follow-up answer is complete and no reload was needed");
+    }
+    {
+        auto rig = std::make_unique<Rig>(true, false);
+        const std::string active = rig->conversation("ask", false);
+        const std::string queued = rig->conversation("ask", false);
+        rig->say({{"First finished.", {}, false, true}, {"Next answer.", {}}});
+        json item;
+        rig->agent->send(active, "first", json::array(), false, false, item);
+        {
+            std::unique_lock<std::mutex> lk(rig->script.m);
+            check(rig->script.before_token_cv.wait_for(lk, 2s, [&] { return rig->script.before_token_started; }),
+                  "queued conversation stop: the first conversation owns pre-token work");
+        }
+        check(rig->agent->send(queued, "second", json::array(), false, false, item).ok(),
+              "queued conversation stop: the other conversation starts waiting");
+        auto stopping = std::async(std::launch::async, [&] { return rig->agent->stop(queued); });
+        const bool ended = stopping.wait_for(2s) == std::future_status::ready;
+        check(ended && rig->agent->running(active) && rig->host->generating() && rig->script.cancels == 0 &&
+                  rig->script.tokens == 0,
+              "queued conversation stop: stopping the waiter leaves the active encoding untouched");
+        {
+            std::lock_guard<std::mutex> lk(rig->script.m);
+            rig->script.before_token_release = true;
+            rig->script.before_token_cv.notify_all();
+        }
+        check(stopping.get() && rig->wait_done(queued) && rig->wait_done(active),
+              "queued conversation stop: both runs end after the active request's own release");
+        const json answers = rig->items_of(active, "assistant");
+        check(!answers.empty() && answers.back().value("text", "") == "First finished." && rig->requests() == 1 &&
+                  !rig->script.before_token_timed_out,
+              "queued conversation stop: only the unrelated request reached the model and answered normally");
+    }
+}
+
 int main() {
     confinement_tests();
     classifier_tests();
@@ -1576,9 +1773,11 @@ int main() {
     store_tests();
     access_tests();
     audience_tests();
+    composing_tests();
     external_agent_tests();
     command_tests();
     loop_tests();
+    pretoken_stop_tests();
     cut_call_tests();
     prompt_tests();
     mcp_agent_tests();

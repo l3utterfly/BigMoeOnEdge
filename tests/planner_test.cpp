@@ -14,12 +14,15 @@
 
 #include "bmoe/config.h"
 #include "bmoe/allocate.h"
+#include "bmoe/auto_plan.h"
 #include "bmoe/backend_choice.h"
 #include "bmoe/planner.h"
 #include "bmoe/probe.h"
+#include "bmoe/routing.h"
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 using namespace bmoe;
@@ -173,9 +176,9 @@ static HardwareProfile unified() {
     return h;
 }
 
-static const LedgerRow * ledger_row(const Plan & p, const char * name) {
+static const LedgerRow * ledger_row(const Plan & p, LedgerKind kind) {
     for (const LedgerRow & r : p.allocation.ledger.rows)
-        if (r.name == name) return &r;
+        if (r.kind == kind) return &r;
     return nullptr;
 }
 
@@ -218,12 +221,12 @@ int main() {
             ModelProfile seeing = model;
             seeing.projector_bytes = 600 * MiB;
             const Plan v = plan_run(base_cfg(), desktop(), seeing, PlanRequest{});
-            const LedgerRow * pr = ledger_row(v, "projector");
+            const LedgerRow * pr = ledger_row(v, LedgerKind::Projector);
             check(pr && pr->bytes == 600 * MiB && !pr->locked, "desktop, projector: a ledger row of its size");
             check(v.config.moe.cache_mb == p.config.moe.cache_mb - 600,
                   "desktop, projector: the cache gives up exactly the projector's bytes",
                   std::to_string(v.config.moe.cache_mb) + " vs " + std::to_string(p.config.moe.cache_mb));
-            check(!ledger_row(p, "projector"), "desktop, no projector: no row");
+            check(!ledger_row(p, LedgerKind::Projector), "desktop, no projector: no row");
         }
 
         const Decision * d = find(p, "release-mmap");
@@ -279,15 +282,21 @@ int main() {
         h.residency_budget = 74 * GiB; // what the issue's host offered after its margin
         h.memory_total = 96 * GiB;
         h.devices.clear();
+        // Held whole beside the table it leaves mapped, the model fits that host: nothing streams.
+        check(plan_run(base_cfg(), h, tabled, PlanRequest{}).regime == Regime::Fits,
+              "mapped table: the model held beside its table fits");
+        // On a host that cannot hold the expert set, the experts stream and the cache gets what the
+        // table would have taken: charged, it would leave the cache under 10 GB of a 40 GB budget.
+        h.residency_budget = 40 * GiB;
         const Plan p = plan_run(base_cfg(), h, tabled, PlanRequest{});
-        check(p.regime == Regime::ExpertsStream, "mapped table: experts stream");
+        check(p.regime == Regime::ExpertsStream, "mapped table: experts stream", regime_name(p.regime));
         check(p.config.moe.dense_mapped == tabled.embedding_tensors, "mapped table: the run leaves the tables mapped");
-        const LedgerRow * dense = ledger_row(p, "dense");
+        const LedgerRow * dense = ledger_row(p, LedgerKind::Dense);
         check(dense && dense->bytes < tabled.group(WeightGroup::Embedding).bytes,
               "mapped table: the ledger's dense row does not carry the table",
               dense ? std::to_string(dense->bytes >> 20) + " MiB" : "no row");
-        check((uint64_t) p.config.moe.cache_mb * MiB >= tabled.expert_bytes,
-              "mapped table: the cache holds the whole expert set", std::to_string(p.config.moe.cache_mb) + " MiB");
+        check((uint64_t) p.config.moe.cache_mb * MiB >= 20 * GiB, "mapped table: the cache is not short by the table",
+              std::to_string(p.config.moe.cache_mb) + " MiB");
         check(p.allocation.ledger.held <= p.allocation.ledger.holdable_cap, "mapped table: what is held fits",
               std::to_string(p.allocation.ledger.held >> 20) + " MiB");
         check(validate(p.config).ok, "mapped table: the plan is a valid config", validate(p.config).error);
@@ -308,6 +317,141 @@ int main() {
 
         const Decision * d = find(p, "dense-weights");
         check(d && d->source == Source::Derived, "phone: dense policy is derived, not defaulted");
+    }
+
+    // ── a table larger than the machine is not a dense set it must hold ─────────────
+    // Shaped after #664: a per-layer table several times the memory this process may hold, beside a
+    // dense set read whole that fits in a fraction of it. The graph gathers the table by row and the
+    // run leaves it mapped, so the experts stream; weighing the regime with the table in it told the
+    // user that not even the dense weights fit.
+    {
+        ModelProfile tabled = model;
+        tabled.embedding_tensors = {"token_embd.weight", "per_layer_token_embd.weight"};
+        tabled.group(WeightGroup::Embedding) = {28 * GiB, 30 * KiB, true, true};
+        tabled.dense_bytes += 28 * GiB - 344 * MiB;
+        tabled.file_bytes += 28 * GiB - 344 * MiB;
+        tabled.largest_dense_tensor = 27 * GiB;
+        const Plan p = plan_run(base_cfg(), phone(), tabled, PlanRequest{});
+        check(p.regime == Regime::ExpertsStream, "table past the machine: experts stream", regime_name(p.regime));
+        check(p.config.moe.dense_mapped == tabled.embedding_tensors,
+              "table past the machine: the run leaves the tables mapped");
+        const Decision * r = find(p, "regime");
+        check(r && r->reason.find("embedding tables the run may leave mapped") != std::string::npos,
+              "table past the machine: the regime says what it left out", r ? r->reason : "no decision");
+
+        // A caller who pinned a list without the tables holds them: the regime weighs them.
+        PlanRequest pinned;
+        pinned.pinned.push_back("dense-mapped");
+        RunConfig held = base_cfg();
+        held.moe.dense_mapped = {"token_embd.weight"};
+        const Plan q = plan_run(held, phone(), tabled, pinned);
+        check(q.regime == Regime::DenseOversized, "table past the machine: a pinned list that holds it is weighed",
+              regime_name(q.regime));
+        // One that names every table leaves them mapped as the plan would.
+        held.moe.dense_mapped = tabled.embedding_tensors;
+        check(plan_run(held, phone(), tabled, pinned).regime == Regime::ExpertsStream,
+              "table past the machine: a pinned list that names every table leaves them out");
+
+        // A dense set past the machine with no table in it is still what the regime says it is.
+        ModelProfile heavy = model;
+        heavy.group(WeightGroup::Attention).bytes += 8 * GiB;
+        heavy.dense_bytes += 8 * GiB;
+        heavy.file_bytes += 8 * GiB;
+        check(plan_run(base_cfg(), phone(), heavy, PlanRequest{}).regime == Regime::DenseOversized,
+              "dense past the machine: still oversized");
+
+        // Over a fitted placement, the tables are taken out as the placement's figure counted them.
+        Placement pl;
+        pl.fitted = true;
+        pl.outcome = "synthetic";
+        pl.n_gpu_layers = 24;
+        pl.n_ctx = 4096;
+        for (uint32_t il = 0; il < 24; ++il)
+            pl.host_expert_layers.push_back(il);
+        pl.host_table_bytes = 14 * GiB;
+        pl.host_resident_bytes = pl.host_table_bytes + 2 * GiB;
+        pl.device_bytes = 8 * GiB;
+        HardwareProfile h = desktop();
+        h.residency_budget = 8 * GiB;
+        check(plan_run(base_cfg(), h, tabled, pl, PlanRequest{}).regime == Regime::ExpertsStream,
+              "table past the machine, placed: experts stream");
+        pl.host_table_bytes = 0; // a fitter's figure with no table in it: all of it is held
+        check(plan_run(base_cfg(), h, tabled, pl, PlanRequest{}).regime == Regime::DenseOversized,
+              "placed, no table counted: the whole figure is weighed");
+    }
+
+    // ── a placement's host figure is where llama.cpp puts each part ─────────────────
+    // n_gpu_layers counts slots from the top, the output first; the input layer (the embedding
+    // tables) never leaves the host. Four blocks of 10/20/30/40, tables 100, head 50, a final norm 5.
+    {
+        ModelProfile m;
+        m.n_layer = 4;
+        m.layer_dense_bytes = {10, 20, 30, 40};
+        m.group(WeightGroup::Embedding).bytes = 100;
+        m.group(WeightGroup::Output).bytes = 50;
+        m.dense_bytes = 100 + 50 + 100 + 5;
+        const auto host = [&](int32_t ngl) { return host_dense_of(m, layer_slots(ngl, m.n_layer)); };
+        check(host(-1).bytes == 105 && host(-1).tables == 100, "slots: every slot leaves the tables and the norm",
+              std::to_string(host(-1).bytes));
+        check(host(5).bytes == 105, "slots: n_layer + 1 is every slot");
+        check(host(4).bytes == 115, "slots: n_layer moves the output and all but the lowest block",
+              std::to_string(host(4).bytes));
+        check(host(2).bytes == 165, "slots: two slots are the output and the top block", std::to_string(host(2).bytes));
+        check(host(0).bytes == m.dense_bytes, "slots: none is the whole dense set");
+        check(layer_slots(4, 4).host_blocks() == 1 && layer_slots(-1, 4).host_blocks() == 0 &&
+                  layer_slots(0, 4).host_blocks() == 4 && !layer_slots(0, 4).output_on_device(),
+              "slots: the blocks the host keeps");
+
+        // Without each block's bytes the blocks are what the tables and the head leave, by count.
+        ModelProfile coarse = m;
+        coarse.layer_dense_bytes.clear();
+        check(host_dense_of(coarse, layer_slots(3, 4)).bytes == 100 + 105 / 2,
+              "slots: a share of the blocks where their bytes are unknown",
+              std::to_string(host_dense_of(coarse, layer_slots(3, 4)).bytes));
+    }
+
+    // ── a placement's tables left mapped are not charged as dense ───────────────────
+    // The model above with a card: every slot on it, the experts on the host, so the host figure
+    // carries the 27 GB per-layer table whole, as llama.cpp keeps it. The run leaves the table mapped;
+    // charged all the same, it would hold the cache short by the table.
+    {
+        ModelProfile tabled = model;
+        tabled.embedding_tensors = {"token_embd.weight", "per_layer_token_embd.weight"};
+        tabled.group(WeightGroup::Embedding) = {27 * GiB, 30 * KiB, true, true};
+        tabled.expert_bytes = 46 * GiB;
+        tabled.group(WeightGroup::Experts) = {46 * GiB, tabled.token_cycle_bytes, false, true};
+        tabled.dense_bytes = 27 * GiB + 2728 * MiB;
+        tabled.file_bytes = tabled.expert_bytes + tabled.dense_bytes;
+        tabled.largest_dense_tensor = 27 * GiB - 512 * MiB;
+        Placement pl;
+        pl.fitted = true;
+        pl.outcome = "synthetic";
+        pl.n_gpu_layers = (int32_t) tabled.n_layer + 1;
+        pl.n_ctx = 4096;
+        for (uint32_t il = 0; il < tabled.n_layer; ++il)
+            pl.host_expert_layers.push_back(il);
+        const HostDense dense = host_dense_of(tabled, layer_slots(pl.n_gpu_layers, tabled.n_layer));
+        pl.host_resident_bytes = dense.bytes + 256 * MiB;
+        pl.raw_host_compute_bytes = 256 * MiB;
+        pl.host_table_bytes = dense.tables;
+        pl.device_bytes = 4 * GiB;
+        HardwareProfile h = desktop();
+        h.residency_budget = 74 * GiB;
+        h.memory_total = 96 * GiB;
+        check(plan_run(base_cfg(), h, tabled, pl, PlanRequest{}).regime == Regime::Fits,
+              "placed table: the model held beside its table fits");
+        h.residency_budget = 40 * GiB;
+        const Plan p = plan_run(base_cfg(), h, tabled, pl, PlanRequest{});
+        check(p.regime == Regime::ExpertsStream, "placed table: experts stream", regime_name(p.regime));
+        check(p.config.moe.dense_mapped == tabled.embedding_tensors, "placed table: the run leaves the tables mapped");
+        const LedgerRow * row = ledger_row(p, LedgerKind::Dense);
+        check(!row || row->bytes < tabled.group(WeightGroup::Embedding).bytes,
+              "placed table: the ledger's dense row does not carry the table",
+              row ? std::to_string(row->bytes >> 20) + " MiB" : "no row");
+        check((uint64_t) p.config.moe.cache_mb * MiB >= 20 * GiB, "placed table: the cache is not short by the table",
+              std::to_string(p.config.moe.cache_mb) + " MiB");
+        check(p.allocation.ledger.held <= p.allocation.ledger.holdable_cap, "placed table: what is held fits",
+              std::to_string(p.allocation.ledger.held >> 20) + " MiB");
     }
 
     // ── a platform that kills instead of reclaiming ─────────────────────────────────
@@ -446,6 +590,46 @@ int main() {
               "tight machine: the reason names the derived floor", c ? c->reason : "no cache-mb decision");
         check(validate(p.config).ok, "tight machine: the plan is a valid config", validate(p.config).error);
 
+        // The reason may name a shorter context that would bring the cache back. Whatever it names
+        // has to do that by the figures of the same sentence: the suggestion is rounded down to a
+        // power of two, and at the smallest one it offers the rounding once went UP past what was
+        // asked, naming a context that frees less than the cache is short of.
+        int suggested = 0, unsuggested = 0;
+        for (uint64_t budget = 3 * GiB + 800 * MiB; budget <= 4 * GiB + 800 * MiB; budget += 16 * MiB) {
+            HardwareProfile sweep = tight;
+            sweep.residency_budget = budget;
+            Placement pl;
+            pl.n_ctx = 4096;
+            pl.raw_host_context_bytes = 440 * MiB;
+            const Plan q = plan_run(base_cfg(), sweep, model, pl, PlanRequest{});
+            const Decision * d = find(q, "cache-mb");
+            if (!d) continue;
+            unsigned long long left = 0, cycle = 0, kv = 0, shortfall = 0, ctx = 0;
+            const size_t at_left = d->reason.find("the "), at_cycle = d->reason.find("token cycle of ");
+            const size_t at_kv = d->reason.find("The context reserves "), at_ctx = d->reason.find("ctx-size ");
+            if (at_kv == std::string::npos || at_ctx == std::string::npos) {
+                unsuggested += q.config.moe.cache_mb == 0;
+                continue;
+            }
+            if (std::sscanf(d->reason.c_str() + at_left, "the %llu MiB left", &left) != 1 ||
+                std::sscanf(d->reason.c_str() + at_cycle, "token cycle of %llu MiB", &cycle) != 1 ||
+                std::sscanf(d->reason.c_str() + at_kv, "The context reserves %llu MiB here and the cache is %llu MiB",
+                            &kv, &shortfall) != 2 ||
+                std::sscanf(d->reason.c_str() + at_ctx, "ctx-size %llu", &ctx) != 1) {
+                check(false, "tight machine, context suggestion: the reason reads as figures", d->reason);
+                continue;
+            }
+            ++suggested;
+            // What the named context frees, against what the cache lacks, a MiB of rounding allowed.
+            const double freed = (double) kv * (1.0 - (double) ctx / 4096.0);
+            check(ctx < 4096 && freed + 1.0 >= (double) shortfall,
+                  "tight machine, context suggestion: the context it names frees what the cache is short of",
+                  d->reason);
+        }
+        check(suggested > 0 && unsuggested > 0,
+              "tight machine, context suggestion: the sweep crosses both a named context and none worth naming",
+              std::to_string(suggested) + " named, " + std::to_string(unsuggested) + " not");
+
         const Allocation & a = p.allocation;
         const GroupPlacement & e = a.at(WeightGroup::Experts);
         check(e.lane == Lane::ExpertStream && e.resident_bytes == 0 && a.cache_bytes == 0,
@@ -453,7 +637,7 @@ int main() {
         check(e.seconds_per_token > 0.0 && e.seconds_per_token < e.seconds_worst_case,
               "tight machine: the stream is chosen on its price against the mapping",
               std::to_string(e.seconds_per_token) + " vs " + std::to_string(e.seconds_worst_case));
-        check(ledger_row(p, "dense") && !ledger_row(p, "expert cache"),
+        check(ledger_row(p, LedgerKind::Dense) && !ledger_row(p, LedgerKind::ExpertCache),
               "tight machine: the ledger keeps the dense set and carries no cache");
         check(p.to_flags().find("--cache-mb 0") != std::string::npos,
               "tight machine: the reproduce line states the cache is off, which a front-end would otherwise size",
@@ -483,7 +667,7 @@ int main() {
         }
         check(!any_held && all_mapped,
               "tight machine, unmeasured drive: a declined plan holds no weights and streams none");
-        check(!ledger_row(q, "dense") && !ledger_row(q, "expert cache"),
+        check(!ledger_row(q, LedgerKind::Dense) && !ledger_row(q, LedgerKind::ExpertCache),
               "tight machine, unmeasured drive: the ledger of a declined plan carries no weights");
     }
 
@@ -742,6 +926,34 @@ int main() {
         dense.is_moe = false;
         const Plan p = plan_run(base_cfg(), desktop(), dense, PlanRequest{});
         check(p.regime == Regime::NotMoe && !p.config.moe.enabled, "dense model: declined");
+        check(p.config.n_gpu_layers == 0 && p.config.device_split.empty(),
+              "dense model, nothing placed: every layer stays on the CPU");
+
+        // Nothing streams, but what the fitter placed on a card stays there: dropping it left a model
+        // that fit the card opening on the CPU alone.
+        Placement placed;
+        placed.fitted = true;
+        placed.n_gpu_layers = (int32_t) dense.n_layer + 1;
+        placed.device_split = {{"discrete", dense.n_layer + 1}};
+        placed.n_ctx = 8192;
+        placed.outcome = "the capacity fitter placed every layer";
+        const Plan on_card = plan_run(base_cfg(), desktop(), dense, placed, PlanRequest{}, PlannerPolicy::defaults());
+        check(on_card.regime == Regime::NotMoe && !on_card.config.moe.enabled &&
+                  on_card.config.n_gpu_layers == placed.n_gpu_layers && on_card.config.device_split.size() == 1 &&
+                  on_card.config.device_split[0].first == "discrete" && on_card.config.n_ctx == 8192,
+              "dense model, placed by the fitter: the placement is applied, streaming stays off");
+        PlanRequest ctx_pinned;
+        ctx_pinned.pinned = {"ctx-size"};
+        RunConfig ctx_cfg = base_cfg();
+        ctx_cfg.n_ctx = 4096;
+        check(plan_run(ctx_cfg, desktop(), dense, placed, ctx_pinned, PlannerPolicy::defaults()).config.n_ctx == 4096,
+              "dense model, placed: a context set by the caller is the caller's");
+        Placement declined = placed;
+        declined.fitted = false;
+        declined.shared_memory_placement = true;
+        check(plan_run(base_cfg(), desktop(), dense, declined, PlanRequest{}, PlannerPolicy::defaults())
+                      .config.n_gpu_layers == 0,
+              "dense model, placement set aside: every layer stays on the CPU");
     }
 
     // ── an unprofiled machine declines instead of inventing numbers ────────────────
@@ -866,6 +1078,10 @@ int main() {
         const uint64_t per_token = 256 * KiB; // 16384 tokens wide is 4 GiB of buffers
         const HardwareProfile hw = desktop();
         const PlannerPolicy pol = PlannerPolicy::defaults();
+        // The rules below weigh a device's width by its memory and by measurement; the evidence bound on
+        // a device's pass (ubatch_max_device, #533) is checked on its own at the end, so it is off here.
+        PlannerPolicy unbounded = pol;
+        unbounded.ubatch_max_device = 0;
         const uint64_t cap =
             (uint64_t) ((double) (hw.holdable_bytes ? hw.holdable_bytes : hw.residency_budget) * pol.compute_share_max);
 
@@ -905,6 +1121,21 @@ int main() {
         check((uint32_t) floor.config.n_ubatch == pol.ubatch_min, "width: never narrower than the floor",
               std::to_string(floor.config.n_ubatch));
 
+        // The floor is reached from a context that is not a power of two times it: halving 4092 stops at
+        // 1023, whose half is under the floor, and the width used to stay there with its buffers past
+        // their share.
+        RunConfig odd_ctx = base_cfg();
+        odd_ctx.n_ctx = 4092;
+        const Plan odd = plan_run(odd_ctx, hw, model, wide(4092, 64 * MiB), PlanRequest{});
+        check((uint32_t) odd.config.n_ubatch == pol.ubatch_min,
+              "width: a context that is not a power of two times the floor still narrows to the floor",
+              std::to_string(odd.config.n_ubatch));
+        // And a width whose buffers fit above the floor is not taken lower than it has to be.
+        const Plan odd_fit = plan_run(odd_ctx, hw, model, wide(4092, per_token), PlanRequest{});
+        const uint64_t wo = odd_fit.config.n_ubatch ? (uint64_t) odd_fit.config.n_ubatch : 4092;
+        check(wo * per_token <= cap && (wo == 4092 || wo * 2 * per_token > cap || wo == pol.ubatch_min),
+              "width: from an odd context, the widest whose buffers fit", std::to_string(wo));
+
         // A slope nobody measured decides nothing.
         const Plan blind = plan_run(big_ctx, hw, model, wide(16384, 0), PlanRequest{});
         const Decision * du = find(blind, "ubatch");
@@ -938,12 +1169,509 @@ int main() {
         check(ws <= wa, "width: a device that shares this pool narrows the graph at least as much as one that does not",
               std::to_string(ws) + " vs " + std::to_string(wa));
 
+        // A device with memory of its own, short of room (the fitter left layers on the host): its
+        // buffers are held to their share of its memory, as the host's are of the host's. The same
+        // buffers on a device the whole model fits take nothing there, and the graph stays wide.
+        {
+            HardwareProfile card = desktop();
+            ComputeDevice & gpu = card.devices[0];
+            gpu.memory_total = 12 * GiB;
+            gpu.memory_free = 12 * GiB;
+            gpu.shares_host_memory = Tri::No;
+            const uint64_t dev_per_token = 400 * KiB; // 16384 wide: 6.25 GiB of the card, as measured on one
+            Placement short_card = wide(16384, 4 * KiB);
+            short_card.fitted = true;
+            short_card.n_gpu_layers = (int32_t) model.n_layer - 1; // two of n_layer + 1 left on the host
+            short_card.device_compute_bytes = 16384ull * dev_per_token;
+            short_card.device_compute_per_token = dev_per_token;
+            short_card.device_bytes = 11 * GiB;
+            const Plan narrowed = plan_run(big_ctx, card, model, short_card, PlanRequest{});
+            const Decision * dn = find(narrowed, "ubatch");
+            const uint64_t wn = (uint64_t) narrowed.config.n_ubatch;
+            const uint64_t dcap = (uint64_t) ((double) (12 * GiB) * pol.compute_share_max);
+            check(wn > 0 && wn < 16384 && wn * dev_per_token <= dcap && dn && dn->source == Source::Policy &&
+                      dn->reason.find("of device memory") != std::string::npos,
+                  "width: a device short of room holds its buffers to their share of its memory",
+                  dn ? std::to_string(wn) + ": " + dn->reason : "no decision");
+            check(wn * 2 * dev_per_token > dcap || wn == pol.ubatch_min,
+                  "width: the widest whose device buffers fit, not a narrower one", std::to_string(wn));
+
+            // No layer on the card at all: the wide graph's buffers took the room of the first one. That is
+            // the shortest of all, and the graph narrows the same way.
+            Placement no_layers = short_card;
+            no_layers.n_gpu_layers = 0;
+            no_layers.device_bytes = 0;
+            const Plan from_none = plan_run(big_ctx, card, model, no_layers, PlanRequest{});
+            const Decision * d0 = find(from_none, "ubatch");
+            const uint64_t w0 = (uint64_t) from_none.config.n_ubatch;
+            check(w0 > 0 && w0 < 16384 && w0 * dev_per_token <= dcap && d0 && d0->source == Source::Policy,
+                  "width: a device the wide graph left with no layer narrows it too",
+                  d0 ? std::to_string(w0) + ": " + d0->reason : "no decision");
+
+            // Every layer on the card, the experts on the host (a cache's job): the wide graph costs
+            // cache, not a dense part, and that trade is not this rule's. The graph stays wide.
+            Placement all_layers = short_card;
+            all_layers.n_gpu_layers = (int32_t) model.n_layer + 1;
+            const Plan layers_kept = plan_run(big_ctx, card, model, all_layers, PlanRequest{}, unbounded);
+            check(layers_kept.config.graph_width() == 16384,
+                  "width: every layer on the card keeps the widest graph, experts on the host or not",
+                  std::to_string(layers_kept.config.graph_width()));
+
+            // The whole model on the card: every layer placed, no experts left on the host.
+            Placement whole = short_card;
+            whole.n_gpu_layers = (int32_t) model.n_layer + 1;
+            whole.host_expert_layers.clear();
+            const Plan wide_kept = plan_run(big_ctx, card, model, whole, PlanRequest{}, unbounded);
+            check(wide_kept.config.graph_width() == 16384,
+                  "width: a device the model fits whole keeps the widest graph, and the session opens that wide",
+                  std::to_string(wide_kept.config.graph_width()));
+            // The same card under the default policy: the memory would take the wide graph, but a device
+            // computes it, and its expert matmul is not known to run a pass past ubatch_max_device (#533).
+            const Plan bounded = plan_run(big_ctx, card, model, whole, PlanRequest{});
+            const Decision * db = find(bounded, "ubatch");
+            check((uint32_t) bounded.config.graph_width() == pol.ubatch_max_device && db &&
+                      db->source == Source::Policy && db->reason.find("#533") != std::string::npos &&
+                      validate(bounded.config).ok,
+                  "width: a device's graph is bounded by the widest pass its expert matmul is known to run",
+                  db ? std::to_string(bounded.config.graph_width()) + ": " + db->reason : "no decision");
+            check(bounded.placement.compute_width == pol.ubatch_max_device,
+                  "width: the bounded width's buffers are the ones charged",
+                  std::to_string(bounded.placement.compute_width));
+            // Where the whole model fits, the fitter leaves llama.cpp's own "every layer", -1. It is the same
+            // placement: a device computes the graph, and the bound holds. Read as "no layer", the graph
+            // went as wide as the context on a card the model filled, and the context could not be made.
+            Placement whole_all = whole;
+            whole_all.n_gpu_layers = -1;
+            const Plan bounded_all = plan_run(big_ctx, card, model, whole_all, PlanRequest{});
+            check((uint32_t) bounded_all.config.graph_width() == pol.ubatch_max_device &&
+                      validate(bounded_all.config).ok,
+                  "width: every layer as llama.cpp's -1 is a device computing the graph, bounded the same",
+                  std::to_string(bounded_all.config.graph_width()));
+
+            // Every layer on the card and one layer's experts behind the cache at the probed width: the
+            // fitter is asked at halves of it, widest first, and the first width that places the whole
+            // model is taken, whatever the device's share of its memory says. Fits read from the facts,
+            // as a re-fit is (AutoPlan::placement_at_width), so no fitter runs here.
+            {
+                RunConfig ctx16 = big_ctx;
+                const uint32_t probed = pol.ubatch_max_device;
+                Placement behind = whole.at_width(probed);
+                behind.device_compute_per_token = 1 * KiB; // its share is the probed width itself
+                behind.device_compute_bytes = (uint64_t) probed * behind.device_compute_per_token;
+                behind.host_expert_layers = {model.n_layer - 1};
+                AutoPlan facts;
+                facts.hw = card;
+                facts.model = model;
+                facts.placement = behind;
+                auto key_at = [&](uint32_t w) {
+                    AutoPlan::FitKey k;
+                    k.width = w;
+                    k.n_ctx = (uint32_t) ctx16.n_ctx;
+                    k.type_k = ctx16.cache_type_k;
+                    k.type_v = ctx16.cache_type_v;
+                    return k;
+                };
+                Placement fits_whole = behind.at_width(probed / 2);
+                fits_whole.host_expert_layers.clear();
+                facts.placement_at_width[key_at(probed / 2)] = fits_whole;
+                const Plan found = replan(facts, ctx16, PlanRequest{}, model.knobs);
+                const Decision * dw = find(found, "ubatch");
+                check(found.config.n_ubatch == (int) (probed / 2) && dw &&
+                          dw->brief.find("whole model fits") != std::string::npos,
+                      "width: a fit one halving under the probed width is found, past the device's share",
+                      dw ? std::to_string(found.config.n_ubatch) + ": " + dw->brief : "no decision");
+                // A halving that brings no layer's experts onto the device ends the search: the wide
+                // graph stands, and no narrower width is asked of the fitter.
+                AutoPlan stuck = facts;
+                stuck.placement_at_width.clear();
+                stuck.placement_at_width[key_at(probed / 2)] = behind.at_width(probed / 2);
+                const Plan kept_wide = replan(stuck, ctx16, PlanRequest{}, model.knobs);
+                check(kept_wide.config.graph_width() == (int) probed && stuck.placement_at_width.size() == 1,
+                      "width: a halving no closer to fitting ends the search at one fit",
+                      std::to_string(kept_wide.config.graph_width()) + ", " +
+                          std::to_string(stuck.placement_at_width.size()) + " fits");
+            }
+            // A graph already inside the bound is left as wide as the context.
+            RunConfig small_ctx = big_ctx;
+            small_ctx.n_ctx = 4096;
+            Placement whole_small = whole.at_width(4096);
+            const Plan inside = plan_run(small_ctx, card, model, whole_small, PlanRequest{});
+            check(inside.config.n_ubatch == 0, "width: a graph inside the device bound stays as wide as the context",
+                  std::to_string(inside.config.n_ubatch));
+
+            // Two cards of different sizes: inside the share of both together, past it on the smaller
+            // one, which reserves its own half of the buffers. Each card is held to its own memory.
+            HardwareProfile two = card;
+            two.devices[0].name = "big";
+            two.devices[0].memory_total = 24 * GiB;
+            ComputeDevice small = two.devices[0];
+            small.name = "small";
+            small.memory_total = 8 * GiB;
+            small.memory_free = 8 * GiB;
+            two.devices.push_back(small);
+            Placement split = short_card;
+            const uint64_t per_card = (uint64_t) (1.5 * (double) GiB); // 3 GiB together, 32 GiB of cards
+            split.device_compute_bytes = 2 * per_card;
+            split.device_compute_per_token = split.device_compute_bytes / 16384;
+            split.projected_devices = {"big", "small"};
+            split.projected_compute_bytes = {per_card, per_card};
+            check((double) split.device_compute_bytes <= (double) (32 * GiB) * pol.compute_share_max,
+                  "width, two cards: the fixture is inside the share of both cards together");
+            const Plan by_card = plan_run(big_ctx, two, model, split, PlanRequest{});
+            const uint64_t wc = (uint64_t) by_card.config.graph_width();
+            check(wc > 0 && wc < 16384 &&
+                      (double) by_card.placement.device_compute_of("small") <=
+                          (double) (8 * GiB) * pol.compute_share_max,
+                  "width, two cards: the smaller card's buffers are held to its own share",
+                  std::to_string(wc) + ", small card " +
+                      std::to_string(by_card.placement.device_compute_of("small") / MiB) + " MiB");
+
+            // The width probe_and_plan asks the fitter about: each card held to its share, the
+            // projected width where it already is, 0 where nothing was measured.
+            const uint32_t share_w = device_share_width(short_card, card, pol);
+            check(share_w > 0 && share_w < 16384 &&
+                      (double) short_card.at_width(share_w).device_compute_bytes <=
+                          (double) (12 * GiB) * pol.compute_share_max,
+                  "device share width: the widest whose buffers fit the card's share", std::to_string(share_w));
+            const uint32_t share_img = device_share_width(short_card, card, pol, 6000);
+            check(share_img >= 6000 && share_img >= share_w,
+                  "device share width: never narrower than the most tokens one image takes", std::to_string(share_img));
+            Placement roomy = short_card;
+            roomy.device_compute_per_token = 1 * KiB;
+            roomy.device_compute_bytes = 16384ull * KiB;
+            check(device_share_width(roomy, card, pol) == 16384,
+                  "device share width: buffers already inside the share keep the projected width");
+            Placement no_slope = short_card;
+            no_slope.device_compute_per_token = 0;
+            check(device_share_width(no_slope, card, pol) == 0, "device share width: an unmeasured slope says nothing");
+            check(device_share_width(split, two, pol) == (uint32_t) by_card.config.graph_width(),
+                  "device share width: the same per-card answer the width rule acts on");
+
+            // The fitter leaves its count at "every layer" where the model fits the devices whole, and
+            // the plan says so rather than "0 layers".
+            Placement every = whole;
+            every.n_gpu_layers = -1;
+            const Plan all_on = plan_run(base_cfg(), card, model, every, PlanRequest{});
+            const Decision * pd = find(all_on, "placement");
+            check(pd && pd->value == "every layer on devices", "placement: the fitter's default reads as every layer",
+                  pd ? pd->value : "none");
+
+            // Every layer on the card, experts on the host, buffers past the card's share: the width is
+            // decided across loads (MeasuredKnobs::width_narrow), by the requests this machine serves.
+            {
+                HardwareProfile no_tier = card;
+                no_tier.devices[0].identity_ok = Tri::No;     // no device cache: the width alone is weighed
+                no_tier.devices[0].upload_gibs = 24.0;        // what a prompt's pass gathers at
+                no_tier.devices[0].wide_matmul_gibs = 1500.0; // a prompt-wide layer on the card
+                no_tier.host_expert_gibs = 20.0;              // the host and the card on this model's own layer
+                no_tier.host_dense_gibs = 30.0;
+                no_tier.devices[0].expert_gibs = 400.0;
+                no_tier.devices[0].dense_gibs = 400.0;
+                Placement roomy_layers = all_layers;
+                for (uint32_t il = 0; il < 8; ++il)
+                    roomy_layers.host_expert_layers.push_back(il);
+                const uint32_t narrow = device_share_width(roomy_layers, no_tier, pol);
+                const auto plan_with = [&](const MeasuredKnobs & k) {
+                    ModelProfile mm = model;
+                    mm.knobs = k;
+                    return plan_run(big_ctx, no_tier, mm, roomy_layers, PlanRequest{}, unbounded);
+                };
+                // Nothing measured, no request served: both widths are priced from the probed rates
+                // over the default mix, the load serves the one priced faster and times it as it serves.
+                const Plan first = plan_with(MeasuredKnobs{});
+                const Decision * dw = find(first, "ubatch");
+                const bool first_narrow = first.config.n_ubatch == (int) narrow;
+                check(narrow > 0 && narrow < 16384 && first.config.trial.width_narrow == (int) narrow &&
+                          first.config.trial.width_side == (first_narrow ? 0 : 1) && dw &&
+                          dw->source == Source::Derived && dw->reason.find("the default mix") != std::string::npos &&
+                          dw->reason.find("priced from the probed rates") != std::string::npos,
+                      "width, nothing measured: priced on the default mix, the side served is the side timed",
+                      dw ? dw->reason : "none");
+                check(validate(first.config).ok, "width: a valid config", validate(first.config).error);
+                // The mix decides between the same prices: a machine that only decodes takes the narrow
+                // graph (more of the experts on the card, nothing to gather twice), and one whose prompts
+                // are long and answers short takes whichever its passes cost less on.
+                MeasuredKnobs chat_mix;
+                chat_mix.mix_requests = 4000; // enough of one kind to be this machine's mix
+                chat_mix.mix_gen_tokens = 500;
+                const Plan chat_priced = plan_with(chat_mix);
+                dw = find(chat_priced, "ubatch");
+                check(chat_priced.config.n_ubatch == (int) narrow && chat_priced.config.trial.width_side == 0 && dw &&
+                          dw->reason.find("requests served here") != std::string::npos,
+                      "width, a machine that only decodes: the narrow graph, priced", dw ? dw->reason : "none");
+                // Both decodes measured on served loads, no long prompt: the measurements decide, and the
+                // load times nothing more (it still records its requests against the narrow width).
+                MeasuredKnobs k = chat_mix;
+                k.width_narrow = (int) narrow;
+                k.wide_decode_tps = 14.2;
+                k.narrow_decode_tps = 19.4;
+                const Plan chat = plan_with(k);
+                dw = find(chat, "ubatch");
+                check(chat.config.n_ubatch == (int) narrow && chat.config.trial.width_side == -1 &&
+                          chat.config.trial.width_narrow == (int) narrow && dw && dw->source == Source::Measured,
+                      "width, both decodes measured, short prompts only: the narrow graph", dw ? dw->reason : "none");
+                // The same decodes on a machine that prefills 9500 tokens a request, both prefills
+                // measured: 500 tokens decoded and 9500 prefilled weigh for the wide graph.
+                k.mix_wide_prompt_tokens = 9500;
+                k.wide_prefill_tps = 610;
+                k.narrow_prefill_tps = 104;
+                const Plan agent = plan_with(k);
+                dw = find(agent, "ubatch");
+                check(agent.config.graph_width() == 16384 && agent.config.trial.width_side == -1 && dw &&
+                          dw->source == Source::Measured,
+                      "width, long prompts measured slower on the narrow graph: the full width wins",
+                      dw ? dw->reason : "none");
+                // One side measured: both prices are scaled by how far that side's ran from it, so the
+                // ratio between the widths stays the price's and no load is opened to time the other.
+                MeasuredKnobs one = chat_mix;
+                one.width_narrow = (int) narrow;
+                one.narrow_decode_tps = 19.4;
+                const Plan scaled = plan_with(one);
+                dw = find(scaled, "ubatch");
+                check(scaled.config.n_ubatch == chat_priced.config.n_ubatch && scaled.config.trial.width_side == -1 &&
+                          dw && dw->reason.find("corrected by the width measured") != std::string::npos,
+                      "width, one side measured: the price corrected, the same side served, nothing timed again",
+                      dw ? dw->reason : "none");
+                // A handful of requests does not swing the width: they are weighed with the default mix,
+                // so the plan stays where it was with nothing served. Measured on two 16 GB cards: four
+                // requests read alone as 1181 prompt tokens, the next load's three short ones as 34, and
+                // the graph went narrow and lost 41% of a 4.6k-token prompt's prefill.
+                MeasuredKnobs few;
+                few.mix_requests = 3;
+                few.mix_gen_tokens = 171;
+                few.mix_wide_prompt_tokens = 34;
+                const Plan few_plan = plan_with(few);
+                dw = find(few_plan, "ubatch");
+                check(few_plan.config.n_ubatch == first.config.n_ubatch && dw &&
+                          dw->reason.find("3 requests served here, weighed with the default mix") != std::string::npos,
+                      "width, three short requests recorded: weighed with the default mix, the width holds",
+                      dw ? dw->reason : "none");
+                // One long prompt among short ones is passes at the narrow width, which their mean hides:
+                // 1181 tokens a request fit one pass, a 4.6k-token prompt every fourth request does not.
+                // With experts left off the card at both widths, the same mean prompt is priced a pass's
+                // gather dearer at the narrow width where a quarter of the prompts are long, and the same
+                // at the full width, which they fit.
+                HardwareProfile slow_gather = no_tier;
+                slow_gather.devices[0].upload_gibs = 0.5;
+                Placement most_off = roomy_layers; // more experts off the card than the narrow graph frees
+                for (uint32_t il = 8; il < 32; ++il)
+                    most_off.host_expert_layers.push_back(il);
+                // The seconds the plan's line gives each width's prefill: "... prefills that prompt in W s,
+                // at N tokens at R tok/s and X s (...".
+                const auto prefill_priced = [&](double long_tokens, double & wide_s, double & narrow_s) {
+                    ModelProfile mm = model;
+                    mm.knobs.mix_requests = 4000;
+                    mm.knobs.mix_gen_tokens = 190;
+                    mm.knobs.mix_wide_prompt_tokens = 1181;
+                    mm.knobs.width_narrow = (int) narrow;
+                    mm.knobs.usage_requests = 4000;
+                    mm.knobs.usage_gen_tokens = 190;
+                    mm.knobs.usage_long_prompt_tokens = long_tokens;
+                    const Plan wp = plan_run(big_ctx, slow_gather, mm, most_off, PlanRequest{}, unbounded);
+                    const Decision * x = find(wp, "ubatch");
+                    wide_s = narrow_s = 0.0;
+                    if (!x) return;
+                    const size_t w = x->reason.find("prefills that prompt in "), n = x->reason.find(" tok/s and ", w);
+                    if (w == std::string::npos || n == std::string::npos) return;
+                    wide_s = std::atof(x->reason.c_str() + w + 24);
+                    narrow_s = std::atof(x->reason.c_str() + n + 11);
+                };
+                double wide_none = 0, narrow_none = 0, wide_long = 0, narrow_long = 0;
+                prefill_priced(0.0, wide_none, narrow_none);
+                prefill_priced(1155.0, wide_long, narrow_long);
+                check(narrow_none > 0.0 && narrow_long > narrow_none * 1.1 && wide_long == wide_none,
+                      "width, the same mean prompt: long prompts are more passes at the narrow width only",
+                      std::to_string(narrow_none) + " " + std::to_string(narrow_long) + " " +
+                          std::to_string(wide_long));
+                // A narrow width other than the one measured: the measurements do not answer it.
+                MeasuredKnobs stale = k;
+                stale.width_narrow = (int) narrow * 2;
+                const Plan stale_plan = plan_with(stale);
+                dw = find(stale_plan, "ubatch");
+                check(dw && dw->source == Source::Derived, "width, another narrow width: priced afresh");
+                // A pinned width is the caller's.
+                PlanRequest pin_ub;
+                pin_ub.pinned.push_back("ubatch");
+                ModelProfile mm = model;
+                const Plan pinned_ub = plan_run(big_ctx, no_tier, mm, roomy_layers, pin_ub, unbounded);
+                check(pinned_ub.config.trial.width_side == -1 && pinned_ub.config.trial.width_narrow == 0,
+                      "width, pinned: nothing weighed, nothing timed");
+
+                // The margin guards the width in force: the full width until a load ran the narrow one
+                // as decided, then that one. The same rates, weighed again, do not swing it.
+                MeasuredKnobs cal = chat_mix;
+                cal.width_narrow = (int) narrow;
+                cal.wide_decode_tps = 14.2;
+                cal.narrow_decode_tps = 14.5; // inside the margin
+                check(plan_with(cal).config.graph_width() == 16384 && plan_with(cal).config.trial.width_side == -1,
+                      "width, the narrow graph inside the margin: the full width holds");
+                MeasuredKnobs held = cal;
+                held.width_held = 0;
+                held.narrow_decode_tps = 14.2;
+                held.wide_decode_tps = 15.0; // the full width 6% ahead
+                const Plan held_plan = plan_with(held);
+                dw = find(held_plan, "ubatch");
+                check(held_plan.config.n_ubatch == (int) narrow && dw &&
+                          dw->reason.find("in force") != std::string::npos,
+                      "width, the narrow graph in force, the full width inside the margin: it holds",
+                      dw ? dw->reason : "none");
+                held.wide_decode_tps = 16.0; // 13% ahead
+                check(plan_with(held).config.graph_width() == 16384,
+                      "width, the narrow graph in force, the full width past the margin: it takes over");
+                // A width that failed to open here as often as a plan lets it loses; once is the
+                // machine's moment, and the price still decides.
+                MeasuredKnobs fails_narrow = chat_mix;
+                fails_narrow.width_narrow = (int) narrow;
+                fails_narrow.narrow_unviable = 1;
+                check(plan_with(fails_narrow).config.n_ubatch == (int) narrow,
+                      "width, the narrow graph failed to open once: still the plan's, on its price");
+                fails_narrow.narrow_unviable = MeasuredKnobs::unviable_max;
+                const Plan wide_kept = plan_with(fails_narrow);
+                dw = find(wide_kept, "ubatch");
+                check(wide_kept.config.graph_width() == 16384 && wide_kept.config.trial.width_side == -1 && dw &&
+                          dw->source == Source::Measured && dw->reason.find("failed") != std::string::npos,
+                      "width, the narrow graph could not be opened: the full width stands", dw ? dw->reason : "none");
+                MeasuredKnobs fails_wide = fails_narrow;
+                fails_wide.narrow_unviable = 0;
+                fails_wide.wide_unviable = MeasuredKnobs::unviable_max;
+                const Plan narrow_kept = plan_with(fails_wide);
+                check(narrow_kept.config.n_ubatch == (int) narrow && narrow_kept.config.trial.width_side == -1,
+                      "width, the full width could not be opened: the narrow graph stands");
+                // Another narrow width: what failed against the old one answers nothing.
+                fails_narrow.width_narrow = (int) narrow * 2;
+                check(plan_with(fails_narrow).config.n_ubatch == (int) narrow,
+                      "width, a failure at another narrow width: priced afresh");
+            }
+
+            // A slope the device side did not measure decides nothing there.
+            Placement blind_dev = short_card;
+            blind_dev.device_compute_per_token = 0;
+            const Plan unmeasured = plan_run(big_ctx, card, model, blind_dev, PlanRequest{}, unbounded);
+            check(unmeasured.config.graph_width() == 16384,
+                  "width: an unmeasured device slope leaves the graph at the probed width",
+                  std::to_string(unmeasured.config.graph_width()));
+        }
+
         // at_width is a line through the projected point, clamped at zero.
         const Placement base_pl = wide(4096, per_token);
         check(base_pl.at_width(2048).raw_host_compute_bytes == 2048ull * per_token &&
                   base_pl.at_width(8192).raw_host_compute_bytes == 8192ull * per_token &&
                   base_pl.at_width(4096).raw_host_compute_bytes == base_pl.raw_host_compute_bytes,
               "width: buffers move along the measured slope, both ways");
+
+        // A long context the probe measured at the default width (RunConfig::graph_width, capped at
+        // ubatch_auto_max), at that context: the plan starts from the whole context, priced by extending
+        // the probe's slope, and narrows from there.
+        {
+            RunConfig long_ctx = base_cfg();
+            long_ctx.n_ctx = 32768;
+            const uint32_t probe_w = (uint32_t) long_ctx.graph_width();
+            check(probe_w == (uint32_t) RunConfig::ubatch_auto_max && probe_w < 32768,
+                  "width, long context: the probe measures at the default width, under the context");
+            auto probed_at_default = [&](uint64_t pt) {
+                Placement pl = wide(probe_w, pt);
+                pl.n_ctx = 32768;
+                return pl;
+            };
+            // Roomy: the whole context's buffers are half the share. One pass, wider than the probe.
+            const uint64_t roomy_pt = cap / 32768 / 2;
+            const Plan roomy = plan_run(long_ctx, hw, model, probed_at_default(roomy_pt), PlanRequest{});
+            const Decision * dr = find(roomy, "ubatch");
+            check(roomy.config.graph_width() == 32768 && roomy.config.n_ubatch == 32768 && dr &&
+                      dr->source == Source::Derived && dr->reason.find("priced by extending") != std::string::npos &&
+                      validate(roomy.config).ok,
+                  "width, long context: a roomy host gets a graph as wide as the context, wider than the probe",
+                  dr ? std::to_string(roomy.config.n_ubatch) + ": " + dr->reason : "no decision");
+            check(roomy.placement.compute_width == 32768 && roomy.placement.raw_host_compute_bytes == 32768 * roomy_pt,
+                  "width, long context: the wider graph's extended buffers are the ones charged",
+                  std::to_string(roomy.placement.raw_host_compute_bytes / MiB));
+            // As on the host of #566: the whole context's buffers are past the share, the probe's width is
+            // inside it. The plan narrows to the widest that fits, which is the default width here.
+            const uint64_t tight_pt = cap * 3 / 4 / probe_w;
+            const Plan tight = plan_run(long_ctx, hw, model, probed_at_default(tight_pt), PlanRequest{});
+            const Decision * dt = find(tight, "ubatch");
+            check(tight.config.graph_width() == (int) probe_w && dt && dt->source == Source::Policy &&
+                      dt->reason.find("priced by extending") != std::string::npos,
+                  "width, long context: whole-context buffers past the share narrow the graph",
+                  dt ? std::to_string(tight.config.graph_width()) + ": " + dt->reason : "no decision");
+            // Tighter still: narrower than the probe, set explicitly.
+            const uint64_t tighter_pt = cap * 3 / 4 / (probe_w / 2);
+            const Plan tighter = plan_run(long_ctx, hw, model, probed_at_default(tighter_pt), PlanRequest{});
+            check(tighter.config.n_ubatch == (int) probe_w / 2,
+                  "width, long context: buffers past the share at the probe's width narrow below it",
+                  std::to_string(tighter.config.n_ubatch));
+            // A device part of the buffers whose slope was not measured: a wider graph is not priced, and
+            // the plan stays at the probe's width even where the host's part would take the whole context.
+            Placement half_blind = probed_at_default(roomy_pt);
+            half_blind.device_compute_bytes = 64 * MiB;
+            half_blind.device_compute_per_token = 0;
+            const Plan stays = plan_run(long_ctx, hw, model, half_blind, PlanRequest{});
+            const Decision * dh = find(stays, "ubatch");
+            check(stays.config.graph_width() == (int) probe_w && dh &&
+                      dh->reason.find("not priced") != std::string::npos,
+                  "width, long context: an unmeasured slope stays at the probe's width",
+                  dh ? std::to_string(stays.config.graph_width()) + ": " + dh->reason : "no decision");
+            // A width the config set but did not pin is the starting width, not the context.
+            RunConfig set_w = long_ctx;
+            set_w.n_ubatch = 4096;
+            const Plan from_set = plan_run(set_w, hw, model, wide(4096, roomy_pt), PlanRequest{});
+            check(from_set.config.graph_width() == 4096, "width, long context: a set width is not widened",
+                  std::to_string(from_set.config.graph_width()));
+
+            // A device that computes the graph: the whole context is the candidate, and the evidence
+            // bound (#533) is what stops it, at no more than the width the probe placed the layers at.
+            check(pol.ubatch_max_device <= (uint32_t) RunConfig::ubatch_auto_max,
+                  "width: the device bound is no wider than the default width the probe measures at");
+            HardwareProfile big_card = desktop();
+            big_card.devices[0].memory_total = 32 * GiB;
+            big_card.devices[0].memory_free = 32 * GiB;
+            Placement on_card = probed_at_default(4 * KiB);
+            on_card.fitted = true;
+            on_card.n_gpu_layers = (int32_t) model.n_layer + 1;
+            on_card.device_compute_per_token = 4 * KiB;
+            on_card.device_compute_bytes = (uint64_t) probe_w * 4 * KiB;
+            on_card.device_bytes = 20 * GiB;
+            const Plan card_plan = plan_run(long_ctx, big_card, model, on_card, PlanRequest{});
+            const Decision * dd = find(card_plan, "ubatch");
+            check((uint32_t) card_plan.config.graph_width() == pol.ubatch_max_device && dd &&
+                      dd->reason.find("#533") != std::string::npos && dd->reason.find("32768") != std::string::npos,
+                  "width, long context: a device's graph is bounded at ubatch_max_device, not at the context",
+                  dd ? std::to_string(card_plan.config.graph_width()) + ": " + dd->reason : "no decision");
+            // An image cap past the device's bound does not lift it: every prompt would pass wider on the
+            // device. The bound wins, and the plan says such an image is refused.
+            {
+                RunConfig big_images = long_ctx;
+                big_images.mmproj = "projector.gguf";
+                big_images.image_max_tokens = 12000;
+                check(big_images.graph_width() == 12000, "width, image past the bound: the default follows the cap");
+                Placement img_card = on_card;
+                img_card.compute_width = 12000;
+                img_card.raw_host_compute_bytes = 12000ull * 4 * KiB;
+                img_card.device_compute_bytes = 12000ull * 4 * KiB;
+                const Plan held = plan_run(big_images, big_card, model, img_card, PlanRequest{});
+                const Decision * dh2 = find(held, "ubatch");
+                check((uint32_t) held.config.graph_width() == pol.ubatch_max_device && dh2 &&
+                          dh2->reason.find("#533") != std::string::npos &&
+                          dh2->reason.find("image-max-tokens") != std::string::npos && validate(held.config).ok,
+                      "width, image past the bound: a device's bound wins, and the plan says images past it are "
+                      "refused",
+                      dh2 ? std::to_string(held.config.graph_width()) + ": " + dh2->reason : "no decision");
+            }
+
+            // An image whose tokens go in one pass: the narrowing stops at the most one image takes.
+            RunConfig with_images = long_ctx;
+            with_images.mmproj = "projector.gguf";
+            with_images.image_max_tokens = 1000;
+            const Plan img_floor = plan_run(with_images, hw, model, probed_at_default(64 * MiB), PlanRequest{});
+            const Decision * di = find(img_floor, "ubatch");
+            check(img_floor.config.graph_width() >= 1000 && img_floor.config.graph_width() < 2000 && di &&
+                      di->reason.find("an image takes") != std::string::npos,
+                  "width: never narrower than the most tokens one image takes, and says why",
+                  di ? std::to_string(img_floor.config.graph_width()) + ": " + di->reason : "no decision");
+            const Plan no_img = plan_run(long_ctx, hw, model, probed_at_default(64 * MiB), PlanRequest{});
+            check((uint32_t) no_img.config.graph_width() == pol.ubatch_min,
+                  "width: without a projector the floor is ubatch_min", std::to_string(no_img.config.graph_width()));
+        }
     }
 
     // ── composed over a first stage: the fitter placed half the layers' experts on a device ─
@@ -1086,6 +1814,32 @@ int main() {
             const Allocation a = allocate(measured_machine(), model, in, pol);
             check(a.cache_bytes == 0, "a residual under the token cycle leaves the cache off",
                   std::to_string(a.cache_bytes >> 20) + " MiB");
+        }
+
+        // The dense policy copies every dense tensor, so a group read whole every token that the
+        // budget had no room for is held by the run all the same, and priced as held. Priced as
+        // mapped, at its refault, it made a phone's plan predict 10-44 s a token for a model that
+        // decoded at 0.5 (Gemma 4 26B-A4B, its 16384 context taking the budget).
+        {
+            AllocationInputs in = inputs(3 * GiB);
+            in.fixed_bytes = 3 * GiB - 64 * MiB; // the context leaves no room for any dense group
+            uint64_t read_whole = 0;
+            for (WeightGroup g : {WeightGroup::Attention, WeightGroup::DenseFfn, WeightGroup::Other})
+                read_whole += model.group(g).bytes;
+            in.reserved_bytes = read_whole;
+            const Allocation a = allocate(measured_machine(), model, in, pol);
+            const GroupPlacement & att = a.at(WeightGroup::Attention);
+            check(att.lane == Lane::Resident && att.resident_bytes == model.group(WeightGroup::Attention).bytes,
+                  "a read-whole group the dense policy holds is held in the plan too");
+            check(att.seconds_per_token > 0.0 && att.seconds_per_token < att.seconds_worst_case,
+                  "and priced at its compute, not at its refault");
+            check(a.at(WeightGroup::Embedding).resident_bytes == 0,
+                  "a row-gathered table stays where the ranking put it: the run leaves it mapped too");
+            AllocationInputs none = in;
+            none.reserved_bytes = 0;
+            const Allocation mapped = allocate(measured_machine(), model, none, pol);
+            check(mapped.at(WeightGroup::Attention).lane == Lane::Mmap,
+                  "with nothing copied, a group with no room is still priced as mapped");
         }
 
         // THE refutation. A device three times the host's bandwidth is still not used while the
@@ -1266,11 +2020,16 @@ int main() {
         PlanRequest orq;
         orq.pinned = {"cache-mb"};
         const Plan o = plan_run(own, unified(), model, orq);
-        const LedgerRow * oc = ledger_row(o, "expert cache");
+        const LedgerRow * oc = ledger_row(o, LedgerKind::ExpertCache);
         check(!o.config.moe.cache_pin_fit && o.config.moe.cache_mb == 12000,
               "ledger: a caller's cache budget is not fitted");
         check(oc && oc->bytes == 12000 * MiB && o.allocation.ledger.held > o.allocation.ledger.holdable_cap,
               "ledger: a caller's cache is the row, even over the ceiling");
+        int n_cache_rows = 0;
+        for (const LedgerRow & r : o.allocation.ledger.rows)
+            if (r.kind == LedgerKind::ExpertCache) ++n_cache_rows;
+        check(n_cache_rows == 1 && oc->name == "expert cache",
+              "ledger: a caller's cache replaces the planned row, matched by kind, under its display name");
 
         // Two stores that are not one pool: no reclaim-exempt allocation, a generous lock in place.
         // The ceiling reported is the one the locked rows were charged to.
@@ -1286,9 +2045,13 @@ int main() {
         // A machine that offers a reclaim-exempt allocation and no lock in place: the dense set is
         // pinned and the cache is bounded only by what can be held, as it always was there.
         const Plan ph = plan_run(base_cfg(), phone(), model, PlanRequest{});
-        const LedgerRow * pc = ledger_row(ph, "expert cache");
-        const LedgerRow * pd = ledger_row(ph, "dense");
+        const LedgerRow * pc = ledger_row(ph, LedgerKind::ExpertCache);
+        const LedgerRow * pd = ledger_row(ph, LedgerKind::Dense);
         check(pd && pd->locked && pc && !pc->locked, "ledger: two stores, and only the dense set is in the locked one");
+        bool named = !ph.allocation.ledger.rows.empty();
+        for (const LedgerRow & r : ph.allocation.ledger.rows)
+            named = named && r.name == ledger_kind_name(r.kind);
+        check(named, "ledger: every row's display name is its kind's one spelling");
         check(!ph.config.moe.cache_pin, "ledger: and no lock is asked for the cache there");
         check(ph.cache_budget_bytes > 1 * GiB, "ledger: a cache that cannot be locked is not sized to the lock",
               mibs_of(ph.cache_budget_bytes));
@@ -1316,7 +2079,7 @@ int main() {
         check(unknown_plan.cache_budget_bytes == zero_plan.cache_budget_bytes &&
                   unknown_plan.allocation.ledger.holdable_cap == zero_plan.allocation.ledger.holdable_cap,
               "ledger: an unknown lock grants no process capacity and removes no margin");
-        const LedgerRow * unknown_cache = ledger_row(unknown_plan, "expert cache");
+        const LedgerRow * unknown_cache = ledger_row(unknown_plan, LedgerKind::ExpertCache);
         check(unknown_cache && !unknown_cache->locked && unknown_plan.allocation.cache_locked_bytes == 0 &&
                   !unknown_plan.allocation.ledger.lockable_cap_known,
               "ledger: the unknown runtime grant is not reported as a locked cache");
@@ -1355,6 +2118,27 @@ int main() {
         no_fit_request.pinned = {"cache-pin-fit"};
         check(!plan_run(no_fit, unknown, model, no_fit_request).config.moe.cache_pin_fit,
               "ledger: an explicit no-fit is not replaced by the unknown-ceiling policy");
+        // A machine that can take memory back by dropping it gets an offered cache, never a locked one:
+        // nothing is charged to the lock, and a zero lock does not shape the cache. The kernel takes
+        // an offered page back by dropping it, a reclaim that writes nothing, so the margin - room
+        // for a reclaim that does write - is not taken out of it: the cache is larger than the same
+        // cache as ordinary memory, by the margin on what it no longer counts, and what the run
+        // holds still closes under the ceiling.
+        HardwareProfile offers = zero_bound;
+        offers.discardable_memory = true;
+        const Plan offered_plan = plan_run(base_cfg(), offers, model, PlanRequest{});
+        const Plan no_pin_known = plan_run(no_pin, zero_bound, model, no_pin_request);
+        check(offered_plan.allocation.cache_locked_bytes == 0 && !offered_plan.allocation.cache_lock_unverified &&
+                  !offered_plan.config.moe.cache_pin_fit,
+              "ledger: a discardable cache is never locked");
+        check(offered_plan.config.moe.cache_mb > no_pin_known.config.moe.cache_mb,
+              "ledger: an offered cache is outside the margin an ordinary one pays",
+              std::to_string(offered_plan.config.moe.cache_mb) + " MiB offered against " +
+                  std::to_string(no_pin_known.config.moe.cache_mb) + " MiB ordinary");
+        check(offered_plan.allocation.ledger.held <= offered_plan.allocation.ledger.holdable_cap,
+              "ledger: an offered cache still closes under what can be held",
+              mibs_of(offered_plan.allocation.ledger.held) + " of " +
+                  mibs_of(offered_plan.allocation.ledger.holdable_cap));
         RunConfig own_unknown = base_cfg();
         own_unknown.moe.cache_mb = 1500;
         const Plan caller_unknown = plan_run(own_unknown, unknown, model, orq);
@@ -1389,10 +2173,10 @@ int main() {
         ar.pinned = {"prefill-device"};
         const Plan off = plan_run(base_cfg(), unified(), mm, PlanRequest{});
         const Plan on = plan_run(armed, unified(), mm, ar);
-        const LedgerRow * dev = ledger_row(on, "device");
+        const LedgerRow * dev = ledger_row(on, LedgerKind::Device);
         check(dev && dev->locked && dev->bytes == 768 * MiB,
               "ledger: an armed device is charged two expert layers, locked", dev ? mibs_of(dev->bytes) : "no row");
-        check(ledger_row(off, "device") == nullptr, "ledger: a device nobody armed is not a line");
+        check(ledger_row(off, LedgerKind::Device) == nullptr, "ledger: a device nobody armed is not a line");
         check(off.cache_budget_bytes - on.cache_budget_bytes == 768 * MiB,
               "ledger: the cache gives up what the device takes",
               mibs_of(off.cache_budget_bytes) + " against " + mibs_of(on.cache_budget_bytes));
@@ -1404,7 +2188,7 @@ int main() {
         pl.raw_host_context_bytes = 500 * MiB;
         pl.raw_host_compute_bytes = 100 * MiB;
         const Plan fx = plan_run(base_cfg(), phone(), model, pl, PlanRequest{});
-        const LedgerRow * fr_row = ledger_row(fx, "context and compute");
+        const LedgerRow * fr_row = ledger_row(fx, LedgerKind::ContextCompute);
         check(fr_row && fr_row->bytes == 600 * MiB,
               "ledger: context and compute are charged without a fitted placement");
         check(ph.cache_budget_bytes - fx.cache_budget_bytes == 600 * MiB, "ledger: and the cache is sized after them",
@@ -1418,12 +2202,12 @@ int main() {
         chat.chatml = true;
         chat.ctx_checkpoints = 4;
         const Plan cx = plan_run(chat, phone(), model, ck, PlanRequest{});
-        const LedgerRow * ck_row = ledger_row(cx, "context checkpoints");
+        const LedgerRow * ck_row = ledger_row(cx, LedgerKind::Checkpoints);
         check(ck_row && ck_row->bytes == 200 * MiB, "ledger: a chat run charges its checkpoints",
               ck_row ? mibs_of(ck_row->bytes) : "no row");
         check(fx.cache_budget_bytes - cx.cache_budget_bytes == 200 * MiB, "ledger: and the cache gives them up",
               mibs_of(fx.cache_budget_bytes) + " against " + mibs_of(cx.cache_budget_bytes));
-        check(ledger_row(plan_run(base_cfg(), phone(), model, ck, PlanRequest{}), "context checkpoints") == nullptr,
+        check(ledger_row(plan_run(base_cfg(), phone(), model, ck, PlanRequest{}), LedgerKind::Checkpoints) == nullptr,
               "ledger: a run that is not a chat keeps no checkpoints");
     }
 
@@ -1459,12 +2243,88 @@ int main() {
               "prefill: a device nobody measured at prefill width is not armed, and the plan says unprobed");
 
         const Plan on = plan_run(base_cfg(), machine(1500.0, Tri::Yes), mm, PlanRequest{});
-        const LedgerRow * row = ledger_row(on, "device");
-        const LedgerRow * turn = ledger_row(on, "device slots");
+        const LedgerRow * row = ledger_row(on, LedgerKind::Device);
+        const LedgerRow * turn = ledger_row(on, LedgerKind::DeviceSlots);
         const uint64_t stays = 2 * 64 * MiB;    // the layer's other weights, held for the session
         const uint64_t in_turn = 2 * 384 * MiB; // the expert slots, held only during a prefill
         check(on.config.prefill.device == "accel",
               "prefill: a device that wins wide and agrees is armed by its own name");
+        // The prefill device computes every pass as wide as the graph: a long context that the memory
+        // takes whole is held to the device's bound (#533) once the device is armed, and not otherwise.
+        {
+            RunConfig long_cfg = base_cfg();
+            long_cfg.n_ctx = 32768;
+            Placement probed;
+            probed.n_ctx = 32768;
+            probed.compute_width = 8192;
+            probed.host_compute_per_token = 1 * KiB;
+            probed.raw_host_compute_bytes = 8192ull * KiB;
+            const uint32_t dev_bound = PlannerPolicy::defaults().ubatch_max_device;
+            const Plan pre =
+                plan_run(long_cfg, machine(1500.0, Tri::Yes), mm, probed, PlanRequest{}, PlannerPolicy::defaults());
+            const Decision * dp = find(pre, "ubatch");
+            check(pre.config.prefill.device == "accel" && (uint32_t) pre.config.graph_width() == dev_bound && dp &&
+                      dp->reason.find("#533") != std::string::npos && validate(pre.config).ok,
+                  "width, prefill device armed by the plan: the graph is held to the device's bound",
+                  std::to_string(pre.config.graph_width()) + (dp ? ": " + dp->reason : std::string()));
+            check(pre.placement.compute_width == dev_bound,
+                  "width, prefill device armed by the plan: the bounded width's buffers are the ones charged",
+                  std::to_string(pre.placement.compute_width));
+            const Plan host_only =
+                plan_run(long_cfg, machine(150.0, Tri::Yes), mm, probed, PlanRequest{}, PlannerPolicy::defaults());
+            check(!host_only.config.prefill.enabled() && host_only.config.graph_width() == 32768,
+                  "width, no prefill device: the same graph stays as wide as the context",
+                  std::to_string(host_only.config.graph_width()));
+            // Named by the caller: bounded from the start.
+            RunConfig named_dev = long_cfg;
+            named_dev.prefill.device = "accel";
+            PlanRequest pin_dev;
+            pin_dev.pinned.push_back("prefill-device");
+            const Plan by_caller =
+                plan_run(named_dev, machine(1500.0, Tri::Yes), mm, probed, pin_dev, PlannerPolicy::defaults());
+            check((uint32_t) by_caller.config.graph_width() == dev_bound,
+                  "width, prefill device named by the caller: the graph is held to the device's bound",
+                  std::to_string(by_caller.config.graph_width()));
+            // And the ledger is the bounded graph's. The plan arms the device after the ledger is
+            // sized, and the bound narrows the graph then: the buffers the wide graph would have
+            // taken were still charged, on the host and again as the device's own, and the cache was
+            // sized under them. A device the plan arms and the same device named by the caller run
+            // the same graph, so they hold the same and leave the cache the same.
+            for (const uint64_t per_token : {1 * KiB, 16 * KiB, 48 * KiB}) {
+                Placement steep = probed;
+                steep.host_compute_per_token = per_token;
+                steep.raw_host_compute_bytes = 8192ull * per_token;
+                const Plan armed =
+                    plan_run(long_cfg, machine(1500.0, Tri::Yes), mm, steep, PlanRequest{}, PlannerPolicy::defaults());
+                if (armed.config.prefill.device != "accel" || (uint32_t) armed.config.graph_width() != dev_bound)
+                    continue; // at this slope the memory already held the graph narrower: nothing to compare
+                // The caller's device with the scheme the plan armed: as many slots, in turn with the cache.
+                RunConfig same_scheme = named_dev;
+                same_scheme.prefill.slots = armed.config.prefill.slots;
+                same_scheme.prefill.slots_on_demand = armed.config.prefill.slots_on_demand;
+                PlanRequest pin_scheme = pin_dev;
+                pin_scheme.pinned.push_back("prefill-slots");
+                pin_scheme.pinned.push_back("prefill-slots-on-demand");
+                const Plan named =
+                    plan_run(same_scheme, machine(1500.0, Tri::Yes), mm, steep, pin_scheme, PlannerPolicy::defaults());
+                const LedgerRow * fa = ledger_row(armed, LedgerKind::ContextCompute);
+                const LedgerRow * fn = ledger_row(named, LedgerKind::ContextCompute);
+                const LedgerRow * da = ledger_row(armed, LedgerKind::Device);
+                const LedgerRow * dn2 = ledger_row(named, LedgerKind::Device);
+                const uint64_t at_bound =
+                    armed.placement.raw_host_context_bytes + armed.placement.raw_host_compute_bytes;
+                const std::string at = " at " + std::to_string(per_token >> 10) + " KiB a token";
+                check(fa && fa->bytes == at_bound,
+                      "width, prefill device armed by the plan: the ledger charges the bounded graph's buffers" + at,
+                      (fa ? std::to_string(fa->bytes >> 20) : std::string("no row")) + " MiB charged, " +
+                          std::to_string(at_bound >> 20) + " at the bound");
+                check(fa && fn && da && dn2 && fa->bytes == fn->bytes && da->bytes == dn2->bytes &&
+                          armed.cache_budget_bytes == named.cache_budget_bytes,
+                      "width, prefill device armed by the plan: the same ledger as the device named by the caller" + at,
+                      std::to_string(armed.cache_budget_bytes >> 20) + " MiB of cache against " +
+                          std::to_string(named.cache_budget_bytes >> 20));
+            }
+        }
         check(on.config.prefill.best_effort, "prefill: a device the plan armed is never a condition for the load");
         // The expert slots take turns with the cache: it is idle exactly when they are busy, so
         // they are not charged to decode. What the cache gives up is only what stays.
@@ -1485,7 +2345,7 @@ int main() {
         PlanRequest held_req;
         held_req.pinned = {"prefill-slots-on-demand"};
         const Plan held = plan_run(base_cfg(), machine(1500.0, Tri::Yes), mm, held_req);
-        check(!held.config.prefill.slots_on_demand && ledger_row(held, "device slots") == nullptr &&
+        check(!held.config.prefill.slots_on_demand && ledger_row(held, LedgerKind::DeviceSlots) == nullptr &&
                   off.cache_budget_bytes - held.cache_budget_bytes == two_layers,
               "prefill: slots held for the session are charged whole, beside the cache");
         check(on.allocation.ledger.locked <= on.allocation.ledger.lockable_cap, "prefill: the ledger still closes");
@@ -1495,6 +2355,27 @@ int main() {
                   on.to_flags().find("--prefill-best-effort") != std::string::npos &&
                   on.to_flags().find("--prefill-slots-on-demand") != std::string::npos,
               "prefill: the reproduce line carries it");
+
+        // A device an earlier load of this model here did not keep - its check on the model refused it,
+        // or the load never said - is not armed again; one it kept is.
+        for (const int verdict : {-1, 0, 1}) {
+            ModelProfile seen = mm;
+            seen.knobs.set_prefill_word({"accel", verdict, verdict == 0 ? MeasuredKnobs::prefill_unconfirmed_max : 0});
+            const Plan q = plan_run(base_cfg(), machine(1500.0, Tri::Yes), seen, PlanRequest{});
+            const std::string why = reason(q);
+            if (verdict > 0)
+                check(q.config.prefill.device == "accel", "prefill: a device an earlier load kept is armed again");
+            else
+                check(!q.config.prefill.enabled() && why.find("not kept by an earlier load") != std::string::npos,
+                      verdict < 0 ? "prefill: a device an earlier load handed back is not armed again"
+                                  : "prefill: a device a load armed and never finished opening is not armed again",
+                      why);
+        }
+        ModelProfile elsewhere = mm;
+        elsewhere.knobs.set_prefill_word({"another", -1, 0});
+        check(plan_run(base_cfg(), machine(1500.0, Tri::Yes), elsewhere, PlanRequest{}).config.prefill.device ==
+                  "accel",
+              "prefill: a verdict about another device leaves this one alone");
 
         const Plan wrong = plan_run(base_cfg(), machine(1500.0, Tri::No), mm, PlanRequest{});
         check(!wrong.config.prefill.enabled() && reason(wrong).find("did not reproduce") != std::string::npos,
@@ -1527,7 +2408,7 @@ int main() {
         ModelProfile mid = mm;
         mid.largest_expert_layer_bytes = 4 * GiB; // the cache can yield one of these and not two
         const Plan one = plan_run(base_cfg(), machine(1500.0, Tri::Yes), mid, PlanRequest{});
-        const LedgerRow * one_row = ledger_row(one, "device slots");
+        const LedgerRow * one_row = ledger_row(one, LedgerKind::DeviceSlots);
         check(one.config.prefill.device == "accel" && one.config.prefill.slots == 1,
               "prefill: where two expert slots do not fit and one does, one is used",
               std::to_string(one.config.prefill.slots) + " slot(s)");
@@ -1555,8 +2436,122 @@ int main() {
         const Plan nodev = plan_run(base_cfg(), unified(), big, PlanRequest{});
         check(!nofit.config.prefill.enabled() && reason(nofit).find("refused on memory") != std::string::npos,
               "prefill: a device that does not fit is refused with the reason");
-        check(nofit.cache_budget_bytes == nodev.cache_budget_bytes && ledger_row(nofit, "device") == nullptr,
+        check(nofit.cache_budget_bytes == nodev.cache_budget_bytes && ledger_row(nofit, LedgerKind::Device) == nullptr,
               "prefill: and a refusal leaves the ledger as it was");
+
+        // A cache that is off without the device - under one token cycle, so it would return no hits -
+        // is not something the device takes away. Refusing the device for it costs the prompt its
+        // faster prefill and saves decode nothing: measured against the run without the device, not
+        // against a cache the run never had.
+        ModelProfile wide = mm;
+        wide.token_cycle_bytes = 64 * GiB; // more than any cache here: the run streams uncached
+        wide.group(WeightGroup::Experts).bytes_per_token = wide.token_cycle_bytes;
+        const Plan uncached = plan_run(base_cfg(), unified(), wide, PlanRequest{});
+        const Plan uncached_on = plan_run(base_cfg(), machine(1500.0, Tri::Yes), wide, PlanRequest{});
+        check(uncached.cache_budget_bytes == 0, "prefill: (a run whose cache is off without any device)",
+              std::to_string((unsigned long long) (uncached.cache_budget_bytes >> 20)) + " MiB");
+        check(uncached_on.config.prefill.device == "accel",
+              "prefill: a cache already off is not a reason to refuse the device", reason(uncached_on));
+        check(uncached_on.allocation.ledger.held <= uncached_on.allocation.ledger.holdable_cap,
+              "prefill: and the ledger still closes with it");
+
+        // A cache that streams without the device and falls under one token cycle with it: a trade
+        // between every long prompt and every decoded token, priced on this machine's own requests.
+        // The token cycle is set just under the cache the run has without the device, so the device's
+        // row is what takes it under.
+        {
+            // A platform with no lock store, as on the phone this was measured on: the cache is then
+            // the only thing the device's row takes.
+            const auto unlocked_hw = [](HardwareProfile h) {
+                h.lockable_bytes = 0;
+                h.lock_in_place_bytes = 0;
+                h.anon_overflow = Overflow::Kill;
+                return h;
+            };
+            const HardwareProfile bare = unlocked_hw(unified()), with_dev = unlocked_hw(machine(1500.0, Tri::Yes));
+            ModelProfile edge = mm;
+            const auto with_cycle = [&](uint64_t cycle) {
+                edge.token_cycle_bytes = cycle;
+                edge.group(WeightGroup::Experts).bytes_per_token = cycle;
+            };
+            with_cycle(plan_run(base_cfg(), bare, mm, PlanRequest{}).cache_budget_bytes - 32 * MiB);
+            with_cycle(plan_run(base_cfg(), bare, edge, PlanRequest{}).cache_budget_bytes - 32 * MiB);
+            const Plan cached = plan_run(base_cfg(), bare, edge, PlanRequest{});
+            const auto plan_mix = [&](const MeasuredKnobs & k) {
+                ModelProfile e = edge;
+                e.knobs = k;
+                return plan_run(base_cfg(), with_dev, e, PlanRequest{});
+            };
+            check(cached.cache_budget_bytes >= edge.token_cycle_bytes,
+                  "prefill trade: (the cache streams without the device)",
+                  std::to_string((unsigned long long) (cached.cache_budget_bytes >> 20)));
+
+            // (c) Nothing recorded of the requests: today's decision, the cache kept, and the plan says
+            // the trade is unpriced and what would price it.
+            const Plan unpriced = plan_mix(MeasuredKnobs{});
+            const Decision * ud = find(unpriced, "prefill-device");
+            check(!unpriced.config.prefill.enabled() && unpriced.cache_budget_bytes == cached.cache_budget_bytes &&
+                      ud && ud->source == Source::Derived &&
+                      ud->reason.find("refused on memory") != std::string::npos &&
+                      ud->reason.find("unpriced: no request of this machine is recorded") != std::string::npos,
+                  "prefill trade: with no request recorded the cache is kept, and the trade is said unpriced",
+                  ud ? ud->reason : "no decision");
+            MeasuredKnobs no_rate;
+            no_rate.mix_requests = 3;
+            no_rate.mix_wide_prompt_tokens = 1054;
+            no_rate.mix_gen_tokens = 40;
+            const Plan no_rate_p = plan_mix(no_rate);
+            check(!no_rate_p.config.prefill.enabled() && no_rate_p.to_flags() == unpriced.to_flags() &&
+                      reason(no_rate_p).find("host's prefill of a long prompt is not measured") != std::string::npos,
+                  "prefill trade: requests without the host's prefill rate are no price either", reason(no_rate_p));
+
+            // (a) Long prompts, short answers: the device is armed though the cache falls under its floor,
+            // and the decision gives both costs.
+            MeasuredKnobs chat;
+            chat.mix_requests = 3;
+            chat.mix_wide_prompt_tokens = 1054;
+            chat.mix_gen_tokens = 40;
+            chat.host_prefill_tps = 8.6;
+            const Plan traded = plan_mix(chat);
+            const Decision * td = find(traded, "prefill-device");
+            check(traded.config.prefill.device == "accel" && td && td->source == Source::Measured &&
+                      td->reason.find("with the device") != std::string::npos &&
+                      td->reason.find("without it") != std::string::npos &&
+                      td->reason.find("1054 prompt tokens and 40 decoded") != std::string::npos,
+                  "prefill trade: long prompts and short answers arm the device, with both costs",
+                  td ? td->reason : "no decision");
+            check(traded.cache_budget_bytes == 0 && traded.config.moe.enabled && traded.config.moe.cache_mb == 0,
+                  "prefill trade: the cache it falls under the floor of is off, and the experts still stream",
+                  std::to_string((unsigned long long) (traded.cache_budget_bytes >> 20)));
+            check(validate(traded.config).ok, "prefill trade: the armed plan is a valid config",
+                  validate(traded.config).error);
+
+            // (b) Long answers from short prompts: the cache wins, priced and said so; the flags are the
+            // unpriced plan's.
+            MeasuredKnobs gen = chat;
+            gen.mix_wide_prompt_tokens = 0;
+            gen.mix_gen_tokens = 2000;
+            const Plan kept = plan_mix(gen);
+            const Decision * kd = find(kept, "prefill-device");
+            check(!kept.config.prefill.enabled() && kd && kd->source == Source::Measured &&
+                      kd->reason.find("the cache is kept") != std::string::npos &&
+                      kd->reason.find("without it") != std::string::npos,
+                  "prefill trade: long answers from short prompts keep the cache, priced", kd ? kd->reason : "none");
+            check(kept.to_flags() == unpriced.to_flags(), "prefill trade: a kept cache and an unpriced trade are the "
+                                                          "same flags");
+        }
+
+        // The same run where not even the dense set fits what may be held: the device's row would be
+        // new memory on a full pool, so it is refused - and the plan says that, not that a cache
+        // which was never there needs the room.
+        HardwareProfile tight = machine(1500.0, Tri::Yes);
+        tight.residency_budget = 2 * GiB; // under the 3 GiB dense set
+        const Plan full = plan_run(base_cfg(), tight, wide, PlanRequest{});
+        const Decision * full_d = find(full, "prefill-device");
+        check(!full.config.prefill.enabled() && full_d && full_d->brief.find("the cache needs") == std::string::npos &&
+                  full_d->brief.find("may hold") != std::string::npos,
+              "prefill: on a full pool the device is refused for the memory, not for a cache",
+              full_d ? full_d->brief : "no decision");
 
         // A machine where nothing can be locked: a phone whose platform publishes no wire limit. The
         // device is still a row of what is held, and it is not refused for a lock store the run
@@ -1566,7 +2561,7 @@ int main() {
         nolock.lock_in_place_bytes = 0;
         nolock.anon_overflow = Overflow::Kill;
         const Plan unlocked = plan_run(base_cfg(), nolock, mm, PlanRequest{});
-        const LedgerRow * ul_row = ledger_row(unlocked, "device");
+        const LedgerRow * ul_row = ledger_row(unlocked, LedgerKind::Device);
         check(unlocked.config.prefill.device == "accel",
               "prefill: where nothing can be locked, the device is not refused for the lock store", reason(unlocked));
         check(ul_row && !ul_row->locked && unlocked.allocation.ledger.locked == 0,
@@ -1594,15 +2589,16 @@ int main() {
         disc.devices[1].memory_total = 8 * GiB;
         disc.devices[1].memory_free = 8 * GiB;
         const Plan own = plan_run(base_cfg(), disc, mm, PlanRequest{});
-        check(own.config.prefill.device == "accel" && ledger_row(own, "device") == nullptr &&
+        check(own.config.prefill.device == "accel" && ledger_row(own, LedgerKind::Device) == nullptr &&
                   own.cache_budget_bytes == off.cache_budget_bytes,
               "prefill: a device with its own memory is armed and charged nothing here");
         // "Its own memory" with no size is not a pool to budget against: charged to this one.
         HardwareProfile sizeless = machine(1500.0, Tri::Yes);
         sizeless.devices[1].shares_host_memory = Tri::No;
         const Plan sz = plan_run(base_cfg(), sizeless, mm, PlanRequest{});
-        const LedgerRow * szr = ledger_row(sz, "device");
-        check(sz.config.prefill.device == "accel" && szr && szr->bytes == stays && ledger_row(sz, "device slots"),
+        const LedgerRow * szr = ledger_row(sz, LedgerKind::Device);
+        check(sz.config.prefill.device == "accel" && szr && szr->bytes == stays &&
+                  ledger_row(sz, LedgerKind::DeviceSlots),
               "prefill: a device that claims its own memory and states no size is charged to the host");
 
         // The fitter's compute buffers are per device: the prefill device pays its own part, and
@@ -1612,13 +2608,13 @@ int main() {
         projected.projected_devices = {"gpu"};
         projected.projected_compute_bytes = {256 * MiB};
         const Plan beside = plan_run(base_cfg(), machine(1500.0, Tri::Yes), mm, projected, PlanRequest{});
-        const LedgerRow * orow = ledger_row(beside, "device");
+        const LedgerRow * orow = ledger_row(beside, LedgerKind::Device);
         check(beside.config.prefill.device == "accel" && orow && orow->bytes == stays,
               "prefill: a compute buffer projected for another device is not charged to this one",
               orow ? std::to_string((unsigned long long) (orow->bytes >> 20)) + " MiB" : "no row");
         projected.projected_devices = {"accel"};
         const Plan mine = plan_run(base_cfg(), machine(1500.0, Tri::Yes), mm, projected, PlanRequest{});
-        const LedgerRow * mrow = ledger_row(mine, "device");
+        const LedgerRow * mrow = ledger_row(mine, LedgerKind::Device);
         check(mrow && mrow->bytes == stays + 256 * MiB, "prefill: and the one projected for it is",
               mrow ? std::to_string((unsigned long long) (mrow->bytes >> 20)) + " MiB" : "no row");
 
@@ -1726,6 +2722,64 @@ int main() {
               validate(cpu_only.config).error);
         check(cpu_only.to_flags().find("--devices cpu") != std::string::npos,
               "isolated: the reproduce line carries the device choice", cpu_only.to_flags());
+        // A card that works beside one that failed its probe keeps what the fitter placed on it, and
+        // the run names it, so the failed one is not handed back by llama.cpp's default list (#606).
+        HardwareProfile mixed = desktop();
+        ComputeDevice dead;
+        dead.name = "dead";
+        dead.memory_total = 11 * GiB;
+        dead.memory_free = 11 * GiB;
+        dead.shares_host_memory = Tri::No;
+        dead.usable = Tri::No;
+        dead.unusable_reason = "its probe ended the process that ran it (signal 6)";
+        dead.probed_out_of_process = true;
+        mixed.devices.push_back(dead);
+        bool dropped = false;
+        check(surviving_devices(mixed, {}, &dropped) == std::vector<std::string>{"discrete"} && dropped,
+              "survivors: an empty list names the devices that survived");
+        check(surviving_devices(mixed, {"discrete"}, &dropped) == std::vector<std::string>{"discrete"} && !dropped,
+              "survivors: a list without the failed device is left as it is");
+        check(surviving_devices(desktop(), {}, &dropped).empty() && !dropped,
+              "survivors: with every device alive, an empty list stays llama.cpp's default");
+        HardwareProfile all_dead = mixed;
+        all_dead.devices.erase(all_dead.devices.begin());
+        check(surviving_devices(all_dead, {}, &dropped).empty() && dropped,
+              "survivors: with none alive, nothing is named and the drop is reported");
+        Placement on_good;
+        on_good.fitted = true;
+        on_good.n_gpu_layers = (int32_t) mm.n_layer + 1;
+        on_good.device_split = {{"discrete", mm.n_layer + 1}};
+        on_good.outcome = "the capacity fitter found a placement that is projected to fit";
+        const Plan beside_dead = plan_run(base_cfg(), mixed, mm, on_good, PlanRequest{}, PlannerPolicy::defaults());
+        const Decision * kept = find(beside_dead, "devices");
+        check(beside_dead.config.n_gpu_layers == on_good.n_gpu_layers &&
+                  beside_dead.config.device_use != DeviceUse::CpuOnly &&
+                  beside_dead.config.device_list == std::vector<std::string>{"discrete"},
+              "isolated: the card that works keeps its layers and is the run's only device");
+        check(kept && kept->value == "discrete" && kept->reason.find("signal 6") != std::string::npos,
+              "isolated: and the plan says which device was left out and why",
+              kept ? kept->value + ": " + kept->reason : "no decision");
+        check(validate(beside_dead.config).ok, "isolated: that plan is a valid config",
+              validate(beside_dead.config).error);
+        check(beside_dead.to_flags().find("dead") == std::string::npos,
+              "isolated: the reproduce line does not name the failed device", beside_dead.to_flags());
+        // The same when the host half streams: the rule is asked on that path as well.
+        Placement half;
+        half.fitted = true;
+        half.outcome = "synthetic";
+        half.n_gpu_layers = 24;
+        half.n_ctx = 4096;
+        for (uint32_t il = 0; il < 24; ++il)
+            half.host_expert_layers.push_back(il);
+        half.host_resident_bytes = 4 * GiB;
+        half.device_bytes = 8 * GiB;
+        half.device_split = {{"discrete", 24}};
+        const Plan streamed = plan_run(base_cfg(), mixed, model, half, PlanRequest{}, PlannerPolicy::defaults());
+        check(streamed.config.moe.enabled && streamed.config.n_gpu_layers == 24 &&
+                  streamed.config.device_list == std::vector<std::string>{"discrete"},
+              "isolated, streamed: the card that works keeps its layers and is the only device listed",
+              streamed.to_flags());
+
         // No runner: nothing is marked, and the probes here do the asking as they always did.
         HardwareProfile plain = unified();
         probe_devices_isolated(plain, nullptr);
@@ -1796,22 +2850,28 @@ int main() {
         };
         const ModelProfile steep = curve_model({{0.02, 0.0}, {0.05, 0.40}, {0.13, 0.75}, {0.25, 0.85}, {1.0, 1.0}});
 
-        // No trace: the plan is today's. Pinned to the figures this fixture produced before the curve
-        // existed (and its whole rationale was diffed byte for byte against that build): the linear
-        // credit, the cache it sized and the cost it predicted.
+        // No trace: the cache is credited the prior in token cycles (prior_hit_curve), ranked and priced
+        // by the same path as a record's curve, and the plan says the figure is a prior.
         {
             const Plan p = plan_run(base_cfg(), measured_machine(), model, PlanRequest{});
             const GroupPlacement & e = p.allocation.at(WeightGroup::Experts);
-            check(p.allocation.cache_bytes == 9147777024ull, "no trace: the cache is the linear credit's",
+            const HitCurve prior = prior_hit_curve(model.expert_bytes, model.token_cycle_bytes);
+            check(p.allocation.cache_bytes == 9147777024ull,
+                  "no trace: every byte the ranking leaves goes to the cache, as before the prior",
                   std::to_string(p.allocation.cache_bytes));
-            check(std::fabs(p.allocation.cache_hit_credited - 0.473307) < 1e-6, "no trace: credited linearly",
-                  std::to_string(p.allocation.cache_hit_credited));
-            check(std::fabs(p.allocation.seconds_per_token - 0.160544713) < 1e-9, "no trace: the same prediction",
+            const double expect = prior.hit_share(p.allocation.cache_bytes);
+            check(expect > 0.473307 && std::fabs(p.allocation.cache_hit_credited - expect) < 1e-12,
+                  "no trace: credited the prior at the cache's size, above the share of the set it holds",
+                  std::to_string(p.allocation.cache_hit_credited) + " vs " + std::to_string(expect));
+            check(p.allocation.seconds_per_token < 0.160544713,
+                  "no trace: more hits credited, a cheaper token than the linear credit priced",
                   std::to_string(p.allocation.seconds_per_token));
-            check(e.reason == "streamed with a 8724 MiB cache, 47% of the expert set; credited hit rate 47%, which is "
-                              "conservative on purpose and is the coefficient a run's own counters correct",
-                  "no trace: the experts' rationale is word for word today's", e.reason);
-            check(!find(p, "cache-hits"), "no trace: nothing is said about a curve there is none of");
+            check(e.reason.find("[prior]") != std::string::npos && e.reason.find("token cycles") != std::string::npos,
+                  "no trace: the experts' rationale says the hit rate is the prior", e.reason);
+            const Decision * ch = find(p, "cache-hits");
+            check(ch && ch->source == Source::Policy && ch->reason.find("no routing record") != std::string::npos,
+                  "no trace: the plan says its hits are a prior until a record exists", ch ? ch->reason : "none");
+            check(!model.hit_curve.credited(), "no trace: the prior is the plan's, never written into the model");
 
             // A trace that is not this model's is the same plan, plus the one line saying why.
             ModelProfile rejected = model;
@@ -1822,7 +2882,7 @@ int main() {
             for (const Decision & d : r.decisions)
                 if (d.knob != "cache-hits") without += d.knob + "=" + d.value + ":" + d.reason + "|" + d.brief + "\n";
             for (const Decision & d : p.decisions)
-                reasons += d.knob + "=" + d.value + ":" + d.reason + "|" + d.brief + "\n";
+                if (d.knob != "cache-hits") reasons += d.knob + "=" + d.value + ":" + d.reason + "|" + d.brief + "\n";
             check(without == reasons && r.allocation.cache_bytes == p.allocation.cache_bytes &&
                       r.allocation.seconds_per_token == p.allocation.seconds_per_token,
                   "a rejected trace leaves the plan as it is without one");
@@ -1844,9 +2904,97 @@ int main() {
             const Decision * d = find(p, "cache-hits");
             check(d && d->source == Source::Measured && d->reason.find("256 decoded") != std::string::npos,
                   "with a curve: a measured decision states the hit rate and what it was replayed from");
-            const Plan lin = plan_run(base_cfg(), measured_machine(), model, PlanRequest{});
-            check(p.allocation.seconds_per_token < lin.allocation.seconds_per_token,
-                  "with a steep curve the same cache is priced cheaper than the linear credit says");
+            const Plan pri = plan_run(base_cfg(), measured_machine(), model, PlanRequest{});
+            check(pri.allocation.cache_hit_credited != p.allocation.cache_hit_credited,
+                  "with a curve: the model's own record replaces the prior");
+        }
+
+        // ── the decode's own cost, measured on an earlier load (MeasuredKnobs::decode_*) ──────────
+        {
+            const HardwareProfile hw = measured_machine();
+            const Plan base = plan_run(base_cfg(), hw, model, PlanRequest{});
+            const double compute = host_compute_seconds(hw, model);
+            auto account = [](const Plan & p) {
+                std::string out = p.to_flags() + "\n";
+                for (const Decision & d : p.decisions)
+                    out += d.knob + "=" + d.value + ":" + d.reason + "|" + d.brief + "\n";
+                char nums[96];
+                std::snprintf(nums, sizeof(nums), "%.17g %.17g %llu", p.allocation.seconds_per_token,
+                              p.allocation.cache_hit_credited, (unsigned long long) p.allocation.cache_bytes);
+                return out + nums;
+            };
+            ModelProfile rec = model;
+            rec.knobs.hardware = "0123456789abcdef";
+            rec.knobs.engine = "test";
+            check(compute > 0.0 && base.config.moe.enabled && !find(base, "decode-cost"),
+                  "decode cost: the fixture streams and prices its compute, and says nothing of a measurement");
+            check(account(plan_run(base_cfg(), hw, rec, PlanRequest{})) == account(base),
+                  "decode cost: a record that measured no decode leaves the plan byte for byte as it is");
+
+            // A decode that computed three times what the matmul rates price: every group's compute
+            // moves together, so the token's compute part triples and nothing the ranking weighs moves.
+            ModelProfile slow = rec;
+            slow.knobs.decode_compute_s = 3.0 * compute;
+            slow.knobs.decode_threads = base.config.n_threads;
+            const Plan q = plan_run(base_cfg(), hw, slow, PlanRequest{});
+            const Decision * d = find(q, "decode-cost");
+            check(d && d->source == Source::Measured && d->value == "compute x3.00" &&
+                      d->brief.rfind("Decode priced from a load here: compute", 0) == 0 && d->brief.size() <= 120,
+                  "decode cost: the measured compute is the plan's, and it says so",
+                  d ? d->value + " / " + d->brief : "");
+            const double grew = q.allocation.seconds_per_token - base.allocation.seconds_per_token;
+            check(std::fabs(grew - 2.0 * compute) < 1e-9 * q.allocation.seconds_per_token,
+                  "decode cost: the predicted token's compute part is the measured one, three times the model's",
+                  std::to_string(grew) + " added against " + std::to_string(2.0 * compute));
+            check(q.allocation.cache_bytes == base.allocation.cache_bytes && q.to_flags() == base.to_flags(),
+                  "decode cost: a compute that scales every group alike changes no knob", q.to_flags());
+
+            // Measured at another thread count, or under another placement: not this plan's figure.
+            ModelProfile other = slow;
+            other.knobs.decode_threads = base.config.n_threads + 1;
+            const Plan o = plan_run(base_cfg(), hw, other, PlanRequest{});
+            const Decision * od = find(o, "decode-cost");
+            check(o.allocation.seconds_per_token == base.allocation.seconds_per_token && od &&
+                      od->source == Source::Derived && od->value == "probed",
+                  "decode cost: a figure measured at another thread count is not used, and the plan says why");
+            ModelProfile placed = slow;
+            placed.knobs.decode_gpu_layers = 12;
+            const Plan pl = plan_run(base_cfg(), hw, placed, PlanRequest{});
+            check(pl.allocation.seconds_per_token == base.allocation.seconds_per_token && find(pl, "decode-cost") &&
+                      find(pl, "decode-cost")->source == Source::Derived,
+                  "decode cost: a figure measured with layers on a device does not answer for a host plan");
+
+            // Hits: the prior is scaled to what was measured at the load's budget, both ways.
+            ModelProfile hits = rec;
+            hits.knobs.decode_hit = 0.5 * base.allocation.cache_hit_credited;
+            hits.knobs.decode_cache_mib = (double) base.allocation.cache_bytes / (double) MiB;
+            const Plan h = plan_run(base_cfg(), hw, hits, PlanRequest{});
+            const double expect_h =
+                0.5 * prior_hit_curve(model.expert_bytes, model.token_cycle_bytes).hit_share(h.allocation.cache_bytes);
+            check(h.allocation.cache_bytes > 0 && std::fabs(h.allocation.cache_hit_credited - expect_h) < 1e-9 &&
+                      h.allocation.seconds_per_token > base.allocation.seconds_per_token && find(h, "decode-cost") &&
+                      find(h, "decode-cost")->source == Source::Measured,
+                  "decode cost: the prior moves to the hits measured at that budget",
+                  std::to_string(h.allocation.cache_hit_credited) + " vs " + std::to_string(expect_h));
+
+            // With the model's own curve: lowered toward the measurement, never raised past the replay.
+            ModelProfile curved = steep;
+            curved.knobs = rec.knobs;
+            const Plan c0 = plan_run(base_cfg(), hw, curved, PlanRequest{});
+            const double replay = steep.hit_curve.hit_share(c0.allocation.cache_bytes);
+            curved.knobs.decode_cache_mib = (double) c0.allocation.cache_bytes / (double) MiB;
+            curved.knobs.decode_hit = 0.8 * replay;
+            const Plan c1 = plan_run(base_cfg(), hw, curved, PlanRequest{});
+            check(c1.allocation.cache_bytes > 0 &&
+                      std::fabs(c1.allocation.cache_hit_credited -
+                                0.8 * steep.hit_curve.hit_share(c1.allocation.cache_bytes)) < 1e-9 &&
+                      c1.allocation.seconds_per_token > c0.allocation.seconds_per_token,
+                  "decode cost: the curve is credited at the ratio measured at the load's budget, at every size");
+            curved.knobs.decode_hit = std::min(1.0, replay + 0.1);
+            const Plan c2 = plan_run(base_cfg(), hw, curved, PlanRequest{});
+            check(c2.allocation.cache_hit_credited == c0.allocation.cache_hit_credited &&
+                      c2.allocation.seconds_per_token == c0.allocation.seconds_per_token,
+                  "decode cost: hits above the replay credit nothing past it");
         }
 
         // The ranking walks the curve: where the cache competes with a read-whole group for the same
@@ -1953,6 +3101,40 @@ int main() {
                   "knobs on: the trial is part of the command line that reproduces the plan", armed.to_flags());
         }
 
+        // The sweep's own rungs: a count above the incumbent that it measured short of the margin is
+        // answered and not tried again under a decode; a count below it is still tried, and a count
+        // the sweep never asked is tried as before.
+        {
+            HardwareProfile swept = het;
+            swept.thread_rates = {{1, 20.0}, {2, 38.0}, {4, 70.0}, {8, 100.0}, {10, 104.0}};
+            const Plan p = plan_run(base_cfg(), swept, model, on);
+            check(p.config.trial.threads == std::vector<int>({4}),
+                  "sweep answered: 10 (4% over 8, alone) is not tried; 4, below the incumbent, is",
+                  std::to_string(p.config.trial.threads.size()));
+            const Decision * t = find(p, "trial-threads");
+            check(t && t->value == "4" && t->reason.find("10 is not tried") != std::string::npos,
+                  "sweep answered: the trial's note says which count it skips and why", t ? t->reason : "none");
+
+            // Past the margin alone, the sweep did not answer it: a decode decides.
+            swept.thread_rates.back().gibs = 115.0;
+            const Plan q = plan_run(base_cfg(), swept, model, on);
+            check(q.config.trial.threads == std::vector<int>({10, 4}),
+                  "sweep answered: a count the sweep measured past the margin is still tried");
+
+            // Nothing left to try: the plan says the sweep answered, and arms no thread trial.
+            HardwareProfile alike = desktop();
+            alike.devices.clear();
+            alike.n_cores = 8;
+            alike.core_classes = {8};
+            alike.best_threads = 4;
+            alike.thread_rates = {{1, 20.0}, {2, 38.0}, {4, 70.0}, {8, 60.0}};
+            const Plan r = plan_run(base_cfg(), alike, model, on);
+            const Decision * n = find(r, "trial-threads");
+            check(r.config.trial.threads.empty() && n && n->value == "none" && n->source == Source::Measured,
+                  "sweep answered: with every candidate answered no thread trial is armed, and the plan says so",
+                  n ? n->value : "none");
+        }
+
         // A stored verdict: applied, stated as measured on this model, and nothing is measured again.
         ModelProfile measured = model;
         measured.knobs.hardware = "0123456789abcdef";
@@ -2041,6 +3223,48 @@ int main() {
             check(p.config.n_gpu_layers == 24 && !p.config.moe.overlap && !p.config.trial.overlap,
                   "layers on a device: overlap is not armed from a verdict nor measured");
             check(validate(p.config).ok, "layers on a device: a valid config", validate(p.config).error);
+
+            // A front-end's default overlap with layers on a device and no cache there: it would take the
+            // offload of the host's weights in a prompt's wide matmuls away (offloads_wide_matmuls), so the
+            // plan turns it off and says why. Measured 2.1x to 4.5x of the prefill on a discrete GPU (#645).
+            pl.device_split = {{"discrete", 24}};
+            RunConfig srv = base_cfg();
+            srv.moe.overlap = true;
+            const Plan d = plan_run(srv, dev, model, pl, PlanRequest{});
+            const Decision * od = find(d, "overlap");
+            check(d.config.n_gpu_layers == 24 && d.config.moe.device_cache_mb == 0 && !d.config.moe.overlap &&
+                      offloads_wide_matmuls(d.config),
+                  "layers on a device, a front-end's default overlap: off, and the prompts' wide matmuls offload");
+            check(od && od->value == "off" && od->source == Source::Derived &&
+                      od->brief == "Off: with layers on discrete, overlap keeps prompts on the host." &&
+                      od->reason.find("pass --overlap") == std::string::npos &&
+                      od->reason.find("Pass --overlap to keep it") != std::string::npos,
+                  "layers on a device, a front-end's default overlap: the plan says why", od ? od->reason : "none");
+            check(validate(d.config).ok, "layers on a device, default overlap off: a valid config",
+                  validate(d.config).error);
+
+            // The caller who pinned it keeps it, and the plan line says what it costs them.
+            PlanRequest pin;
+            pin.pinned = {"overlap"};
+            HardwareProfile wide = dev;
+            wide.host_wide_matmul_gibs = 20.0;
+            wide.devices[0].wide_matmul_gibs = 64.0;
+            const Plan k = plan_run(srv, wide, model, pl, pin);
+            const Decision * kd = find(k, "overlap");
+            check(k.config.n_gpu_layers == 24 && k.config.moe.overlap && !offloads_wide_matmuls(k.config),
+                  "layers on a device, overlap pinned: kept, and the prompts stay on the cores");
+            check(kd && kd->value == "on" && kd->source == Source::Operator &&
+                      kd->brief == "On, as you set it: prompts run on the host's cores, not on discrete." &&
+                      kd->reason.find("measured 3.2x the host's") != std::string::npos &&
+                      kd->reason.find("pass --no-overlap") != std::string::npos,
+                  "layers on a device, overlap pinned: the plan says what it costs", kd ? kd->reason : "none");
+            check(validate(k.config).ok, "layers on a device, overlap pinned: a valid config",
+                  validate(k.config).error);
+
+            // Nothing placed: the default is not this rule's to touch.
+            const Plan h = plan_run(srv, het, model, PlanRequest{});
+            check(h.config.n_gpu_layers == 0 && h.config.moe.overlap,
+                  "every layer on the host: a front-end's default overlap stands");
         }
         {
             // Every core alike: the whole count and half of it are the candidates.
@@ -2059,6 +3283,393 @@ int main() {
             check(plan_run(base_cfg(), blind, model, on).config.trial.threads.empty(),
                   "unknown cores: no thread trial");
         }
+    }
+
+    // ── a model held in memory, on a device that reads that same memory: decided by the first load ─
+    // The fitter's placement on such a device is set aside (one pool, counted twice), so what is left
+    // is which engine serves this machine's requests faster. No probe of a part of a model says that,
+    // so until a load has timed both sides the plan opens the device and asks the load to time the
+    // model on it and on the cores, as it compares their answers, and to keep the faster on a request
+    // (device_answer_test has the load's rule). Once both rates are measured the plan reads them.
+    {
+        HardwareProfile roomy = unified();
+        roomy.residency_budget = 64 * GiB;
+        roomy.memory_total = 64 * GiB;
+        roomy.host_wide_matmul_gibs = 1000.0;
+        roomy.host_expert_gibs = roomy.host_dense_gibs = 100.0; // level with the device one token wide
+        for (ComputeDevice & d : roomy.devices) {
+            if (d.is_cpu) continue;
+            d.usable = Tri::Yes;
+            d.identity_ok = Tri::Yes;
+            d.runs_expert_op = Tri::Yes;
+            d.needs_repack = Tri::No;
+            d.wide_identity_ok = Tri::Yes;
+            d.wide_matmul_gibs = 900.0; // no faster on a prompt than the host
+            d.expert_gibs = d.dense_gibs = 100.0;
+        }
+        Placement shared;
+        shared.shared_memory_placement = true;
+        shared.device_bytes = 20 * GiB;
+        shared.device_compute_bytes = 400 * MiB;
+        shared.projected_devices = {"accel"};
+        shared.projected_compute_bytes = {400 * MiB};
+        const auto plan_with = [&](double on, double off, const HardwareProfile & h = HardwareProfile{},
+                                   const PlanRequest & r = PlanRequest{}) {
+            ModelProfile m = model;
+            m.knobs.shared_device_tps = on;
+            m.knobs.no_shared_device_tps = off;
+            return plan_run(base_cfg(), h.devices.empty() ? roomy : h, m, shared, r, PlannerPolicy::defaults());
+        };
+        const auto on_device = [&](const Plan & p) {
+            return p.config.n_gpu_layers == (int) model.n_layer + 1 && p.config.device_split.size() == 1 &&
+                   p.config.device_split[0].first == "accel" &&
+                   p.config.device_split[0].second == p.config.n_gpu_layers;
+        };
+        const auto on_cores = [](const Plan & p) {
+            return p.config.n_gpu_layers == 0 && p.config.device_split.empty();
+        };
+
+        // The same on a machine whose requests are answers with no long prompt (what its loads recorded).
+        const auto plan_chat = [&](double on, double off, const HardwareProfile & h) {
+            ModelProfile m = model;
+            m.knobs.shared_device_tps = on;
+            m.knobs.no_shared_device_tps = off;
+            m.knobs.mix_requests = 4000;
+            m.knobs.mix_gen_tokens = 400;
+            return plan_run(base_cfg(), h, m, shared, PlanRequest{}, PlannerPolicy::defaults());
+        };
+
+        // Nothing measured, and probes that read the two sides level: the load decides, on the model.
+        const PlannerPolicy defaults = PlannerPolicy::defaults();
+        const float default_mix = defaults.mix_prompt_tokens_default / defaults.mix_gen_tokens_default;
+        const auto asks_the_load = [&](const Plan & p) {
+            return on_device(p) && p.config.trial.answer_device == "accel" &&
+                   p.config.trial.answer_prompt_per_token >= 0.0f && p.config.trial.shared_device_side == 1;
+        };
+        const Plan first = plan_with(0.0, 0.0);
+        check(first.regime == Regime::Fits, "shared device: the model is held in memory");
+        check(asks_the_load(first),
+              "shared device, no side timed: the device is opened and the load times both sides and keeps one");
+        check(std::fabs(first.config.trial.answer_prompt_per_token - default_mix) < 1e-3f,
+              "shared device, no side timed: the load weighs a prompt as the default request does",
+              std::to_string(first.config.trial.answer_prompt_per_token));
+        const Decision * d0 = find(first, "shared-device");
+        check(d0 && d0->value == "accel" && d0->source == Source::Derived &&
+                  d0->reason.find("the default mix") != std::string::npos &&
+                  d0->reason.find("no probe of a part of a model") != std::string::npos,
+              "shared device: the line says the load decides, and on which request", d0 ? d0->reason : "no line");
+        check(validate(first.config).ok, "shared device, the load decides: a valid config",
+              validate(first.config).error);
+        // One side measured is still no comparison: the load that follows times both.
+        check(asks_the_load(plan_with(0.0, 40.0)) && asks_the_load(plan_with(40.0, 0.0)),
+              "shared device, one side timed: the load is still asked for both");
+        // Probes that read the cores far ahead decide nothing either: they are a part of a model's rate.
+        {
+            HardwareProfile cores_ahead = roomy;
+            cores_ahead.host_expert_gibs = cores_ahead.host_dense_gibs = 143.0;
+            for (ComputeDevice & d : cores_ahead.devices)
+                if (!d.is_cpu) d.expert_gibs = d.dense_gibs = 82.0;
+            check(asks_the_load(plan_with(0.0, 0.0, cores_ahead)),
+                  "shared device, probes read the cores 74% ahead: the model's own timing still decides");
+        }
+
+        // A device that computes a prompt 2.5x faster, for the plans made once both sides are measured.
+        HardwareProfile prompts = roomy;
+        for (ComputeDevice & d : prompts.devices)
+            if (!d.is_cpu) d.wide_matmul_gibs = 2500.0;
+        const Plan moved = plan_with(0.0, 0.0, prompts);
+        const Decision * df = find(moved, "shared-device");
+        check(asks_the_load(moved) && df && df->value == "accel" &&
+                  df->reason.find("copied into the device's own buffers") != std::string::npos,
+              "shared device: a line naming the device and how its weights are held", df ? df->reason : "");
+        check(validate(moved.config).ok, "shared device, moved: a valid config", validate(moved.config).error);
+        // A machine that only decodes asks the load to weigh the decode alone.
+        {
+            const Plan chat = plan_chat(0.0, 0.0, prompts);
+            check(asks_the_load(chat) && chat.config.trial.answer_prompt_per_token < default_mix / 4.0f,
+                  "shared device, a machine that sends no long prompt: the load weighs little but the decode",
+                  std::to_string(chat.config.trial.answer_prompt_per_token));
+        }
+
+        // Both decodes measured: their ratio is the decode's, whatever the probe read.
+        const Plan faster = plan_chat(54.0, 40.0, roomy);
+        df = find(faster, "shared-device");
+        check(on_device(faster) && faster.config.trial.shared_device_side == -1 && df && df->source == Source::Measured,
+              "shared device, measured faster on the decode this machine serves: every layer moves");
+        // The rule is the load's: the device keeps the model unless the cores are faster by the margin,
+        // so a plan made on the load's measurements does not undo what the load decided.
+        check(on_device(plan_chat(41.0, 40.0, roomy)) && on_device(plan_chat(38.0, 40.0, roomy)),
+              "shared device, level on the decode: the device keeps it, as the load that timed them did");
+        check(on_cores(plan_chat(30.0, 40.0, roomy)), "shared device, slower: the cores keep it");
+        check(on_device(plan_with(41.0, 40.0, prompts)),
+              "shared device, level on the decode and faster on a prompt: the device takes it");
+        check(on_cores(plan_chat(30.0, 40.0, prompts)),
+              "shared device, slower on the decode of a machine that only decodes: a faster prompt buys nothing");
+        // A decode 35% faster against a prompt 10% slower, on the default request: the cores are not
+        // faster by the margin, so the device keeps it.
+        check(on_device(plan_with(54.0, 40.0)),
+              "shared device, the cores not ahead by the margin on the whole request: the device keeps it");
+
+        // The probes let the device through; what this model answers there is compared by the load that
+        // moves it, once, and the record's word then decides.
+        check(moved.config.trial.answer_device == "accel" && df &&
+                  df->reason.find("compares its answers") != std::string::npos,
+              "shared device, moved with no word on its answers: the load is asked to compare them",
+              df ? df->reason : "");
+        {
+            const Plan cores = plan_chat(30.0, 40.0, roomy);
+            check(on_cores(cores) && cores.config.trial.answer_device.empty() &&
+                      cores.config.trial.answer_prompt_per_token < 0.0f,
+                  "shared device, measured on the cores: nothing to compare, nothing to weigh");
+        }
+        {
+            ModelProfile said = model;
+            said.knobs.shared_device_tps = 41.0; // both sides timed, by the load that confirmed the answers
+            said.knobs.no_shared_device_tps = 40.0;
+            said.knobs.set_device_answer("accel", 1);
+            const Plan ok = plan_run(base_cfg(), prompts, said, shared, PlanRequest{}, PlannerPolicy::defaults());
+            const Decision * dk = find(ok, "shared-device");
+            check(on_device(ok) && ok.config.trial.answer_device.empty() && dk &&
+                      dk->reason.find("matched the cores'") != std::string::npos,
+                  "shared device, answers confirmed here: the device, and nothing compared again",
+                  dk ? dk->reason : "");
+            check(validate(ok.config).ok, "shared device, confirmed: a valid config", validate(ok.config).error);
+
+            said.knobs.set_device_answer("accel", -1);
+            const Plan no = plan_run(base_cfg(), prompts, said, shared, PlanRequest{}, PlannerPolicy::defaults());
+            const Decision * dn = find(no, "shared-device");
+            check(on_cores(no) && no.config.trial.answer_device.empty() && no.config.trial.shared_device_side == -1,
+                  "shared device, answers differed here: the cores, nothing compared, no side timed");
+            check(dn && dn->value == "cpu" && dn->source == Source::Measured &&
+                      dn->reason.find("differed from the cores' on this machine") != std::string::npos,
+                  "shared device, answers differed: a measured line that says so", dn ? dn->reason : "no line");
+            // Another device's word is not this one's.
+            said.knobs.device_answers.clear();
+            said.knobs.set_device_answer("other", -1);
+            const Plan el = plan_run(base_cfg(), prompts, said, shared, PlanRequest{}, PlannerPolicy::defaults());
+            check(on_device(el) && el.config.trial.answer_device == "accel",
+                  "shared device, another device's answers differed: this one moves, and is compared");
+
+            PlanRequest held;
+            held.pinned = {"gpu-layers"};
+            const Plan pin = plan_run(base_cfg(), prompts, model, shared, held, PlannerPolicy::defaults());
+            check(pin.config.trial.answer_device.empty() && !find(pin, "shared-device"),
+                  "shared device, the placement pinned by a person: nothing moved, nothing compared");
+        }
+
+        ModelProfile failed = model;
+        failed.knobs.shared_device_unviable = MeasuredKnobs::unviable_max;
+        const Plan f = plan_run(base_cfg(), prompts, failed, shared, PlanRequest{}, PlannerPolicy::defaults());
+        check(on_cores(f) && f.config.trial.shared_device_side == -1,
+              "shared device that failed to load the model: the cores, whatever its price");
+
+        HardwareProfile wraps = roomy;
+        for (ComputeDevice & d : wraps.devices)
+            if (!d.is_cpu) d.host_ptr_buffers = d.host_ptr_verified = Tri::Yes;
+        const Plan in_place = plan_chat(54.0, 40.0, wraps);
+        const Decision * dw = find(in_place, "shared-device");
+        check(dw && dw->reason.find("stay the file's mapping") != std::string::npos,
+              "shared device that reads our memory in place: the line says the weights stay mapped",
+              dw ? dw->reason : "no line");
+
+        HardwareProfile wrong = roomy;
+        for (ComputeDevice & d : wrong.devices)
+            if (!d.is_cpu) d.identity_ok = Tri::No;
+        const Plan w = plan_with(54.0, 40.0, wrong);
+        const Decision * dr = find(w, "shared-device");
+        check(on_cores(w) && w.config.trial.shared_device_side == -1 && dr && dr->source == Source::Derived,
+              "shared device that has not computed the host's results: never timed, never moved");
+
+        HardwareProfile wide_wrong = roomy;
+        for (ComputeDevice & d : wide_wrong.devices)
+            if (!d.is_cpu) d.wide_identity_ok = Tri::No;
+        const Plan ww = plan_with(54.0, 40.0, wide_wrong);
+        check(on_cores(ww) && ww.config.trial.shared_device_side == -1,
+              "shared device right one token wide and wrong on a prompt: never timed, never moved (the prompt "
+              "would run there too)");
+
+        Placement unpriced = shared;
+        unpriced.projected_devices.clear();
+        unpriced.projected_compute_bytes.clear();
+        const Plan up = plan_run(base_cfg(), roomy, model, unpriced, PlanRequest{}, PlannerPolicy::defaults());
+        check(on_cores(up) && up.config.trial.shared_device_side == -1,
+              "shared device with no projected compute buffer: not timed, not moved");
+
+        // The model fits and the room this machine asks beside it does not: the plan streams it, and
+        // the device, which holds it whole inside what that plan may hold, is offered it with the
+        // stream behind (the block below has the rest of that rule).
+        HardwareProfile tight = roomy;
+        tight.residency_budget = 25 * GiB;
+        {
+            const Plan measured = plan_with(54.0, 40.0, tight), unmeasured = plan_with(0.0, 0.0, tight);
+            check(on_device(measured) && measured.config.fallback && measured.config.fallback->moe.enabled &&
+                      on_device(unmeasured) && unmeasured.config.fallback &&
+                      unmeasured.config.trial.answer_device == "accel",
+                  "shared device without the room residency asks: offered the model, the stream behind it");
+        }
+
+        PlanRequest pinned;
+        pinned.pinned = {"devices"};
+        const Plan pd = plan_with(54.0, 40.0, roomy, pinned);
+        check(on_cores(pd) && !find(pd, "shared-device"), "shared device, devices pinned: left alone");
+
+        // ── a model the plan streams, where the device could hold it whole ──────────────────────
+        // The shape of a laptop with integrated graphics: the model does not fit beside the room this
+        // machine asks for, so the plan streams it with a cache nearly as large as its experts. Held
+        // whole on the device it takes no more of the pool than that plan holds, so the first load is
+        // asked, and the streaming plan is what the session reopens with where the device does not
+        // keep the model.
+        {
+            const auto streams = [&](const Plan & p) {
+                return p.config.moe.enabled && p.config.n_gpu_layers == 0 && !p.config.fallback;
+            };
+            HardwareProfile laptop = roomy;
+            laptop.memory_total = 31 * GiB;
+            // No lock ceiling short of the memory itself: the cache is bounded by what may be held.
+            laptop.lockable_bytes = laptop.lock_in_place_bytes = laptop.reclaim_exempt_max = 31 * GiB;
+            laptop.host_expert_gibs = laptop.host_dense_gibs = 143.0; // the probes read the cores far ahead
+            for (ComputeDevice & d : laptop.devices)
+                if (!d.is_cpu) d.expert_gibs = d.dense_gibs = 82.0;
+            uint64_t budget = 0; // the least this process may hold at which the plan asks the load
+            for (uint64_t b = 12 * GiB; b <= 40 * GiB && budget == 0; b += 256 * MiB) {
+                laptop.residency_budget = b;
+                const Plan q = plan_run(base_cfg(), laptop, model, shared, PlanRequest{}, defaults);
+                if (q.config.fallback) budget = b;
+            }
+            laptop.residency_budget = budget;
+            const Plan held = plan_run(base_cfg(), laptop, model, shared, PlanRequest{}, defaults);
+            const Decision * dh = find(held, "held-whole");
+            check(budget > 0 && on_device(held) && !held.config.moe.enabled && held.config.fallback &&
+                      held.config.trial.answer_device == "accel" && held.config.trial.answer_prompt_per_token >= 0.0f,
+                  "streamed, could be held whole on the device: the device is opened and the load decides",
+                  std::to_string(budget >> 20) + " MiB");
+            check(held.config.fallback && held.config.fallback->moe.enabled &&
+                      held.config.fallback->n_gpu_layers == 0 && held.config.fallback->moe.cache_mb > 0 &&
+                      !held.config.fallback->fallback && held.config.fallback->trial.answer_device.empty(),
+                  "streamed, could be held whole: the fallback is the streaming plan, whole and by itself");
+            check(validate(held.config).ok, "streamed, could be held whole: a valid config, fallback included",
+                  validate(held.config).error);
+            check(dh && dh->value == "accel" && dh->reason.find("reopens as the streaming plan") != std::string::npos,
+                  "streamed, could be held whole: the plan says both parts", dh ? dh->reason : "no line");
+            // The room is the streaming plan's own: what it holds of this memory, and no more.
+            {
+                HardwareProfile alone = laptop;
+                alone.devices.resize(1); // no device: the same machine plans the stream
+                const Plan stream = plan_run(base_cfg(), alone, model, Placement{}, PlanRequest{}, defaults);
+                check(streams(stream) && stream.regime == Regime::ExpertsStream,
+                      "streamed, could be held whole: without the device this machine streams the model");
+                const uint64_t whole = model.file_bytes + shared.device_compute_bytes;
+                check(stream.allocation.ledger.holdable_cap > 0 && whole <= stream.allocation.ledger.holdable_cap,
+                      "streamed, could be held whole: whole on the device stays inside what the stream may hold",
+                      std::to_string(whole >> 20) + " MiB against " +
+                          std::to_string(stream.allocation.ledger.holdable_cap >> 20));
+            }
+            // Less memory than that: the stream, as before, with nothing asked of the load.
+            HardwareProfile small = laptop;
+            small.residency_budget = budget - 4 * GiB;
+            check(streams(plan_run(base_cfg(), small, model, shared, PlanRequest{}, defaults)),
+                  "streamed, the whole model past what the stream holds: streamed, and nothing else");
+            // What the first load measured then decides, by the load's own rule.
+            ModelProfile timed = model;
+            timed.knobs.set_device_answer("accel", 1);
+            timed.knobs.shared_device_tps = 40.0;
+            timed.knobs.no_shared_device_tps = 18.0;
+            const Plan kept = plan_run(base_cfg(), laptop, timed, shared, PlanRequest{}, defaults);
+            check(on_device(kept) && kept.config.trial.answer_device.empty() && kept.config.fallback,
+                  "streamed, the device measured faster: held whole on it at once, the stream still behind it");
+            timed.knobs.shared_device_tps = 12.0;
+            timed.knobs.no_shared_device_tps = 18.0;
+            check(streams(plan_run(base_cfg(), laptop, timed, shared, PlanRequest{}, defaults)),
+                  "streamed, the cores measured faster than the device: the stream, not the model whole on the cores");
+            // A device that lost this model here, by its answers or by failing to open, is not asked.
+            ModelProfile refused = model;
+            refused.knobs.set_device_answer("accel", -1);
+            check(streams(plan_run(base_cfg(), laptop, refused, shared, PlanRequest{}, defaults)),
+                  "streamed, the device's answers differed here: the stream");
+            ModelProfile failed = model;
+            failed.knobs.shared_device_unviable = MeasuredKnobs::unviable_max;
+            check(streams(plan_run(base_cfg(), laptop, failed, shared, PlanRequest{}, defaults)),
+                  "streamed, the device could not open the model here: the stream");
+            // A caller who asked for the stream, or a device that has not shown the cores' results, keeps it.
+            PlanRequest asked;
+            asked.pinned = {"moe-stream"};
+            RunConfig streamed_cfg = base_cfg();
+            streamed_cfg.moe.enabled = true;
+            check(streams(plan_run(streamed_cfg, laptop, model, shared, asked, defaults)),
+                  "streamed by the caller: left alone");
+            HardwareProfile unshown = laptop;
+            for (ComputeDevice & d : unshown.devices)
+                if (!d.is_cpu) d.wide_identity_ok = Tri::Unknown;
+            check(streams(plan_run(base_cfg(), unshown, model, shared, PlanRequest{}, defaults)),
+                  "streamed, a device not shown to compute a prompt as the cores do: the stream");
+        }
+
+        // A model with no experts is asked the same question.
+        ModelProfile dense;
+        dense.arch = "llama";
+        dense.ok = true;
+        dense.is_moe = false;
+        dense.n_layer = 32;
+        dense.file_bytes = dense.dense_bytes = 5 * GiB;
+        const Plan dp = plan_run(base_cfg(), roomy, dense, shared, PlanRequest{}, PlannerPolicy::defaults());
+        check(dp.regime == Regime::NotMoe && dp.config.trial.answer_device == "accel" &&
+                  dp.config.trial.answer_prompt_per_token >= 0.0f && dp.config.n_gpu_layers == 33,
+              "shared device, a dense model held in memory: asked the same way, the load times both sides");
+        dense.knobs.shared_device_tps = 27.0;
+        dense.knobs.no_shared_device_tps = 21.0;
+        dense.knobs.mix_requests = 4000;
+        dense.knobs.mix_gen_tokens = 400;
+        const Plan dm = plan_run(base_cfg(), roomy, dense, shared, PlanRequest{}, PlannerPolicy::defaults());
+        check(dm.config.n_gpu_layers == 33 && dm.config.device_split.size() == 1,
+              "shared device, a dense model measured faster on the device: every layer moves");
+
+        // A dense model the cores hold without the room residency asks beside it: the cores hold it
+        // all the same, so the question is still asked, against what the move adds to this pool.
+        {
+            ModelProfile snug_model = dense;
+            snug_model.knobs = MeasuredKnobs{};
+            HardwareProfile snug = roomy;
+            snug.residency_budget = 8 * GiB; // the model fits, not with as much again beside it
+            HardwareProfile snug_in_place = snug;
+            for (ComputeDevice & d : snug_in_place.devices)
+                if (!d.is_cpu) d.host_ptr_buffers = d.host_ptr_verified = Tri::Yes;
+            const Plan asked =
+                plan_run(base_cfg(), snug_in_place, snug_model, shared, PlanRequest{}, PlannerPolicy::defaults());
+            const Decision * da = find(asked, "shared-device");
+            check(asked.regime == Regime::NotMoe && asked.config.trial.answer_device == "accel" && da &&
+                      da->value == "accel",
+                  "shared device, a dense model short of residency's room, weights read in place: still asked, "
+                  "and the load decides",
+                  da ? da->reason : "no line");
+            // Copied, the weights become this process's memory: the move adds them, and the bar is on that.
+            const Plan copied =
+                plan_run(base_cfg(), snug, snug_model, shared, PlanRequest{}, PlannerPolicy::defaults());
+            const Decision * dc = find(copied, "shared-device");
+            check(on_cores(copied) && copied.config.trial.shared_device_side == -1 && dc && dc->value == "cpu" &&
+                      dc->reason.find("what the move adds") != std::string::npos,
+                  "shared device, a dense model short of room for a copy of its weights: refused, and said",
+                  dc ? dc->reason : "no line");
+            // Past what this process may hold at all: refused, and said, never silent.
+            HardwareProfile small = snug_in_place;
+            small.residency_budget = 4 * GiB;
+            const Plan over = plan_run(base_cfg(), small, snug_model, shared, PlanRequest{}, PlannerPolicy::defaults());
+            const Decision * dov = find(over, "shared-device");
+            check(on_cores(over) && dov && dov->value == "cpu" && dov->reason.find("past the") != std::string::npos,
+                  "shared device, a dense model past what may be held: refused, and said",
+                  dov ? dov->reason : "no line");
+        }
+
+        // Elsewhere nothing changes: a device with memory of its own goes through the fitter, and a
+        // model that streams has no whole model to move.
+        HardwareProfile big = desktop();
+        big.residency_budget = 64 * GiB;
+        big.memory_total = 64 * GiB;
+        const Plan disc = plan_run(base_cfg(), big, model, PlanRequest{});
+        check(!find(disc, "shared-device") && disc.config.trial.shared_device_side == -1,
+              "a device with memory of its own: not this question");
+        const Plan streams = plan_run(base_cfg(), unified(), model, shared, PlanRequest{}, PlannerPolicy::defaults());
+        check(streams.regime != Regime::Fits && !find(streams, "shared-device"),
+              "shared device, the model streams: not this question");
     }
 
     // Informational: the rationale as a user would read it. Printed rather than asserted, because
@@ -2102,12 +3713,32 @@ int main() {
             return plan_run(base_cfg(), h, model, pl, r, PlannerPolicy::defaults());
         };
 
+        // A device expert cache computes the experts on the device: a long context's graph is held to
+        // the device's bound (#533) even where the host's memory would take it whole.
+        {
+            RunConfig long_cfg = base_cfg();
+            long_cfg.n_ctx = 32768;
+            Placement half_long = half;
+            half_long.n_ctx = 32768;
+            half_long.compute_width = 8192;
+            half_long.host_compute_per_token = 1 * KiB;
+            half_long.raw_host_compute_bytes = 8192ull * KiB;
+            const Plan cached = plan_run(long_cfg, card, model, half_long, PlanRequest{}, PlannerPolicy::defaults());
+            const Decision * dw = find(cached, "ubatch");
+            check(cached.config.moe.device_cache_mb > 0 &&
+                      (uint32_t) cached.config.graph_width() == PlannerPolicy::defaults().ubatch_max_device && dw &&
+                      dw->reason.find("#533") != std::string::npos,
+                  "width, device expert cache: the graph is held to the device's bound",
+                  std::to_string(cached.config.moe.device_cache_mb) + " MiB cache, " +
+                      std::to_string(cached.config.graph_width()) + (dw ? ": " + dw->reason : std::string()));
+        }
+
         // No record of the routing yet: the cache still goes on the faster processor, and fills from use
         // as the RAM cache does. A record is what says how much of a token it serves, not whether.
         const Plan linear = plan_on(card, half, PlanRequest{});
         const Decision * d = find(linear, "device-cache-mb");
         check(d && d->source == Source::Measured && linear.config.moe.device_cache_mb == (int) (9 * 1024) &&
-                  d->reason.find("the fraction of the expert set it holds") != std::string::npos,
+                  d->reason.find("the prior in token cycles") != std::string::npos,
               "device tier, no record: the cache is on the faster processor all the same", d ? d->reason : "none");
         check(linear.config.buft_overrides.size() == model.n_layer && !linear.config.moe.record_unstreamed,
               "device tier, no record: every layer's experts on the host, nothing recorded for a price");
@@ -2145,7 +3776,7 @@ int main() {
             ModelProfile seeing = model;
             seeing.projector_bytes = 1 * GiB;
             const Plan v = plan_run(base_cfg(), card, seeing, half, PlanRequest{}, PlannerPolicy::defaults());
-            check(v.config.moe.device_cache_mb == (int) (8 * 1024) && !ledger_row(v, "projector"),
+            check(v.config.moe.device_cache_mb == (int) (8 * 1024) && !ledger_row(v, LedgerKind::Projector),
                   "device tier, projector: the device cache is smaller by it, and the host holds none",
                   std::to_string(v.config.moe.device_cache_mb) + " MiB");
 
@@ -2156,7 +3787,7 @@ int main() {
             reserved.device_bytes += 1 * GiB;
             const Plan r = plan_run(base_cfg(), card, seeing, reserved, PlanRequest{}, PlannerPolicy::defaults());
             const Decision * pn = find(r, "placement");
-            check(r.config.moe.device_cache_mb == (int) (9 * 1024) && !ledger_row(r, "projector"),
+            check(r.config.moe.device_cache_mb == (int) (9 * 1024) && !ledger_row(r, LedgerKind::Projector),
                   "device tier, projector reserved by the fitter: the cache is whole, charged once, no host row",
                   std::to_string(r.config.moe.device_cache_mb) + " MiB");
             // The experts' bytes became the cache: what the device still holds is the dense part and
@@ -2172,7 +3803,7 @@ int main() {
             part.n_gpu_layers = (int32_t) model.n_layer - 8;
             const Plan q = plan_run(base_cfg(), card, seeing, part, PlanRequest{}, PlannerPolicy::defaults());
             pn = find(q, "placement");
-            check(q.config.moe.device_cache_mb == 0 && !ledger_row(q, "projector") &&
+            check(q.config.moe.device_cache_mb == 0 && !ledger_row(q, LedgerKind::Projector) &&
                       q.config.n_gpu_layers == part.n_gpu_layers,
                   "device tier, partial placement with a projector: no tier, no host row, the fitter's layers stand",
                   std::to_string(q.config.moe.device_cache_mb) + " MiB, " + std::to_string(q.config.n_gpu_layers) +
@@ -2180,6 +3811,24 @@ int main() {
             check(pn && pn->reason.find("on devices " + std::to_string(13 * 1024) + " MiB") != std::string::npos,
                   "device tier, partial placement with a projector: counted on the device once",
                   pn ? pn->reason : "none");
+            // And the plan says why no cache was armed, rather than saying nothing.
+            const Decision * dq = find(q, "device-cache-mb");
+            check(dq && dq->value == "0" && dq->source == Source::Derived &&
+                      dq->reason.find("dense parts are on the host") != std::string::npos,
+                  "device tier, partial placement: the plan says the dense parts are not all on the device",
+                  dq ? dq->reason : "no decision");
+
+            // One slot short is partial too. llama.cpp counts n_layer + 1 slots, the output last, and
+            // fills the devices from the top: n_layer of them leaves the first block on the host,
+            // dense part and all, so a cache on the device would be crossed to on every token.
+            Placement one_short = reserved;
+            one_short.n_gpu_layers = (int32_t) model.n_layer;
+            const Plan os = plan_run(base_cfg(), card, seeing, one_short, PlanRequest{}, PlannerPolicy::defaults());
+            const Decision * ds = find(os, "device-cache-mb");
+            check(os.config.moe.device_cache_mb == 0 && ds && ds->value == "0" &&
+                      ds->reason.find("dense parts are on the host") != std::string::npos,
+                  "device tier, one slot short: the first block's dense part is on the host, so no tier",
+                  ds ? std::to_string(os.config.moe.device_cache_mb) + " MiB: " + ds->reason : "no decision");
 
             // A device whose memory is the host's: the fitter's placement is set aside, and the
             // projector is a row of the host's ledger, as on a machine with no device at all.
@@ -2187,7 +3836,7 @@ int main() {
             aside.shared_memory_placement = true;
             aside.device_bytes = 3 * GiB;
             const Plan sh = plan_run(base_cfg(), phone(), seeing, aside, PlanRequest{}, PlannerPolicy::defaults());
-            const LedgerRow * pr = ledger_row(sh, "projector");
+            const LedgerRow * pr = ledger_row(sh, LedgerKind::Projector);
             check(pr && pr->bytes == 1 * GiB && sh.config.moe.device_cache_mb == 0,
                   "shared-memory device, projector: a host row of its size, no device cache");
         }
@@ -2225,6 +3874,170 @@ int main() {
                   "device tier, a front-end's default overlap: off beside the cache", od ? od->reason : "none");
         }
         check(validate(tier.config).ok, "device tier, cache faster: a valid config", validate(tier.config).error);
+
+        // Decided by calculation: each side at its measurement where a load timed it, at its price from
+        // the probed rates otherwise; the load serves the faster and times its own decode as it serves
+        // (MeasuredKnobs::device_cache_tps). No load is opened to try a side.
+        {
+            const auto tier_on = [&](const HardwareProfile & h, const MeasuredKnobs & k) {
+                ModelProfile mm = model;
+                mm.knobs = k;
+                return plan_run(base_cfg(), h, mm, half, PlanRequest{}, PlannerPolicy::defaults());
+            };
+            // Nothing measured: the cache is priced far past the fitter's ceiling (13.4 tok/s: its 24
+            // host layers' experts, 291.5 MiB a token, at the host's 4 GiB/s, the rest at the card's 881).
+            check(tier.config.trial.device_tier == 1,
+                  "device tier, nothing measured: the cache is priced faster, served, and timed as it serves",
+                  std::to_string(tier.config.trial.device_tier));
+            // The same machine over a link that makes every miss the whole token: the fitter's
+            // placement is priced faster, so it is the first load's, with no load spent on the cache.
+            HardwareProfile dial_up = slow_cores;
+            dial_up.devices[0].upload_gibs = 0.05;
+            dial_up.devices[0].upload_host_buffer_gibs = 0.0;
+            const Plan fitter_first = tier_on(dial_up, MeasuredKnobs{});
+            const Decision * e = find(fitter_first, "device-cache-mb");
+            check(fitter_first.config.moe.device_cache_mb == 0 && fitter_first.config.trial.device_tier == 0 &&
+                      fitter_first.config.buft_overrides.size() == 24 && e && e->source == Source::Derived &&
+                      e->reason.find("priced from the probed rates") != std::string::npos,
+                  "device tier, nothing measured, misses too slow to upload: the fitter's placement is served first",
+                  e ? e->reason : "no decision");
+            check(validate(fitter_first.config).ok, "device tier, the fitter's placement first: a valid config",
+                  validate(fitter_first.config).error);
+
+            // The cache measured on a load at 1.6 tok/s, under the fitter's price by the margin: the
+            // next load serves the fitter's placement and times it.
+            MeasuredKnobs once;
+            once.device_cache_tps = 1.6;
+            const Plan second = tier_on(slow_cores, once);
+            e = find(second, "device-cache-mb");
+            check(second.config.moe.device_cache_mb == 0 && second.config.trial.device_tier == 0 &&
+                      second.config.buft_overrides.size() == 24 && e && e->source == Source::Derived &&
+                      e->reason.find("1.60 tok/s with a device cache (measured on a load here) against 6.7") !=
+                          std::string::npos,
+                  "device tier, the cache measured under the fitter's price: the fitter's placement is served",
+                  e ? e->reason : "no decision");
+            check(validate(second.config).ok, "device tier, second load: a valid config",
+                  validate(second.config).error);
+            // The placement is priced at half its ceiling (6.7 tok/s), what such placements were measured
+            // to reach. Measured at 20, or at 15, the cache is past it: it stays, nothing is timed again,
+            // and no load runs the slower side. At 5 (5.5 with the margin) the placement's price is past it.
+            for (double tps : {20.0, 15.0}) {
+                MeasuredKnobs fast;
+                fast.device_cache_tps = tps;
+                const Plan untimed = tier_on(slow_cores, fast);
+                e = find(untimed, "device-cache-mb");
+                check(untimed.config.moe.device_cache_mb > 0 && untimed.config.trial.device_tier == -1 && e &&
+                          e->reason.find("not past the 10% margin") != std::string::npos && validate(untimed.config).ok,
+                      "device tier, the cache measured past the fitter's price: kept, the other side never opened",
+                      e ? e->reason : "no decision");
+            }
+            MeasuredKnobs under;
+            under.device_cache_tps = 5.0;
+            check(tier_on(slow_cores, under).config.trial.device_tier == 0,
+                  "device tier, the cache measured under the fitter's price by the margin: the fitter's placement");
+
+            // A cache measured at 5.8 (6.4 with the margin) is under the placement's 6.7 where the host
+            // holds the experts the fitter leaves it. On a host whose memory does not, they stream, a
+            // token also waits on flash for them, and the placement's price with those reads is no
+            // longer past the cache. Priced on compute alone, an 8 GB card served the fitter's placement
+            // for a load at 3.5 tok/s where its price said 11.
+            MeasuredKnobs near_cache;
+            near_cache.device_cache_tps = 5.8;
+            HardwareProfile tight_host = slow_cores;
+            tight_host.residency_budget = 3 * GiB;
+            const Plan streams = tier_on(tight_host, near_cache);
+            e = find(streams, "device-cache-mb");
+            check(tier_on(slow_cores, near_cache).config.trial.device_tier == 0 &&
+                      streams.config.moe.device_cache_mb > 0 && streams.config.trial.device_tier == -1,
+                  "device tier, the fitter's experts stream on this host: its flash reads are in its price",
+                  e ? e->reason : "no decision");
+
+            MeasuredKnobs lost = once;
+            lost.no_device_cache_tps = 3.94; // the fitter's placement decoded 2.5x faster
+            const Plan third = tier_on(slow_cores, lost);
+            e = find(third, "device-cache-mb");
+            check(third.config.moe.device_cache_mb == 0 && third.config.trial.device_tier == -1 &&
+                      third.config.buft_overrides.size() == 24 && e && e->source == Source::Measured &&
+                      e->reason.find("1.60 tok/s with a device cache (measured on a load here) against 3.94") !=
+                          std::string::npos,
+                  "device tier, the fitter's placement measured faster: it is kept, and the plan says by how much",
+                  e ? e->reason : "no decision");
+            // The fitter's placement measured, the cache only priced: its price past the measurement by
+            // the margin brings the cache back, timed as it serves.
+            MeasuredKnobs fitter_only;
+            fitter_only.no_device_cache_tps = 30.0;
+            const Plan back = tier_on(slow_cores, fitter_only);
+            check(back.config.moe.device_cache_mb > 0 && back.config.trial.device_tier == 1,
+                  "device tier, the fitter's placement measured under the cache's price: the cache, timed");
+
+            MeasuredKnobs won;
+            won.device_cache_tps = 17.5;
+            won.no_device_cache_tps = 9.9;
+            const Plan kept = tier_on(slow_cores, won);
+            e = find(kept, "device-cache-mb");
+            check(kept.config.moe.device_cache_mb > 0 && kept.config.trial.device_tier == -1 && e &&
+                      e->reason.find("17.50 tok/s with a device cache (measured on a load here)") != std::string::npos,
+                  "device tier, the cache measured faster: armed, nothing timed again", e ? e->reason : "no decision");
+
+            MeasuredKnobs tie;
+            tie.device_cache_tps = 10.0;
+            tie.no_device_cache_tps = 10.5; // inside the margin: the cache holds
+            const Plan held = tier_on(slow_cores, tie);
+            check(held.config.moe.device_cache_mb > 0 && held.config.trial.device_tier == -1,
+                  "device tier, the two inside the margin: the cache holds");
+
+            // The device cache's CPU share is a person's setting: the plan uploads every miss, names no
+            // side for it, and says how to set it, on a machine where a price used to nominate one (a
+            // host at 66 GiB/s behind a link at 3).
+            {
+                HardwareProfile slow_link = card;
+                slow_link.devices[0].upload_gibs = 3.0;
+                slow_link.devices[0].host_hop_seconds = 58e-6;
+                const Plan uploaded = tier_on(slow_link, won);
+                const Decision * sd = find(uploaded, "device-cache-cpu-share");
+                check(uploaded.config.moe.device_cache_mb > 0 && uploaded.config.moe.device_cache_cpu_share == 0.0f &&
+                          sd && sd->source == Source::Policy && sd->reason.find("sets it by hand") != std::string::npos,
+                      "cpu share: never the plan's, every miss uploaded, and the plan says how to set it",
+                      sd ? sd->reason : "no decision");
+                PlanRequest pin_share;
+                pin_share.pinned.push_back("device-cache-cpu-share");
+                RunConfig with_share = base_cfg();
+                with_share.moe.device_cache_cpu_share = 0.5f;
+                ModelProfile mm = model;
+                mm.knobs = won;
+                const Plan asked = plan_run(with_share, slow_link, mm, half, pin_share, PlannerPolicy::defaults());
+                check(asked.config.moe.device_cache_cpu_share == 0.5f,
+                      "cpu share: a share the person set is kept as set");
+            }
+
+            // A caller who placed it is not measured against.
+            PlanRequest pin;
+            pin.pinned.push_back("device-cache-mb");
+            const Plan pinned = plan_run(base_cfg(), slow_cores, model, half, pin, PlannerPolicy::defaults());
+            check(pinned.config.trial.device_tier == -1, "device tier, pinned by the caller: nothing timed");
+
+            // A side that failed to open here as often as a plan lets it loses; once is the machine's
+            // moment, and the price still decides.
+            MeasuredKnobs no_cache;
+            no_cache.device_cache_unviable = 1;
+            check(tier_on(slow_cores, no_cache).config.moe.device_cache_mb > 0,
+                  "device tier, the cache failed to open once: still the plan's, on its price");
+            no_cache.device_cache_unviable = MeasuredKnobs::unviable_max;
+            const Plan fitter_kept = tier_on(slow_cores, no_cache);
+            e = find(fitter_kept, "device-cache-mb");
+            check(fitter_kept.config.moe.device_cache_mb == 0 && fitter_kept.config.trial.device_tier == -1 &&
+                      fitter_kept.config.buft_overrides.size() == 24 && e && e->source == Source::Measured,
+                  "device tier, the cache could not be opened: the fitter's placement, nothing timed",
+                  e ? e->reason : "no decision");
+            MeasuredKnobs no_fitter = once; // the cache measured under the ceiling, the other side unopenable
+            no_fitter.no_device_cache_unviable = MeasuredKnobs::unviable_max;
+            const Plan cache_kept = tier_on(slow_cores, no_fitter);
+            e = find(cache_kept, "device-cache-mb");
+            check(cache_kept.config.moe.device_cache_mb > 0 && cache_kept.config.trial.device_tier == -1 && e &&
+                      e->reason.find("failed") != std::string::npos,
+                  "device tier, the fitter's placement could not be opened: the cache, nothing timed",
+                  e ? e->reason : "no decision");
+        }
 
         // The device's rate unmeasured: nothing says it is the faster processor, and nothing moves.
         HardwareProfile no_rate = slow_cores;
@@ -2276,11 +4089,23 @@ int main() {
             const Plan level_hb = plan_on(hb, half, PlanRequest{});
             check(level_hb.config.moe.expert_host_buffer.empty(),
                   "expert host buffer: inside the margin, the mapping stays");
+            // The copy takes the place of the mapped experts the host is already charged for: a host with
+            // room for the model and not for the experts twice still takes it, and says it holds them once.
+            // Charged twice, every 64 GB machine a 32 GB expert set ran on refused the copy and uploaded
+            // its misses at half the rate.
             hb.devices[0].upload_host_buffer_gibs = 48.0;
             hb.residency_budget = model.file_bytes + model.expert_bytes / 2;
             const Plan tight = plan_on(hb, half, PlanRequest{});
-            check(tight.config.moe.expert_host_buffer.empty(),
-                  "expert host buffer: a copy the host cannot hold is not made");
+            const Decision * et = find(tight, "expert-host-buffer");
+            check(tight.regime == Regime::Fits && tight.config.moe.expert_host_buffer == "discrete" && et &&
+                      et->reason.find("takes the place") != std::string::npos,
+                  "expert host buffer: the copy replaces the mapped experts, it is not charged beside them",
+                  et ? et->reason : "no decision");
+            // Short of room for the model itself, nothing is resident to copy from: no copy.
+            hb.residency_budget = model.dense_bytes * 2;
+            const Plan streamed = plan_on(hb, half, PlanRequest{});
+            check(streamed.regime != Regime::Fits && streamed.config.moe.expert_host_buffer.empty(),
+                  "expert host buffer: a host that cannot hold the model makes no copy");
         }
 
         // The cache is sized from the card's free memory, not from the fitter's whole layers: what the
@@ -2323,16 +4148,131 @@ int main() {
                       e->reason.find("token cycle") != std::string::npos,
                   "device tier, under one token cycle: no cache", e ? e->reason : "none");
 
-            // Two cards: llama.cpp hands each a share of one budget by its layers, so the budget is
-            // what the card with the least spare per layer can take its share of.
+            // Two cards: llama.cpp hands each a share of one budget by its layers, so the layers and the
+            // budget are decided together. Each card's room under the cache is what it had free, the
+            // experts the fitter put on it and its layers' dense part and context; every card must
+            // hold its layers' dense part and its share of the budget within that room.
+            const double dense_layer =
+                (double) (model.group(WeightGroup::Attention).bytes + model.group(WeightGroup::DenseFfn).bytes +
+                          model.group(WeightGroup::Other).bytes) /
+                (double) model.n_layer;
+            const auto fits_every_card = [&](const Plan & p, const std::vector<double> & room) {
+                uint32_t layers = 0;
+                for (const auto & e : p.config.device_split)
+                    layers += (uint32_t) e.second;
+                layers -= 1; // the output's slot
+                const double budget = (double) p.config.moe.device_cache_mb * (double) MiB;
+                for (size_t i = 0; i < p.config.device_split.size(); ++i) {
+                    const double n = (double) p.config.device_split[i].second - (i + 1 == room.size() ? 1 : 0);
+                    if (n * dense_layer + budget * n / layers > room[i] + (double) MiB) return false;
+                }
+                return true;
+            };
             Placement two = half;
             two.device_split = {{"discrete", 37}, {"second", 12}};
             two.device_spare = {{"discrete", 6 * GiB}, {"second", 1 * GiB}};
             const Plan pair = plan_on(slow_cores, two, PlanRequest{});
-            const uint64_t want = 9 * GiB + (uint64_t) ((double) GiB * 49.0 / 12.0);
-            check(pair.config.moe.device_cache_mb == (int) (want / MiB),
-                  "device tier, two cards: the budget each card can take its share of",
-                  std::to_string(pair.config.moe.device_cache_mb) + " MiB, want " + std::to_string(want / MiB));
+            // Layers 0-36 on the first (24 with their experts home, 13 whole), 37-47 and the output on
+            // the second (11 whole): the fitter's 9 GiB of experts over its 24 whole layers.
+            const double per_whole = 9.0 * (double) GiB / 24.0;
+            const std::vector<double> room = {6.0 * GiB + 13 * per_whole + 37 * dense_layer,
+                                              1.0 * GiB + 11 * per_whole + 11 * dense_layer};
+            const double kept_budget =
+                std::min((room[0] - 37 * dense_layer) * 48 / 37, (room[1] - 11 * dense_layer) * 48 / 11);
+            check(fits_every_card(pair, room) && pair.config.moe.device_cache_mb > (int) (kept_budget / MiB) &&
+                      pair.config.moe.device_cache_mb <= (int) (16 * 1024),
+                  "device tier, two cards: every card holds its share, more than the fitter's split allowed",
+                  std::to_string(pair.config.moe.device_cache_mb) + " MiB against " +
+                      std::to_string((int) (kept_budget / MiB)));
+            const Decision * ds = find(pair, "device-split");
+            check(ds && pair.config.device_split.size() == 2 && pair.config.device_split[0].second != 37 &&
+                      pair.config.device_split[0].second + pair.config.device_split[1].second == 49 &&
+                      validate(pair.config).ok,
+                  "device tier, two cards: the layers follow the room, every slot still placed",
+                  ds ? ds->reason : "no device-split decision");
+
+            // The case it is for: two equal cards, the fitter's whole layers all on the first (its room
+            // is their experts) and dense-only layers on the second. With the fitter's split the first
+            // card's share was its 6 layers' worth of the budget, and most of the card stayed empty.
+            Placement lopsided = half;
+            lopsided.host_expert_layers.clear();
+            for (uint32_t il = 6; il < model.n_layer; ++il)
+                lopsided.host_expert_layers.push_back(il);
+            lopsided.override_patterns.assign(lopsided.all_expert_patterns.begin() + 6,
+                                              lopsided.all_expert_patterns.end());
+            lopsided.device_split = {{"discrete", 6}, {"second", (uint32_t) model.n_layer + 1 - 6}};
+            lopsided.device_spare = {{"discrete", 256 * MiB}, {"second", 4 * GiB}};
+            const Plan even = plan_on(slow_cores, lopsided, PlanRequest{});
+            const uint64_t six = model.expert_bytes / model.n_moe_layer * 6;
+            const std::vector<double> room2 = {256.0 * MiB + (double) six + 6 * dense_layer,
+                                               4.0 * GiB + (double) (model.n_layer - 6) * dense_layer};
+            const double kept2 =
+                std::min((room2[0] - 6 * dense_layer) * model.n_layer / 6,
+                         (room2[1] - (model.n_layer - 6) * dense_layer) * model.n_layer / (model.n_layer - 6));
+            check(fits_every_card(even, room2) && even.config.moe.device_cache_mb > (int) (kept2 / MiB) &&
+                      even.config.device_split[0].second > 6,
+                  "device tier, whole layers on one card: the split follows the room the cache leaves",
+                  std::to_string(even.config.moe.device_cache_mb) + " MiB against " +
+                      std::to_string((int) (kept2 / MiB)));
+
+            // The layers a card takes on are loaded before any cache is made, with nothing to fall back
+            // on: each is charged the file's largest dense layer, so a file whose layers differ cannot
+            // push the card that takes them past its memory. A card's room for its share is what it
+            // holds for the cache (free beyond the fitter's projection and the experts it held), less
+            // the bound for each layer it takes on.
+            {
+                ModelProfile uneven = model;
+                uneven.largest_layer_dense_bytes = (uint64_t) (3.0 * dense_layer);
+                const Plan safe =
+                    plan_run(base_cfg(), slow_cores, uneven, lopsided, PlanRequest{}, PlannerPolicy::defaults());
+                const double layers = (double) model.n_layer;
+                const double budget = (double) safe.config.moe.device_cache_mb * (double) MiB;
+                const double hold[2] = {256.0 * MiB + (double) six, 4.0 * GiB};
+                const uint32_t had[2] = {6, model.n_layer - 6};
+                bool fits = safe.config.device_split.size() == 2;
+                for (size_t i = 0; fits && i < 2; ++i) {
+                    const double n = (double) safe.config.device_split[i].second - (i == 1 ? 1 : 0);
+                    const double moved = n - (double) had[i];
+                    const double charged =
+                        moved > 0 ? moved * (double) uneven.largest_layer_dense_bytes : moved * dense_layer;
+                    fits = budget * n / layers + charged <= hold[i] + (double) MiB;
+                }
+                check(fits && safe.config.moe.device_cache_mb > 0,
+                      "device tier, layers of different sizes: a card takes on layers at the largest one's size",
+                      std::to_string(safe.config.device_split[0].second) + "/" +
+                          std::to_string(safe.config.device_split[1].second) + ", " +
+                          std::to_string(safe.config.moe.device_cache_mb) + " MiB");
+
+                // Where the file's per-layer bytes are known, the layers a card takes on are charged
+                // exactly: the split is contiguous, so it names them. Layer 0, on the first card, is the
+                // heavy one; the first card takes on layers from 6 up, of the average size, and is not
+                // charged layer 0's size for each.
+                ModelProfile known = uneven;
+                const double avg = dense_layer;
+                known.layer_dense_bytes.assign(model.n_layer, (uint64_t) avg);
+                known.layer_dense_bytes[0] = (uint64_t) (3.0 * avg);
+                const Plan exact_plan =
+                    plan_run(base_cfg(), slow_cores, known, lopsided, PlanRequest{}, PlannerPolicy::defaults());
+                const double eb = (double) exact_plan.config.moe.device_cache_mb * (double) MiB;
+                bool exact_fits = exact_plan.config.device_split.size() == 2;
+                uint32_t at = 0;
+                const uint32_t had_from[2] = {0, 6};
+                for (size_t i = 0; exact_fits && i < 2; ++i) {
+                    const uint32_t n = exact_plan.config.device_split[i].second - (i == 1 ? 1 : 0);
+                    double now = 0.0, before = 0.0;
+                    for (uint32_t il = at; il < at + n; ++il)
+                        now += (double) known.layer_dense_bytes[il];
+                    for (uint32_t il = had_from[i]; il < had_from[i] + had[i]; ++il)
+                        before += (double) known.layer_dense_bytes[il];
+                    exact_fits = eb * n / layers + (now - before) <= hold[i] + (double) MiB;
+                    at += n;
+                }
+                check(exact_fits && exact_plan.config.moe.device_cache_mb > safe.config.moe.device_cache_mb,
+                      "device tier, per-layer bytes known: the layers moved are charged exactly, and the cache is "
+                      "larger than under the bound",
+                      std::to_string(exact_plan.config.moe.device_cache_mb) + " MiB against " +
+                          std::to_string(safe.config.moe.device_cache_mb));
+            }
         }
 
         // The caller's placement is the caller's.
@@ -2409,6 +4349,12 @@ int main() {
         d = find(home, "device-layers");
         check(d && d->value == "40 home" && d->source == Source::Measured,
               "device crossing, slow link: the dense-only layers come home", d ? d->reason : "none");
+        // The account is what was measured, then the one outcome: the clause the ranking wrote before it
+        // funded the move is not carried along.
+        check(d && d->reason.rfind("measured, ", 0) == 0 &&
+                  d->reason.find("; they come onto the host whole, for ") != std::string::npos &&
+                  d->reason.find("did not fund") == std::string::npos,
+              "device crossing, slow link: the account carries one outcome", d ? d->reason : "none");
         check(home.config.n_gpu_layers == 9 && home.config.buft_overrides.empty() &&
                   home.config.device_split.size() == 1 && home.config.device_split[0].second == 9,
               "device crossing, slow link: the card keeps its whole layers at the top, nothing overridden",
@@ -2430,6 +4376,10 @@ int main() {
         d = find(kept, "device-layers");
         check(d && d->value == "40 split" && kept.config.n_gpu_layers == split.n_gpu_layers,
               "device crossing, no room: the layers stay split", d ? d->reason : "none");
+        check(d && d->reason.rfind("measured, ", 0) == 0 &&
+                  d->reason.find("; bringing them home costs the host ") != std::string::npos &&
+                  d->reason.find("did not fund") != std::string::npos,
+              "device crossing, no room: the account says what the ranking did not fund", d ? d->reason : "none");
 
         // Unmeasured, nothing moves, and the plan says what it was owed.
         HardwareProfile blind = slow;
@@ -2557,6 +4507,28 @@ int main() {
         pinned.pinned = {"devices"};
         check(plan_run(base_cfg(), two, model, pinned).config.device_list.empty(),
               "backends: the caller's devices are the caller's");
+
+        // An integrated GPU beside the card: the choice keeps it (it is a card of its own), and the
+        // fitter must not be asked of it, or one layer there sets the card's placement aside too.
+        HardwareProfile igpu = two;
+        ComputeDevice shared;
+        shared.name = "Vulkan1";
+        shared.physical_id = "0000:7a:00.0";
+        shared.memory_total = 16 * GiB;
+        shared.memory_free = 15 * GiB;
+        shared.shares_host_memory = Tri::Yes;
+        shared.expert_gibs = 40.0;
+        igpu.devices.push_back(shared);
+        const BackendChoice with_igpu = choose_backends(igpu, 0.10);
+        check(with_igpu.keep == std::vector<std::string>{"Vulkan0", "Vulkan1"},
+              "backends: an integrated GPU is a card of its own and stays in the choice");
+        check(capacity_devices(igpu, with_igpu.keep) == std::vector<std::string>{"Vulkan0"},
+              "capacity: the fitter is asked of the card with memory of its own, not of the integrated GPU");
+        HardwareProfile only_shared;
+        only_shared.devices.push_back(shared);
+        check(capacity_devices(only_shared, {"Vulkan1"}) == std::vector<std::string>{"Vulkan1"},
+              "capacity: with no device of its own memory the list is left as it is");
+        check(capacity_devices(igpu, {}).empty(), "capacity: an empty list stays empty (llama.cpp's default)");
     }
 
     // ── no device of its own: the new facts change nothing they do not measure ──────────────────

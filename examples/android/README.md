@@ -26,7 +26,8 @@ Each [release](https://github.com/Helldez/BigMoeOnEdge/releases/latest) carries
 `app-dev-release.apk`, signed with the project's stable key, so each version installs over the
 previous one. Download it from the release page and open it; Android asks once to allow installs
 from the browser. `app-dev-debug.apk`, on the same page, is a debug build signed with another key: it
-cannot update the release one.
+cannot update the release one. Settings → Updates checks for a newer release when you press it
+and opens its page.
 
 ## Build
 
@@ -102,7 +103,17 @@ where it may write); Forget takes an entry added from a repository or a link off
 leaves its files. Catalog entries with nothing on the phone sit at the bottom as suggestions, and
 files that are not models (a projector, a draft head, by their headers) are listed apart with no
 Load. With nothing on the phone the screen is three steps (find, check it fits, download then
-load), and the app opens on it instead of an empty Chat.
+load).
+
+**First run.** When the first listing of a launch finds no model on the phone and none coming, the
+app opens on **Get started** instead of an empty Chat (the web UI's first run): the phone's memory and
+processor threads, then three steps whose number follows the model's state. **Pick a model**: every
+catalog model, the smallest first, the one picked checked by the server before its download
+(`POST /api/models/inspect`: one plain sentence, in the server's colour), and Download (or Resume). **Download**: progress, the time left over a 20 s window ("about
+12 min left · 8.4 MB/s"), and Pause; a paused download stays on this step, with Resume and Pick
+another model. **Start**: the model loads by itself when the download ends, and
+the conversation opens once the engine reports it ready, with three questions to try. Under it: pick
+a gguf already on the phone, Models, or Skip for now.
 
 The list covers the engine's own directory (the app's internal storage, where in-app downloads and
 imports land) and the other places a model can sit on the phone, which the app hands the server at
@@ -112,7 +123,8 @@ live**, at the foot of the screen, names them. The server groups split sets, rea
 architecture, says whether this build streams it and whether the file is a model at all; the app
 reads no gguf itself. Nothing below needs a storage permission except the last option.
 
-1. **Built-in catalog** (both flavors): the models this engine is measured on, one tap each. The
+1. **Built-in catalog** (both flavors): six models from 5 GB to 300 GB, a small dense one that runs
+   whole in memory up to MoE models whose experts stream, one tap each. The
    catalog is the project's one data file, `catalog/models.json`, shipped in the APK and read by
    the server; the app does the transfers itself (a phone has no `curl` for the server to run), in
    a foreground worker that survives the app being killed and resumes an interrupted transfer.
@@ -152,7 +164,7 @@ server deletes the entry's `.part` files, in its models directory only). These a
 UI's words and behaviour too (`docs/server-api.md`, "Models"). A link an older build downloaded on
 its own, with no entry, has no row to resume from, so its **Cancel** deletes its partial file.
 
-### Sharded models (gpt-oss-120b, DeepSeek V4 Flash, Qwen3.8-Flash-Next)
+### Sharded models (gpt-oss-120b, DeepSeek V4 Flash and V4.1 Flash, Qwen3.8-Flash-Next)
 
 Models above Hugging Face's 50 GB per-file limit ship as several shard files
 (`-00001-of-0000N.gguf`). The engine streams a split set natively: the repository listing shows
@@ -160,13 +172,14 @@ the set as one model by its first shard, the shards download one at a time (each
 row shows one progress bar over the set, and the model list offers the set once, by that first
 shard, which is the file the engine opens. For adb-pushed models push every
 shard to the same directory. Mind the space: DeepSeek V4 Flash UD-IQ2_M is ~91 GB on disk,
-Qwen3.8-Flash-Next UD-IQ3_XXS ~82 GB and its Q2_K build ~80 GB.
+Qwen3.8-Flash-Next UD-IQ3_XXS ~82 GB and the catalog's Q2_K build ~83 GB, and the catalog's
+DeepSeek V4.1 Flash Q2_K_S ~298 GB.
 
 Qwen3.8-Flash-Next needs **Dense weights = pinned** (pinned, dma-buf) in Settings. Its dense side is
 4.3 GB and every token walks it: with `anon` the kernel swaps it to zram and single tokens stall
 for 10-20 s, with `mmap` it is refaulted from flash every token. Its 51B n-gram table is held back
-automatically and stays mmap'd whatever the setting. The planner chooses this where it can; the
-catalog's Q2_K build has a 2.4 GB dense side instead, which is ~2 GB the expert cache can have back.
+automatically and stays mmap'd whatever the setting. The planner chooses this where it can. The
+catalog's Q2_K build keeps about as much in memory (4357 MiB by its header), so the same holds.
 
 ## Loading, and the plan
 
@@ -189,7 +202,8 @@ running; a value you set yourself in Settings is never overridden. With nothing 
 measured, it shows the decisions the settings carry from the last applied plan. A model is unloaded after ten
 idle minutes to give the phone its memory back; the next message reloads it.
 
-The status line above the navigation bar, on every screen, says what the engine is doing and shows
+The status line above the navigation bar, on every screen, says in words what the engine is doing
+(the loaded model's name and "Ready · private, on this phone", never a figure) and shows
 the running downloads ("Downloading 42%", or "2 downloads 42%"), which lead to Models. With "Serve
 on the network" on, or once a request was refused for the context, a loaded model whose context is
 below what a coding agent's first request needs gets a warning under it: the context, the server's
@@ -208,16 +222,31 @@ are plain chat, with no tools, no workspaces and no tasks. The agent is the desk
 on a phone is not one. The drawer lists the conversations, newest first, with a mark on one that is
 being answered; a row's menu renames or deletes it.
 
+- **The status line.** At the top of a conversation once it has begun, the logo beside one line of plain words from
+  the engine's and the conversation's state: "Connecting…", "Measuring this phone…", "Loading the
+  model…", "Thinking…", "Writing…", "Reading part of the model from the disk…" (when more than 0.3
+  of the live token's time is the disk's), "Answered", "Stopped", "No model loaded", "Ready". While
+  the engine works the logo breathes, unless the system's animations are off.
+- **The welcome.** An empty conversation shows the logo on a sheet over a yellow rule, the same
+  status words under it ("Private: everything stays on this phone." when all is ready), and "What
+  shall we do?".
 - **The transcript.** Your messages on the right; long-press one to copy it or to edit it and send
-  it again (everything after it is dropped). The model's answers as GitHub-flavoured Markdown
+  it again (everything after it is dropped). The model's answers on white sheets, as GitHub-flavoured Markdown
   (tables bordered and scrolling sideways when wide, drawn by multiplatform-markdown-renderer in
   the app's tokens; images are not loaded and HTML is not run), its thinking folded above them,
   with Copy under each and **Answer again** under the last one, which sends the last question
-  again as it was (the server drops the old answer). A notice says, in words, why
+  again as it was (the server drops the old answer). Under a finished answer, one quiet line says
+  how it ran, `tg 12.4 tok/s · pp 140 tok/s` (the writing speed, then the speed the message was
+  read at), live while it is written; tapping it opens each figure with what it measures (Answer
+  speed against what the plan expected; where each token's time went, as whole shares that add up
+  to 100%; Found in memory, as "81 of every 100 parts"; Reading the message; Context used; Guesses
+  kept) and links to the Plan and to Metrics. A notice says, in words, why
   something did not happen. Stop ends the answer.
-- **The composer.** The prompt, Send, or Stop while an answer is written; the + beside the prompt
-  holds **Choose from options** (below). With no model loaded the empty chat says to load one from
-  Models.
+- **The composer.** The prompt, across the whole sheet, and under it the + and Send, or Stop while
+  an answer is written, as on the web and iOS; the + holds **Image** and **Take a photo**, when the loaded model reads images (a projector file beside
+  it; otherwise the two say so, disabled), at most 8 in a message, shown as thumbnails above the
+  prompt until sent and on the message after, and **Choose from options** (below). With no model loaded the status line says so, and the
+  engine's line above the navigation bar leads to Models.
 
 The conversations earlier versions kept on the phone are handed to the server once, on the first
 launch that reaches it: each becomes a server conversation with its messages, and the phone's copy
@@ -226,12 +255,14 @@ them keeps nothing and the phone keeps its copy).
 
 ## The look
 
-Slate and cyan, light and dark following the system, Material 3 with an 8 dp corner, 1 dp lines and
-a soft shadow on cards. The colour values sit in one place, `ui/Theme.kt` (`LightTokens`,
-`DarkTokens`), mapped onto Material's colour roles. Text is set in Inter and code in JetBrains Mono,
-static instances bundled in `res/font`, both under the SIL Open Font License (its text is in
-`THIRD_PARTY_LICENSES`, which the APK carries). The pixel logo is the one mark that keeps its own
-style.
+"Letterhead", the web UI's language: words on white sheets (6 dp corners, lifted by a soft shadow,
+no frame) over a cool grey desk, controls with a 10 dp corner, the top bar and the drawer in the ink
+shell, and one ink primary button per screen (Send, Load, Apply plan). Light and dark follow the
+system or the setting. The colour values sit in one place, `ui/Theme.kt` (`LightTokens`,
+`DarkTokens`), mapped onto Material's colour roles. Text is set in Hanken Grotesk (one variable
+file) and code in JetBrains Mono, both bundled in `res/font` under the SIL Open Font License; the APK
+carries Hanken Grotesk's licence from `app/licenses/` and the others in `THIRD_PARTY_LICENSES`. The
+pixel logo is the one mark that keeps its own style.
 
 ## Settings
 
@@ -243,8 +274,10 @@ and lists, in the table's order, the rows the table marks for a form (`form`; a 
 send it offers its basic rows), the same rows the web UI and the iOS app show. Every value you set,
 on the form or off it, sits instead in a **Set by you** card ahead of the groups, with the count in
 its header and hidden while you set nothing: each row appears once on the page, a reset sends it back
-to its group, and a link to a value you set opens that card. Every other parameter is still the engine's, set
-from the command line or the API. Each row carries one chip for where its value came from (default,
+to its group, and a link to a value you set opens that card. Below the groups, **Advanced settings**
+folds every other parameter the app may set (the devices for the prompt and the answer, the caches,
+the reads, the experimental and debug rows, marked as such) into the same group cards; only a path,
+given at launch, stays off the page. Each row carries one chip for where its value came from (default,
 from the plan, set by you); a value you set can be reset, or, where the plan decided
 another, replaced with **Use plan value**. **Reset all my values** removes yours after asking,
 leaving what the engine was launched with and the model. A number shows its unit, the name of a
@@ -255,9 +288,12 @@ lands on its row.
 **Serve on the network** is the first card on the page, folded like the rest, with its state in
 its header even when closed: Off, On with the phone's address, or On but not on a network. Switched
 on, the engine listens on every interface, and the card shows the phone's address on its Wi-Fi or
-Ethernet network (`http://<phone IP>:8765`, ready to copy and kept current when the network
-changes), the API key (masked, with Show, Copy and New key) and the base URL a client takes,
-`http://<phone IP>:8765/v1`. Any OpenAI-compatible client then uses it with
+Ethernet network (`http://<phone IP>:<port>`, ready to copy and kept current when the network
+changes), the API key (on its own line in blocks of four, masked, with Show, Copy and New key
+below it), the base URL a client takes, `http://<phone IP>:<port>/v1`, and a **Port** field. The
+port is the server's default (8765) unless the field names another; when another app holds it (a
+remote-access app often does), the server takes the next free one, the address shows the port it
+took, and the field says it moved. Any OpenAI-compatible client then uses it with
 `Authorization: Bearer <key>`: a laptop's coding agent, Open WebUI, a script. Prompts and answers
 cross the network unencrypted, as the card says; use it on a network you trust. A coding agent needs
 a larger Context than a chat: its first request alone is about 10k tokens, so set Context to 16384
@@ -271,9 +307,11 @@ installed app, and an open server would let any of them read a conversation off 
 The app starts it with a random key per launch, written to a file in its private storage that only
 it can read (`--api-key-file`, mode 0600, never on the command line), and sends it on every request;
 shared, the key is the persistent one Settings shows, so a client keeps working across restarts.
-Before it trusts the server on the port, the app checks it is the one it started: that server
-refuses a random key and accepts the launch's. Another program's server on 8765 (an open one, or
-one with a key of its own) is reported as holding the port, and nothing is sent to it. The server
+The app never assumes the port: it starts the server with `--port-fallback` and `--port-file` in its
+private storage, and talks only to the port that file names once the server has bound it
+([server-api.md](../../docs/server-api.md)); the server binds it exclusively, so no other app can
+share it. Before it trusts the server there, the app still checks it is the one it started: that
+server refuses a random key and accepts the launch's. The server
 is stopped and restarted on a background thread, one step at a time, so a restart never races the
 old process for the port and a stop never freezes the screen; a stopped server's late exit report
 changes nothing. The event stream has a watchdog: the server pings every 15 s, and a stream silent
@@ -296,10 +334,11 @@ why. Nothing in the app names a device. See `../../docs/npu-prefill.md`.
 ## Metrics
 
 The Metrics screen, opened from Settings, has the **Record** switch (off by default: one per-token
-CSV file per model loaded while it is on) and shows the live card for the current or last generation (the rate, and each
-token's time split into compute, flash wait, cache management and what nothing claims), then the
-CSV files: view one, share one, correlate its columns, or compare two on one axis. The chat shows
-the same rate in one line above the prompt while an answer streams. The flash term and the threads
+CSV file per model loaded while it is on) and shows the live card for the current or last generation (the rate; while it writes, the share of
+each token's time spent waiting for the disk and what it finds in memory; for the last answer, each
+token's time split into computing, waiting for the disk, managing the cache and what nothing claims,
+as whole shares that add up to 100%), then the CSV files: view one, share one, correlate its
+columns, or compare two on one axis. The chat shows the writing speed under an answer while it streams. The flash term and the threads
 the CPU figures divide by are the server's (`flash_wait_ms`, `compute_threads`, `busy_threads`),
 never read from the settings. The fields are documented in `../../docs/telemetry.md` and in the
 screen's glossary, whose settings half is the engine's parameter table: each setting a file was

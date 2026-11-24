@@ -56,9 +56,51 @@ int main() {
         check(tn::weight_suffix("ffn_up_exps.weight", il).empty(), "weight_suffix: outside a block");
     }
 
+    // ── a tensor's role, by the format's naming ──────────────────────────────────────
+    {
+        check(tn::is_weight("blk.3.attn_q.weight") && tn::is_weight("output.weight"), "is_weight: a .weight tail");
+        check(!tn::is_weight("blk.3.ffn_down_exps.scale") && !tn::is_weight("blk.3.attn_q.weight.bias") &&
+                  !tn::is_weight("weight"),
+              "is_weight: a companion or a bare word is not a weight");
+
+        check(tn::block_part("blk.3.attn_q.weight") == tn::BlockPart::Attention &&
+                  tn::block_part("blk.3.attn_norm.weight") == tn::BlockPart::Attention,
+              "block_part: attn... is the attention's");
+        check(tn::block_part("blk.3.ffn_up_exps.weight") == tn::BlockPart::Ffn &&
+                  tn::block_part("blk.3.ffn_gate_inp.weight") == tn::BlockPart::Ffn,
+              "block_part: ffn... is the feed-forward's, experts included");
+        check(tn::block_part("blk.3.post_norm.weight") == tn::BlockPart::Other,
+              "block_part: a block tensor of neither part");
+        check(tn::block_part("attn_q.weight") == tn::BlockPart::Other &&
+                  tn::block_part("ffn_out.weight") == tn::BlockPart::Other &&
+                  tn::block_part("blk.x.attn_q.weight") == tn::BlockPart::Other,
+              "block_part: outside any block it is neither, whatever the name says");
+
+        check(tn::is_mtp_tensor("blk.47.nextn.eh_proj.weight") && tn::is_mtp_tensor("blk.47.nextn.enorm.weight"),
+              "is_mtp_tensor: a multi-token-prediction block's tensors");
+        check(!tn::is_mtp_tensor("blk.47.ffn_up_exps.weight"), "is_mtp_tensor: an ordinary block tensor is not");
+
+        check(tn::is_embedding_table("token_embd.weight") && tn::is_embedding_table("per_layer_token_embd.weight"),
+              "is_embedding_table: the token table and a per-layer table beside it");
+        check(!tn::is_embedding_table("output.weight"), "is_embedding_table: the output head is not one");
+
+        check(tn::is_output_head("output.weight") && !tn::is_output_head("output_norm.weight") &&
+                  !tn::is_output_head("blk.0.output.weight"),
+              "is_output_head: exactly the head");
+        check(tn::is_token_table("token_embd.weight") && !tn::is_token_table("per_layer_token_embd.weight"),
+              "is_token_table: exactly the token table");
+        check(std::string(tn::k_output_norm) == "output_norm.weight", "k_output_norm: the final norm's name");
+    }
+
     // ── graph nodes ──────────────────────────────────────────────────────────────────
     {
         check(tn::is_moe_node("ffn_moe_topk-7") && !tn::is_moe_node("attn_norm-7"), "is_moe_node: by prefix");
+        check(tn::is_state_tensor("cache_k_l3") && tn::is_state_tensor("cache_r_l0") &&
+                  !tn::is_state_tensor("blk.3.attn_k.weight") && !tn::is_state_tensor("token_embd.weight"),
+              "is_state_tensor: the memory modules' state, not a weight");
+        check(tn::block_label(12) == "blk.12" &&
+                  tn::block_layer((tn::block_label(12) + ".attn_q.weight").c_str()) == 12,
+              "block_label: the name block_layer reads back");
         check(tn::node_layer("ffn_moe_topk-7", tn::k_topk_node) == 7, "node_layer: the topk node's layer");
         check(tn::node_layer("ffn_moe_logits-40", tn::k_logits_node) == 40, "node_layer: the gate matmul");
         check(tn::node_layer("l_out-3", tn::k_layer_out_node) == 3, "node_layer: a layer's output");

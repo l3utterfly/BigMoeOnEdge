@@ -269,6 +269,18 @@ final class ScreensTests: XCTestCase {
         XCTAssertEqual(linked[2].rows.map(\.key), ["threads", "trace", "layers"])
     }
 
+    func testAdvancedSettingsHoldEveryOtherRowInTheSameGroups() throws {
+        let params = try table()
+        let adv = SettingsForm.advancedCards(params)
+        XCTAssertEqual(adv.map(\.group), ["compute", "debugonly"])
+        XCTAssertEqual(adv[0].rows.map(\.key), ["lanes", "trace", "spin", "batch"])
+        // With the form's cards, every settable row appears exactly once.
+        let all = (SettingsForm.cards(params) + adv).flatMap { $0.rows.map(\.key) }.sorted()
+        XCTAssertEqual(all, params.filter(SettingsForm.settable).map(\.key).sorted())
+        // A row the person set lives in "Set by you" instead.
+        XCTAssertEqual(SettingsForm.advancedCards(params, setByYou: ["probe"]).map(\.group), ["compute"])
+    }
+
     func testALoadTargetIsReadFromTheReadOnlyGroupNotByName() throws {
         let params = try table()
         let none = ConfigState(try JSON(parsing: #"{"values":{"model":""}}"#))
@@ -355,7 +367,7 @@ final class ScreensTests: XCTestCase {
         let f = p.figures
         XCTAssertEqual(f.expectedTokS!, 2.5, accuracy: 1e-9)
         XCTAssertEqual(f.measuredTokS!, 3.2, accuracy: 1e-9)
-        XCTAssertEqual(f.deltaPct!, 28, accuracy: 1e-9)
+        XCTAssertNil(f.speedCheck) // the server sends none here, so there is no comparison to show
         XCTAssertEqual(f.creditedHitPct, 38)
         XCTAssertEqual(f.measuredHitPct, 41.5)
         XCTAssertEqual(f.heldBytes, 3000) // the host pool, wherever it sits

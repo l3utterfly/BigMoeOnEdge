@@ -10,12 +10,18 @@ a single ~25-line hook on a fork branch with an explicit sunset (see below and
 ## Layers
 
 ```
+frontend/       what every front-end does the same way: user_dirs (the per-user data folder,
+                and the folder each model's measurements are kept in), so what one measured is
+                the others', and backend_env (what the compute backends read from their environment,
+                one table set before any loads); linked by bmoe-cli, bmoe-server and the desktop app
 cli/            bmoe-cli — parses flags, the only place env vars are read
 server/         bmoe-server: the application framework every UI speaks to (docs/application-framework.md),
                 and the engine behind the desktop web UI (docs/server-api.md)
                 openai_chat (the chat protocol), anthropic_messages and openai_responses (the
-                agent protocols, over agent_protocol's append-only stream), image_part (an image as
+                agent protocols, over agent_protocol's append-only stream), llama_compat (llama.cpp
+                server's timings, prompt progress, metrics and tokenizer routes, as a wire format), image_part (an image as
                 a protocol carries it, inline, to the engine's ChatImage), turn_queue,
+                server_seams (what a test puts in place of the engine and the planner),
                 settings_store, event_bus, json_util,
                 model_files (which gguf names make one model, the one-level folder scan, and what a
                 file is for by its header: model, projector, draft), plan_view (the plan as the Plan
@@ -38,23 +44,30 @@ server/         bmoe-server: the application framework every UI speaks to (docs/
                 unpacked), update_service (packs and updates downloaded, checked, put in place):
                 pure policy (bmoe_server_core), with curl_fetch beside it, the system curl behind the
                 HttpFetch port: the library's one adapter, there so its no-curl answer is tested
+                engine_thread: the one thread every computation of the engine runs on (a backend
+                may keep a worker team per calling thread, as ggml's OpenMP CPU backend does);
                 engine_host: the one Session, loads, the turn line, over the HostedSession seam
                 (hosted_session.h) its test drives with a scripted session; model_library: files, catalog,
-                downloads; planner_adapter: /api/plan when the planner is built in; routing_store:
-                each model's routing record and knob verdicts, kept by content fingerprint for the
-                next plan;
+                downloads; planner_adapter: /api/plan;
+                hf_repo (a Hugging Face repository as a source of models, pure rules),
+                model_inspect (a model's gguf header read before download, against this machine),
+                request_sampling (the sampling fields every protocol may carry, read once),
+                decide_protocol (the decide request and answer at the server's edge, docs/decide.md),
+                log_file (--log-file and its rotation), service_spec and service_manager (the
+                server as a login service of the person's init system), cpu_thermal (the CPU temperature from the kernel's thermal zones);
                 agent: the agent's runs (one thread each, approvals, stop, MCP tools) and its task
                 scheduler, over EngineHost::chat or a provider; agent_external: a conversation
                 another coding agent works, over ACP; agent_routes: its HTTP routes;
                 access: who may reach the API (host, origin, key, content type, the local-only
                 routes), pure and tested;
                 platform: the only file with platform #ifs, a library of its own
-                (bmoe_server_platform) the desktop app links too; http_server: the HTTP routes and
+                (bmoe_server_platform) the desktop app links too, with listen_port (the port the
+                server takes, the fallback past ports in use, the port file a launcher reads); http_server: the HTTP routes and
                 run(); the whole is the bmoe_server library, main.cpp the process around it
 desktop/        bmoe-desktop (docs/desktop-app.md): the native window over the system's web view
                 (third_party/webview), bmoe-server as its child process (supervisor), the app's
-                rules apart from any window (app_core: preferences, port, bridge guard, update
-                file), and os.h with one file per system (os_macos.mm, os_windows.cpp,
+                rules apart from any window (app_core: preferences, server arguments, bridge guard,
+                update file), and os.h with one file per system (os_macos.mm, os_windows.cpp,
                 os_linux.cpp): tray, notifications, folder dialog, close-to-tray, one instance
 ui/             the web UI (Svelte + TypeScript); settings rendered from the parameter table
 catalog/        models.json: the curated model catalog, as data; clients.json: the apps the server can
@@ -102,21 +115,29 @@ core/
     measured_knobs.h
                     the lossless knobs' verdicts as a value (what the first answer measured), their
                     text form, and the hardware fingerprint a verdict is kept against
+    model_records.h a model's routing record and verdicts kept on disk between loads, by content
+                    fingerprint, in a folder the front-end names: one store for every front-end
     probe.h         the adapters' entry points: what fills the two profiles
     auto_plan.h     probe_and_plan: the one probe-and-plan sequence every front-end calls, the
                     adapters in their order and then the rules; the options are what differs
   src/
     io/         platform_io — O_DIRECT reads and their per-file alignment, reserve/commit/evict VM,
-                  the spin-wait pause: the OS and ISA branches the streaming path needs
+                  offer/reclaim of discardable spans, the spin-wait pause: the OS and ISA branches
+                  the streaming path needs
                 file_reader — pooled positioned reader, per-consumer O_DIRECT
                 mapping_release - releases the model file's mapping after load (--release-mmap)
-    moe/        gguf_offsets (tensor → (shard, offset), split ggufs included), expert_layout,
+                parallel_copy - memory copies spread across the plan's threads, landing exactly
+                  where one memcpy would (the experts' host copy behind a device cache)
+    moe/        discardable_entries — which cached experts are offered to the kernel to drop, and what a
+                  lookup finds after a drop; pure policy over a SpanOps port (platform_io underneath)
+                gguf_offsets (tensor → (shard, offset), split ggufs included), expert_layout,
                 expert_stream_source (one reader per shard), router_hook
                 gate_gemv - the router-gate GEMV over float gates and over an int8 mirror, and the
                   timing of both that --gate-mirror auto reads
                 stall_union - the wall time at least one thread was stalled, not the sum of stalls
                 tensor_names - how llama.cpp's tensor and graph-node names, and the capacity
-                  fitter's override patterns, are read: the one place, no regex, unit-tested
+                  fitter's override patterns, are read: the one place (the planner's probes
+                  included: token table, output head, MTP blocks), no regex, unit-tested
                 dense_weights — non-expert weight policy + the residency sensor
                 row_stream - row-gathered tables served from flash (see row-gathered-tables.md)
                 device_arena - one or two layer slots on a prefill device, held for the session or
@@ -125,8 +146,17 @@ core/
                 decide_probe - experimental per-decision expert usage and layer-exit answers (decide.md)
     engine/     session — composition + the generation loop (open/generate/close); open() and
                   generate() are short sequences of named steps (see "The generation loop")
+                cache_brake - the expert cache's brake: halves the budget when the run stalls and
+                  the cache's own pages are being taken back, and never grows it again (pressure.md)
+                image_probe - an encoded image's size from its header alone, so an image too large
+                  to decode is refused before any pixel is allocated
+                kv_cache_type - the KV cache type to the ggml type llama.cpp's context takes
                 prefill_device - moves layer weights and model state onto a device per graph
                 prefill_path - the prefill device for one session: setup, placement, device decode
+                compute_reservation - the one request that makes a context reserve its compute
+                  buffers again, at its next decode
+                device_answer - a model open on devices compared with the cores, once per model
+                logit_agreement - the rule two sets of next-token rows are compared by
                 runtime — the one-shot run() wrapper over a Session
                 llama_log — what of llama.cpp's own log reaches stderr: DEBUG dropped unless
                   asked for, a requested cancel's decode errors demoted while it is in flight
@@ -153,19 +183,27 @@ core/
                 routing - the routing record's text form, the LRU replay over it, the hit curve
                   and the hottest experts (measured-planning.md, Step 1); pure as the rules
                 measured_knobs - the knob verdicts' text form and the hardware fingerprint (Step 2)
+                model_records - ModelRecords: the routing record and verdicts per model on disk
                 hardware_probe, model_probe, storage_probe, headroom_probe, bandwidth_probe,
                   layer_probe (one real layer of the model, its experts and its dense matrices, on
                   every backend: measured-planning.md, Step 3), gate_probe,
                   device_probe, placement_probe, isolated_probe (a device asked in a second
-                  process, so a driver that ends it ends only that) - the adapters that measure a
-                  machine and read a gguf; the only place in the planner where a platform or
-                  llama.cpp may appear
+                  process, so a driver that ends it ends only that), native_memory_probe,
+                  metal_memory_probe, opencl_memory_probe and memory_topology (whether a device
+                  shares the host's memory, from its own API) - the adapters that
+                  measure a machine and read a gguf; the only place in the planner where a platform
+                  or llama.cpp may appear
                 auto_plan - the composition of the two: the probes in the order a plan is
                   measured in, then plan_run(). With the adapters because it starts the backends;
-                  it decides nothing, and bmoe-cli --auto and the server's /api/plan both call it
+                  it decides nothing, and bmoe-cli --auto and the server's /api/plan both call it.
+                  replan() runs its planning half again on the same facts, which is what the
+                  server plans a plan's other side with (the side a load opens when the one the
+                  plan names does not)
     params.cpp  the parameter table's rows (see params.h)
     log.cpp     the log port's default sink and level filter (see log.h)
-    metrics/    csv_metrics_sink, route_trace_sink, decode_trace_sink
+    metrics/    csv_metrics_sink, route_trace_sink, decode_trace_sink; memory_snapshot (the
+                  process's memory on each token's row, and diagnostics in the log that never move a
+                  budget)
 third_party/
   llama.cpp     upstream submodule; public-API consumer, plus one optional overlap hook
 tests/          byte-identity gates

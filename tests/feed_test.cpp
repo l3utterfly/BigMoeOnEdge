@@ -188,7 +188,8 @@ static void feed_tests() {
     up = update_answer(feed, "0.39.0", "test-target");
     check(!up["available"].get<bool>(), "update: the same version is not");
     up = update_answer(feed, "0.38.0", "nowhere");
-    check(!up["available"].get<bool>() && up["installer"].is_null(), "update: no installer for this target, none");
+    check(up["available"].get<bool>() && up["installer"].is_null(),
+          "update: no installer for this target, still newer, with no installer to download");
     check(is_pack_id("cuda") && is_pack_id("hip-7") && !is_pack_id("-x") && !is_pack_id("CUDA") && !is_pack_id(""),
           "pack id: lowercase, digits and '-'");
 }
@@ -229,12 +230,39 @@ static void pack_tests() {
     check(inst.size() == 1 && inst[0].id == "gpu" && inst[0].version == "0.39.0",
           "installed: a marker that names another pack than its folder is not believed");
 
-    json answer = backends_answer({"CPU"}, "test-target", &feed, inst, loads_driver, false);
+    json answer = backends_answer({"CPU", "GPU0"}, {{"GPU0", "A test card"}}, "test-target", &feed, inst, loads_driver,
+                                  false, "0.39.0");
+    check(answer["graphics"].size() == 1 && answer["graphics"][0]["backend"] == "GPU0" &&
+              answer["graphics"][0]["description"] == "A test card",
+          "backends: the local graphics cards, by the device's own description");
     check(answer["packs"].size() == 1 && answer["packs"][0]["applies"].get<bool>() &&
               answer["packs"][0]["installed"].get<bool>() && answer["packs"][0]["current"].get<bool>(),
           "backends: this target's pack only, applying, installed and current");
-    answer = backends_answer({"CPU"}, "test-target", nullptr, {}, loads_driver, true);
-    check(answer["feed"].is_null() && answer["packs"].empty() && answer["restart_required"].get<bool>(),
+    check(answer["installed"].size() == 1 && answer["installed"][0]["loaded"].get<bool>(),
+          "backends: a pack of this release is loaded");
+    answer = backends_answer({"CPU"}, {}, "test-target", &feed, inst, loads_driver, false, "0.40.0");
+    check(!answer["installed"][0]["loaded"].get<bool>(), "backends: a pack of another release is said not loaded");
+
+    // What the engine loads: its own release's packs, and a folder with no marker as before. `other`
+    // holds a marker that names no release, so it is not loaded by any.
+    fs::create_directories(root / "by-hand");
+    std::vector<std::string> skipped;
+    std::vector<std::string> loadable = loadable_pack_dirs(root.u8string(), "0.39.0", &skipped);
+    check(loadable.size() == 2 && fs::u8path(loadable[0]).filename() == "by-hand" &&
+              fs::u8path(loadable[1]).filename() == "gpu" && skipped.size() == 1 &&
+              skipped[0] == "other (no release named)",
+          "pack dirs: this release's pack loads, and a folder with no marker");
+    skipped.clear();
+    loadable = loadable_pack_dirs(root.u8string(), "0.40.0", &skipped);
+    check(loadable.size() == 1 && fs::u8path(loadable[0]).filename() == "by-hand" && skipped.size() == 2 &&
+              skipped[0] == "gpu (0.39.0)",
+          "pack dirs: a pack of another release is not loaded, and is named");
+    check(!pack_matches_engine("", "0.39.0") && !pack_matches_engine("0.39.0", "0.39.1") &&
+              pack_matches_engine("0.39.0", "0.39.0"),
+          "pack: loads on the release it names, and on no other");
+    answer = backends_answer({"CPU"}, {}, "test-target", nullptr, {}, loads_driver, true, "0.39.0");
+    check(answer["feed"].is_null() && answer["packs"].empty() && answer["restart_required"].get<bool>() &&
+              answer["graphics"].is_array() && answer["graphics"].empty(),
           "backends: no feed read, no pack offered");
     fs::remove_all(root, ec);
 }
@@ -379,12 +407,24 @@ static void install_tests() {
         cfg.feed_url = feed_url;
         cfg.public_key = kTestPublicKey;
         cfg.target = "test-target";
-        cfg.version = "0.38.0";
+        cfg.version = "0.39.0";
         cfg.library_loads = [](const std::string & n) { return n == "libdriver.so.1"; };
         UpdateService svc(bus, net, cfg);
 
         UpdateService::Reply r = svc.install_pack("gpu", false);
         check(r.status == 409, "install: refused before any feed was read");
+        if (!tampered) {
+            // The feed's packs are the newest release's: an engine of another one takes none of them.
+            UpdateConfig older = cfg;
+            older.data_dir = (dir / "data-older").u8string();
+            older.version = "0.38.0";
+            UpdateService svc_older(bus, net, older);
+            svc_older.backends(true);
+            r = svc_older.install_pack("gpu", true);
+            check(r.status == 409 && r.body.value("code", "") == "version_mismatch" &&
+                      !fs::exists(fs::u8path(older.data_dir) / "backends" / "gpu"),
+                  "install: a pack built for another release is refused, forced or not");
+        }
         r = svc.backends(true);
         check(r.status == 200 && r.body["packs"].size() == 1 && r.body["packs"][0]["applies"].get<bool>(),
               "install: the feed is read and the pack applies");
@@ -433,6 +473,28 @@ static void install_tests() {
         UpdateService keyless(bus, net, cfg);
         check(keyless.update().status == 503 && keyless.update().body["code"] == "no_feed_key",
               "feed: a build with no key reads no feed");
+    }
+
+    // A build the feed carries no installer for (a phone: its app ships beside the feed) learns
+    // that a newer release is out, and is refused a download it could not run.
+    {
+        FakeNet net;
+        const std::string text = sample_feed();
+        net.pages[feed_url] = text;
+        net.pages[feed_url + ".sig"] = sign_with_test_key(text);
+        EventBus bus;
+        UpdateConfig cfg;
+        cfg.data_dir = (dir / "data-phone").u8string();
+        cfg.feed_url = feed_url;
+        cfg.public_key = kTestPublicKey;
+        cfg.target = "android-arm64";
+        cfg.version = "0.38.0";
+        UpdateService svc(bus, net, cfg);
+        const UpdateService::Reply u = svc.update();
+        check(u.status == 200 && u.body["available"].get<bool>() && u.body["installer"].is_null(),
+              "update: a target with no installer is told a newer release is out");
+        const UpdateService::Reply d = svc.download_update();
+        check(d.status == 409 && d.body["code"] == "no_installer", "update: and its download is refused");
     }
     fs::remove_all(dir, ec);
 }

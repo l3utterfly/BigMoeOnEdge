@@ -27,16 +27,16 @@ app/
   Sources/
     App/        the entry point, the four tabs and the links between them, the status line
     Engine/     the server's life in the app: paths, launch, key, the state the screens observe
-    Chat/       the conversations over the server, the transcript, the composer, the answer's
-                Markdown theme, choose-from-options
+    Chat/       the conversations over the server, the transcript, the composer and the images it
+                attaches, the answer's Markdown theme, choose-from-options
     Models/     one list of what is here and what the catalog offers, Hugging Face, a link, a file
     Plan/       the verdict and its three figures, the planner's measurements and decisions
     Settings/   the engine parameters a form offers, one card per group of GET /api/params, and
                 the app's own
     Metrics/    the live card, the recorded runs with their Record switch, the engine's log:
                 opened from Settings, where it always is
-    Design/     the visual language (docs/design.md): the tokens, Inter and JetBrains Mono, the
-                boxes, the logo
+    Design/     the visual language (docs/design.md): the tokens, Hanken Grotesk and JetBrains Mono,
+                the sheets, the logo
   MarkdownUI/   the image providers that load nothing, compiled into the vendored MarkdownUI
                 in place of its network ones
   Resources/    the app icon, rendered from the logo by make-icon.swift; Fonts/, the bundled
@@ -49,8 +49,11 @@ BmoeKit/        the client side with no UI: the API client, the event stream, th
 
 The screens follow [docs/screens.md](../../docs/screens.md) as the web UI does: Models is one list
 where the files the server lists and the catalog's entries are merged by file, each row with one
-state and one primary action, and with nothing on the device a first visit opens there on three
-steps; Hugging Face is Find, Pick, Check, Download with the server's verdict as the headline; a
+state and one primary action. With nothing on the device and nothing coming, a first visit opens
+there on the first run (`Models/SetupView.swift`, docs/screens.md "First run"): 1 Pick a model (every
+catalog entry, the one picked checked by the server before its download), 2 its download with
+the time left (`ETA` in BmoeKit), 3 the model loads by itself and the conversation opens once the
+engine is ready, with three questions to try; Import a file, More models and Skip stay under it; Hugging Face is Find, Pick, Check, Download with the server's verdict as the headline; a
 direct https link becomes a catalog entry on the server (`POST /api/models/url`, its sizes from a
 `HEAD` the bridge asks) and its files download here like any other entry's. Delete goes through the
 server (`DELETE /api/models/local/<name>`), which removes a split set whole. The status line shows
@@ -61,14 +64,15 @@ line stays in the "Serve on the network" card. Plan opens on "For <model file>" 
 Models), the plan's own model or else the one a load would open, then its verdict and three figures
 with Apply and Measure again; Settings opens with **Serve on the network**, a card whose header says the
 state even while it is closed (Off, or On and the first address, or On but not on a network); inside
-are the switch, each address with Copy, the API key masked with Show, Copy and New key (which
+are the switch, each address with Copy, the API key masked in blocks of four on its own line, with Show, Copy and New key (which
 restarts the engine on the new key), the base URL a client takes, and that prompts and answers
 cross the network unencrypted. Then **Appearance**: the theme (System, Light or Dark, applied at
 once; the web UI's choice). Then **Set by you · N**, every value the person
 set, on the form or not, in table order, each with its reset or plan action, shown when there is
 one; then one card per engine group holding the other rows the parameter table offers on a form
-(`form`), so each row appears once and a reset sends it back to its group. Every card is closed
-until opened; a row carries a chip for where its value came from, and a link from Plan opens the
+(`form`), so each row appears once and a reset sends it back to its group; then **Advanced
+settings**, one fold holding every other row a client may set in the same group cards, experimental
+and debug rows marked. Every card is closed until opened; a row carries a chip for where its value came from, and a link from Plan opens the
 row's card ("Set by you" for a value the person set) and lands on it.
 Metrics is not a tab: the **Metrics** switch in Appearance (off by default) records a per-token CSV
 for every loaded model and adds the Metrics entry to Settings. "This app" starts and stops the
@@ -83,7 +87,7 @@ chat, with no tools, no workspaces and no tasks. The agent is the desktop's: a s
 phone is not one. The transcript shows the person's messages, the model's answers as Markdown with
 their thinking folded above, and the server's notices. The Markdown is GitHub-flavoured (tables,
 task lists, strikethrough, autolinks), rendered by [MarkdownUI](https://github.com/gonzalezreal/swift-markdown-ui)
-over cmark-gfm in the app's tokens: Inter, JetBrains Mono for code on the second surface, tables
+over cmark-gfm in the app's tokens: Hanken Grotesk, JetBrains Mono for code on the second surface, tables
 with borders in the line token that scroll sideways when wider than the screen, as code blocks do.
 Nothing in an answer runs or fetches: raw HTML is shown as text, an image is not loaded (MarkdownUI
 is built without its NetworkImage dependency; `app/MarkdownUI/` draws images as nothing, their alt
@@ -91,7 +95,14 @@ text kept for VoiceOver), and a link opens only when tapped. Holding a message o
 send again; under each answer is Copy, and under the last one **Answer again**, which sends the
 last question again as it was (the server drops the old answer). Stop stops the answer. The
 conversations sheet lists them newest first; swipe a row to rename or delete it. With no model
-loaded the empty chat says to load one, with the way to Models. Choose from options stays: the
+loaded the empty chat says to load one, with the way to Models. The composer's **Add** menu
+attaches an image from the library or the camera (`NSCameraUsageDescription`; the photo picker
+needs no entry), up to 8 a message of at most 16 MB each, as the web UI's composer does. A photo
+from the camera is encoded once as JPEG by the app (the camera hands over a decoded image, not a
+file); everything else goes as picked (data URLs in `images`, docs/server-api.md "Images"), the
+engine decodes them and the projector downsizes. With a model that has no projector loaded the two entries stay in the menu,
+disabled, with the reason (`GET /api/info` `model.vision`). A message shows the images it carried
+above its words, and Edit and send again resends them unchanged. Choose from options stays: the
 model picks one option from one read of the prompt, shown as a card under the conversation and not
 kept, since a decision is not a turn. An answer holds the background time iOS grants, so one nearly
 done when the person switches apps still finishes.
@@ -117,14 +128,31 @@ settings and its conversations in the app's private Application Support.
 
 ### The look
 
-Slate and cyan, light and dark following the system or the Theme in Settings (the tokens are one
-file, `Sources/Design/Theme.swift`, and [docs/design.md](../../docs/design.md) is their source):
-Inter for every word, JetBrains Mono for code, paths and keys, both bundled from their official
-releases with their licences; 8-point rounded boxes with a 1-point line and a soft shadow on cards;
-the system's navigation, tab bars, lists, forms, sheets and menus, tinted. The pixel logo is unchanged.
+Letterhead: ink on paper, light and dark following the system or the Theme in Settings (the tokens
+are one file, `Sources/Design/Theme.swift`, and [docs/design.md](../../docs/design.md) is their
+source). Hanken Grotesk for every word, JetBrains Mono for code, paths and keys, both bundled with
+their SIL OFL licences (Hanken Grotesk as static instances of the official variable font at 400,
+500, 600 and 700). Answers and cards are white sheets with a 6-point corner lifted by a soft
+shadow, controls have a 10-point corner, and the composer is a sheet with a field's strong edge.
+The top bars and the conversations list are the shell's ink, the open conversation raised in it,
+and the person's message is a bubble in the same raised ink. The one primary button of a screen,
+Send among them, is filled with the ink. The pixel logo is unchanged.
 
-The server listens on `127.0.0.1:8765` with a random key per launch, since every app on the
-device can reach loopback. **Serve on the network** in Settings restarts it on all addresses
+The line under the top bar is the logo beside a few plain words from the engine's and the open
+conversation's state ("Thinking…", "Writing…", "Reading part of the model from the disk…",
+"Answered", "No model loaded"…), never a figure; the logo breathes while the engine works, unless
+the system asks for less motion. An empty chat is the welcome: the logo on a sheet over the
+logo's yellow rule, "Private: everything stays on this phone.", "What shall we do?". Under each
+answer this app saw finish is one quiet line, `tg 12.4 tok/s · pp 140 tok/s` (the answer speed and
+the speed the message was read at), which opens to each figure with what it measures (the answer speed against
+what the plan expected; where each token's time went, in whole shares that add up to 100; what
+was found in memory, as "N of every 100 parts"), with the way to Plan and to Metrics; while an answer streams, its live
+`tg` is in the same place. The server keeps no figures, so an answer from an earlier launch has
+none. The words and the figures are BmoeKit's (`TurnFigures`, `StatusWords`), tested there.
+
+The server listens on loopback, on the server's default port (8765) or the next free one when another
+app holds it, with a random key per launch, since every app on the device can reach loopback. The
+app learns the port from the file the server writes (`--port-file`) and talks to no other. **Serve on the network** in Settings restarts it on all addresses
 with a key kept in the keychain and shown there, for an OpenAI client on another machine; it
 serves while the app is open, since iOS suspends an app in the background. A coding agent needs a
 larger Context than a chat (its first request alone is about 10k tokens): set Context to 16384 or
@@ -148,6 +176,14 @@ is not a SwiftPM package: MarkdownUI 2.4.1 (`third_party/swift-markdown-ui`, MIT
 library, and swift-cmark 0.5.0 (`third_party/swift-cmark`, cmark-gfm, BSD-2-Clause) as a C static
 library whose module maps MarkdownUI imports. Both are upstream's files unmodified, at the tags and
 commits `app/CMakeLists.txt` records; `THIRD_PARTY_LICENSES` carries their licences.
+
+With Apple Swift 6.4.x, the MarkdownUI target alone is compiled with `-Onone`. Its optimized
+build aborts when the tested iOS runtime resolves `Markdown.Body`, including in a minimal app
+without the engine or a model. Disabling linker dead stripping did not avoid the abort. This
+workaround keeps the app and the C++ engine optimized and leaves the vendored sources unchanged;
+Markdown rendering performance has not yet been compared. It is scoped to the compiler version
+family until an upstream fix is known: the failure was reproduced with Swift 6.4, not with
+every 6.4.x patch release or iOS version.
 
 The script generates an Xcode project (`build-ios-sim/bigmoeonedge.xcodeproj`), which opens in
 Xcode to run, debug and profile either app. `BMOE_IOS_TARGETS=bmoe-app` builds one of the two.
@@ -182,8 +218,9 @@ cp model.gguf "$(xcrun simctl get_app_container booted io.bigmoeonedge.app data)
 xcrun simctl launch --console-pty booted io.bigmoeonedge.app
 ```
 
-The simulator shares the Mac's loopback: if a desktop `bmoe-server` holds port 8765, the app
-says so on its status line. Launch it on another port with `-BmoePort 8799` after the bundle id.
+The simulator shares the Mac's loopback: if a desktop `bmoe-server` holds port 8765, the app's
+server takes the next free one. Launch it on a port of your choice with `-BmoePort 8799` after the
+bundle id (the same preference as the Port field in Settings).
 
 **The simulator proves that it builds and runs, not what a device would do.** It runs on the Mac's
 kernel with the Mac's memory, storage and GPU, and the planner reads that kernel's facts (no

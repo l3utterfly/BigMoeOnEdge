@@ -8,6 +8,7 @@
 
 #include "event_bus.h"
 #include "json_util.h"
+#include "model_files.h"
 
 #include <atomic>
 #include <chrono>
@@ -55,13 +56,22 @@ public:
 
     // Problems found reading the catalog, for the start-up log. Empty when it loaded cleanly.
     const std::vector<std::string> & warnings() const { return warnings_; }
-    const std::string & models_dir() const { return dir_; }
+    // Copies, not references: the folders can change while the server runs (set_folders).
+    std::string models_dir() const;
     // Every folder this library lists models from: the models folder first, then the scan dirs.
-    std::vector<std::string> model_roots() const {
-        std::vector<std::string> r{dir_};
-        r.insert(r.end(), scan_dirs_.begin(), scan_dirs_.end());
-        return r;
-    }
+    std::vector<std::string> model_roots() const;
+
+    // Make `models_dir` the folder downloads land in and `scan_dirs` the other folders listed, as a
+    // person chose them while the server runs. Every path must be absolute; the models folder is
+    // created when missing and must take a file, each scan folder must exist. Refused, with nothing
+    // changed, while a download runs: its files are being written to the folder it started in.
+    // Partial downloads and models stay where they are; the old folder is no longer listed unless
+    // it is among `scan_dirs`. status 0 when applied.
+    struct FolderRefusal {
+        int status = 0; // 400: a path is not usable; 409: a download runs
+        std::string error;
+    };
+    FolderRefusal set_folders(std::string models_dir, std::vector<std::string> scan_dirs);
 
     // The /api/models object: local files and the catalog with each entry's status.
     json list();
@@ -111,6 +121,7 @@ public:
 
 private:
     struct Job {
+        std::string dir; // the models folder when the download started: where its files go
         std::thread thread;
         std::atomic<bool> cancel{false};
         std::atomic<bool> finished{false};
@@ -130,15 +141,15 @@ private:
                  const char * state,
                  const std::string & error);
     const CatalogEntry * find(const std::string & id) const;
-    bool entry_on_disk(const CatalogEntry & e) const;
-    // What entry `e` already has in the models folder: complete files plus the bytes of each
+    bool entry_on_disk(const CatalogEntry & e, const std::string & dir) const;
+    // What entry `e` already has in models folder `dir`: complete files plus the bytes of each
     // `.part`, and whether any `.part` is there - what a resume would continue from.
     struct OnDisk {
         uint64_t received = 0;
         uint64_t still_needed = 0;
         bool partial = false;
     };
-    OnDisk on_disk(const CatalogEntry & e) const;
+    OnDisk on_disk(const CatalogEntry & e, const std::string & dir) const;
     // The job of `id` runs: its entry's files are being written. Called with m_ held.
     bool running_locked(const std::string & id) const;
     // Wait `d`, waking early when the job is cancelled. False when it was.
@@ -149,6 +160,8 @@ private:
     void list_dir(const std::string & dir, json & out);
 
     void save_added();
+    // The folders, guarded on their own: a listing reads them while a download holds m_.
+    mutable std::mutex dirs_m_;
     std::string dir_;
     std::vector<std::string> scan_dirs_;
     std::string added_path_;
@@ -160,9 +173,10 @@ private:
 
     mutable std::mutex m_;
     std::map<std::string, std::unique_ptr<Job>> jobs_;
+    // A reading kept with the files it read (model_set_stamp): every shard of a split set, since
+    // the reading takes each one's header, so a shard that lands after it was taken retakes it.
     struct FactsCacheEntry {
-        uint64_t size = 0;
-        long long mtime = 0;
+        std::vector<FileStamp> stamp;
         ModelFacts facts;
     };
     std::map<std::string, FactsCacheEntry> facts_cache_;

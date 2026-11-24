@@ -9,23 +9,39 @@
 
 #include "json_util.h"
 
+#include "bmoe/auto_plan.h"
 #include "bmoe/config.h"
 #include "bmoe/measured_knobs.h"
 #include "bmoe/routing.h"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace bmoe::server {
+
+// What a plan was made from, for the rules to run again on (bmoe/auto_plan.h, replan): the probed
+// facts, the config the plan was asked for and the keys the operator pinned. The plan's other side
+// (plan_other_side) is planned on it, without probing the machine again.
+struct PlanBasis {
+    AutoPlan facts;
+    RunConfig cfg;
+    PlanRequest req;
+};
 
 struct PlanOutcome {
     bool ok = false;
     std::string error;                         // why there is no plan (no planner, no model)
     json body;                                 // the /api/plan object
     std::map<std::string, std::string> values; // parameters the plan changes, by key
+    // The plan's other part, where it has one (RunConfig::fallback), in the same form: the parameters
+    // that configuration changes from the one the plan was given. Empty where the plan is one part.
+    bool has_fallback = false;
+    std::map<std::string, std::string> fallback_values;
     json decisions = json::array();
     // What the plan's memory ledger charges the run with (Ledger::held): the session's own account
     // of the memory it holds once loaded, which a question about loading another model gives back.
@@ -36,7 +52,18 @@ struct PlanOutcome {
     // Its place in the order this server measured plans in (0: no plan): the load's plan is the one
     // the model runs with only while no measurement followed it (plan_view.h, held_plan).
     uint64_t seq = 0;
+    // What it was made from; null without a planner.
+    std::shared_ptr<const PlanBasis> basis;
+
+    // Whether it names a side of a decision across loads (bmoe/measured_knobs.h, names_side): the side
+    // its load serves and times, with the other to open if this one does not.
+    bool names_side() const;
 };
+
+// `plan` with the side it names counted as one that cannot open here: the plan on the other side,
+// which a load falls back to when the named side's open fails. Not ok when `plan` names no side, or
+// when the rules name the same side again (there is no other side to open).
+PlanOutcome plan_other_side(const PlanOutcome & plan);
 
 bool planner_available();
 
@@ -49,7 +76,7 @@ bool planner_available();
 // starts: its key (bmoe/auto_plan.h, k_plan_steps), its words for a person, its position and how
 // many there are.
 using PlanStepFn = std::function<void(const std::string & step, const std::string & label, int index, int count)>;
-// `routing` (nullable) is the model's own recorded routing from an earlier load (routing_store.h):
+// `routing` (nullable) is the model's own recorded routing from an earlier load (bmoe/model_records.h):
 // with it the cache is priced on the model's hit curve. `knobs` (nullable) are the knob verdicts kept
 // for the model; with `measure_knobs` the plan arms the first answer to measure what is not measured
 // yet, for the caller to keep.

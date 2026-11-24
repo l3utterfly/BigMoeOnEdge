@@ -171,14 +171,12 @@ void probe_devices(HardwareProfile & h) {
             // Native topology can settle it below; otherwise it stays Unknown - read as shared -
             // until probe_device_costs allocates on the device and watches what the host loses.
             if (d.is_cpu || props.type == GGML_BACKEND_DEVICE_TYPE_IGPU) d.shares_host_memory = Tri::Yes;
-#if defined(BMOE_HAVE_METAL_MEMORY_PROBE)
-            // Metal reports TYPE_GPU even for a shared physical pool. Ask the native device
-            // before an allocation delta can mistake reused or compressed pages for extra RAM.
-            if (std::strcmp(ggml_backend_reg_name(reg), "MTL") == 0) {
-                d.shares_host_memory = detail::refine_memory_sharing(d.shares_host_memory,
-                                                                     detail::metal_memory_sharing(props.description));
-            }
-#endif
+            // A backend that reports TYPE_GPU for every device (Metal on unified memory, OpenCL on an
+            // integrated GPU) is asked through its own API, which the driver answers as a fixed
+            // property; the allocation delta in probe_device_costs stays for whatever neither tells.
+            if (!d.is_cpu)
+                d.shares_host_memory = detail::refine_memory_sharing(
+                    d.shares_host_memory, detail::native_memory_sharing(ggml_backend_reg_name(reg), props.description));
             // Whether this device will execute over memory the host owns. Asking the backend for a
             // host buffer type is the question; a device that answers is one we can read flash into
             // and it can compute out of, which is exactly the pair of properties a streamed expert
@@ -341,8 +339,13 @@ BackendInventory backend_inventory() {
         const size_t n = ggml_backend_reg_dev_count(reg);
         bool host_side = n > 0;
         for (size_t j = 0; j < n; ++j) {
-            const enum ggml_backend_dev_type t = ggml_backend_dev_type(ggml_backend_reg_dev_get(reg, j));
+            ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, j);
+            const enum ggml_backend_dev_type t = ggml_backend_dev_type(dev);
             if (t != GGML_BACKEND_DEVICE_TYPE_CPU && t != GGML_BACKEND_DEVICE_TYPE_ACCEL) host_side = false;
+            if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                const char * d = ggml_backend_dev_description(dev);
+                inv.graphics.push_back({ggml_backend_reg_name(reg), d ? d : ""});
+            }
         }
         if (!host_side) ++inv.placeable;
     }
@@ -364,6 +367,7 @@ HardwareProfile probe_hardware(const char * model_path) {
     h.lockable_bytes_known = lockable.known;
     h.lock_in_place_bytes = in_place.bytes;
     h.lock_in_place_bytes_known = in_place.known;
+    h.discardable_memory = pio::vm_discard_supported();
     h.n_cores = usable_cores();
     probe_core_classes(h);
 

@@ -122,6 +122,11 @@ public final class APIClient: @unchecked Sendable {
         HFFacts(try await send("POST", "/api/hf/inspect", HF.body(repo: repo, name: name, token: token), timeout: Self.slow))
     }
 
+    /// A catalog entry's header against this device, before its download.
+    public func inspectEntry(id: String) async throws -> ModelCheck {
+        ModelCheck(try await send("POST", "/api/models/inspect", .object(["id": .string(id)]), timeout: Self.slow))
+    }
+
     /// Adds the model to the catalog; answers the new entry's id.
     public func hfAdd(repo: String, name: String, token: String) async throws -> String {
         try await send("POST", "/api/hf/add", HF.body(repo: repo, name: name, token: token), timeout: Self.slow)["id"]
@@ -164,6 +169,9 @@ public final class APIClient: @unchecked Sendable {
     public func applyPlan() async throws -> ConfigState {
         ConfigState(try await send("POST", "/api/plan/apply", nil, timeout: Self.quick))
     }
+
+    /// Reads the release feed: the one network request made only when a person asks.
+    public func update() async throws -> UpdateInfo { UpdateInfo(try await get("/api/update", timeout: Self.slow)) }
 
     // MARK: whose server this is
 

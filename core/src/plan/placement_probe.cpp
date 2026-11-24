@@ -8,6 +8,7 @@
 // is this file and the planner keeps working with `fitted = false` — declining the device axis
 // rather than failing to build.
 
+#include "bmoe/backend_choice.h"
 #include "bmoe/config.h"
 #include "bmoe/probe.h"
 
@@ -45,6 +46,22 @@ constexpr size_t fitter_device_margin_bytes = (size_t) 1 << 30;
 constexpr uint32_t fitter_n_ctx_min = 4096;
 } // namespace
 
+uint32_t probe_engine_layers(const char * model_path) {
+    if (!model_path || !*model_path) return 0;
+    // The loader reads the file's metadata and works the count out as the run will. The same
+    // weightless load the capacity fitter makes: no tensor data is read or mapped, and with no
+    // layer asked of a device none is touched.
+    llama_model_params mp = llama_model_default_params();
+    mp.no_alloc = true;
+    mp.load_mode = LLAMA_LOAD_MODE_NONE;
+    mp.n_gpu_layers = 0;
+    llama_model * model = llama_model_load_from_file(model_path, mp);
+    if (!model) return 0;
+    const int32_t n = llama_model_n_layer(model);
+    llama_model_free(model);
+    return n > 0 ? (uint32_t) n : 0;
+}
+
 Placement probe_placement(const char * model_path,
                           const ModelProfile & model,
                           const HardwareProfile & hw,
@@ -56,15 +73,20 @@ Placement probe_placement(const char * model_path,
                           const SpecConfig * spec) {
     Placement pl;
     if (!model_path || !*model_path || !model.ok) return pl;
+    // One path, as llama.cpp's own loader takes it (common_model_load): the first file of a split set
+    // stands for the set, by the split naming convention, as it did when the fitter took a C string.
+    const std::vector<std::string> model_paths{model_path};
 
-    // The fitter works by asking every device, and a device that did not survive its own probe is
-    // not one to ask again from this process: what ended the probe would end the plan. Nothing is
-    // placed, which is also the answer the run needs - that device is being kept out of it.
-    for (const ComputeDevice & d : hw.devices)
-        if (!d.is_cpu && d.usable == Tri::No) {
-            pl.outcome = "the capacity fitter was not run: " + d.name + " failed its probe";
-            return pl;
-        }
+    // The fitter works by asking every device it is handed, and a device that did not survive its own
+    // probe is not one to ask again from this process: what ended the probe would end the plan. So it
+    // is asked of the others only. One failed device used to stop the fitter for all of them, and a
+    // card that works next to one that does not ran on the CPU (#606).
+    bool dropped = false;
+    const std::vector<std::string> alive = surviving_devices(hw, devices, &dropped);
+    if (dropped && alive.empty()) {
+        pl.outcome = "the capacity fitter was not run: no device survived its probe";
+        return pl;
+    }
 
     // The fitter only touches parameters still at their default, and it refuses to run at all if
     // tensor_buft_overrides is already set — so the experts-on-host pin is not something we pass
@@ -76,7 +98,8 @@ Placement probe_placement(const char * model_path,
     // into, the KV and compute for that context land on the host, the one place that is not.
     cparams.n_ctx = n_ctx ? n_ctx : llama_context_default_params().n_ctx;
     // The widths the session opens with (session_config_from, Session::open): one batch per
-    // context, computed in graphs `n_ubatch` wide, or one graph when that is 0. Left at the fitter's
+    // context, computed in graphs `n_ubatch` wide (the caller hands RunConfig::graph_width, never 0;
+    // a 0 here still reads as one graph as wide as the context). Left at the fitter's
     // defaults, the compute buffers it projects are those of a 512-wide graph whatever the run is
     // about to reserve.
     cparams.n_batch = cparams.n_ctx;
@@ -90,6 +113,9 @@ Placement probe_placement(const char * model_path,
     // The cache's own element types, so the KV it projects is the one the run allocates.
     cparams.type_k = detail::to_ggml_type(type_k);
     cparams.type_v = detail::to_ggml_type(type_v);
+    // And its own size: windowed layers keep their window, as the session opens them
+    // (Session::Impl::create_contexts), not llama.cpp's default of the whole context.
+    cparams.swa_full = false;
 
     std::vector<float> tensor_split(llama_max_devices(), 0.0f);
     std::vector<llama_model_tensor_buft_override> overrides(llama_max_tensor_buft_overrides());
@@ -106,11 +132,13 @@ Placement probe_placement(const char * model_path,
     // own; on a shared pool the projector is the host's and the placement is set aside anyway.
     size_t n_dev_local = 0;
     for (const ComputeDevice & d : hw.devices)
-        if (d.has_own_memory() && d.memory_total > 0) ++n_dev_local;
+        if (d.usable != Tri::No && d.has_own_memory() && d.memory_total > 0) ++n_dev_local;
     const uint64_t projector_reserved = n_dev_local ? model.projector_bytes : 0;
     margins[0] += (size_t) projector_reserved;
+    // Only the devices that add capacity: one layer on an integrated GPU beside a discrete card would
+    // set the whole placement aside below (capacity_devices).
     std::vector<ggml_backend_dev_t> listed;
-    for (const std::string & n : devices)
+    for (const std::string & n : capacity_devices(hw, alive))
         if (ggml_backend_dev_t dev = ggml_backend_dev_by_name(n.c_str())) listed.push_back(dev);
     if (!listed.empty()) {
         listed.push_back(nullptr);
@@ -138,14 +166,14 @@ Placement probe_placement(const char * model_path,
         dcparams.n_outputs_max = 0;
         dcparams.n_ubatch = std::min<uint32_t>(cparams.n_ubatch,
                                                (uint32_t) std::max(spec->draft_max + 1, SpecConfig::mtp_draft_ubatch));
-        draft.path_model = own_head ? spec->mtp_head.c_str() : model_path;
+        draft.paths_model = {own_head ? spec->mtp_head : std::string(model_path)};
         draft.mparams = &dmparams;
         draft.cparams = &dcparams;
         draft.shares_model = !own_head;
     }
 
     const common_params_fit_status st =
-        common_fit_params(model_path, &mparams, &cparams, tensor_split.data(), overrides.data(), margins.data(),
+        common_fit_params(model_paths, &mparams, &cparams, tensor_split.data(), overrides.data(), margins.data(),
                           fitter_n_ctx_min, mtp ? &draft : nullptr, GGML_LOG_LEVEL_WARN);
     if (st == COMMON_PARAMS_FIT_STATUS_ERROR) {
         pl.outcome = "the capacity fitter hit an error; planning as if there were no devices";
@@ -191,9 +219,9 @@ Placement probe_placement(const char * model_path,
     // "Its own" also needs a size, for the reason the prefill rule gives: a pool with no stated
     // size is not one the fitter can have budgeted against.
     std::vector<ggml_backend_dev_t> devs;
-    uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
-    const common_device_memory_data_vec dm = common_get_device_memory_data(model_path, &mparams, &cparams, devs, hp_ngl,
-                                                                           hp_nct, hp_nex, GGML_LOG_LEVEL_WARN);
+    uint32_t hp_ngl = 0, hp_nsk = 0, hp_nct = 0, hp_nex = 0;
+    const common_device_memory_data_vec dm = common_get_device_memory_data(
+        model_paths, &mparams, &cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, GGML_LOG_LEVEL_WARN);
     const ComputeDevice * placed_on_shared = nullptr;
     bool placed_unknown = false;
     for (size_t i = 0; i + 1 < dm.size() && i < devs.size(); ++i) {
@@ -211,9 +239,13 @@ Placement probe_placement(const char * model_path,
     pl.n_gpu_layers = n_dev_local ? mparams.n_gpu_layers : 0;
     // The room left for the projector is a cost of the device only where the run will use one: with
     // no layer placed the session opens without devices and the library loads it on the host.
-    if (pl.n_gpu_layers > 0) pl.device_projector_bytes = projector_reserved;
+    // -1 is llama.cpp's "every layer", which the fitter leaves where the whole model fits: a layer is
+    // on a device for any count but zero, so the projector's room is that device's either way.
+    if (pl.n_gpu_layers != 0) pl.device_projector_bytes = projector_reserved;
     // The fitter writes one layer count per device into tensor_split only when there are several;
-    // with one, every placed layer is that device's.
+    // with one, every placed layer is that device's. A split is a count of layers, which "every layer"
+    // is not: where the fitter left -1 there is none, and the session loads every layer on the devices
+    // llama.cpp chooses (a split must sum to the count it describes, which RunConfig validates).
     if (pl.n_gpu_layers > 0) {
         for (size_t i = 0; i < devs.size(); ++i) {
             const float n = devs.size() > 1 ? tensor_split[i] : (float) pl.n_gpu_layers;
@@ -240,11 +272,10 @@ Placement probe_placement(const char * model_path,
     // placed layer an override moves any of the FFN of is host for all of its experts (below).
     // Anything else went to a device and is not the streamer's to serve.
     const uint32_t n_layer = model.n_layer;
-    const uint32_t on_devices = pl.n_gpu_layers < 0 ? n_layer : std::min<uint32_t>((uint32_t) pl.n_gpu_layers, n_layer);
-    const uint32_t first_device_layer = n_layer - on_devices; // llama.cpp fills devices from the top
+    const LayerSlots slots = layer_slots(pl.n_gpu_layers, n_layer);
 
     std::vector<bool> host(n_layer, false);
-    for (uint32_t il = 0; il < first_device_layer; ++il)
+    for (uint32_t il = 0; il < slots.host_blocks(); ++il)
         host[il] = true;
 
     // A layer's experts never straddle the boundary. The fitter's partial layer can overflow a SHARE
@@ -287,19 +318,20 @@ Placement probe_placement(const char * model_path,
         // fitter's own load mode, and on a CPU-only machine it equals neither the file nor the
         // dense set (measured: 5724 MiB for a 21242 MiB file whose dense set is 2642). What the
         // fitter knows and we do not is the context and compute reservation, and that is what is
-        // taken from it. Dense bytes are pro-rated by the layers still on the host; the embedding
-        // and head are counted as host in full, which over-reserves a little where they offload.
-        const uint64_t dense_on_host =
-            n_layer ? (uint64_t) ((double) model.dense_bytes * (double) (n_layer - on_devices) / (double) n_layer)
-                    : model.dense_bytes;
-        pl.host_resident_bytes = dense_on_host + (uint64_t) cpu.context + (uint64_t) cpu.compute;
+        // taken from it. The dense bytes are where llama.cpp puts them (host_dense_of), not a share
+        // of the whole by layer count: a share counted the embedding tables, which never leave the
+        // host, at the fraction of blocks left here, so every layer on a device counted none of a
+        // table the host holds, and a split counted part of one the run leaves mapped.
+        const HostDense dense = host_dense_of(model, slots);
+        pl.host_resident_bytes = dense.bytes + (uint64_t) cpu.context + (uint64_t) cpu.compute;
+        pl.host_table_bytes = dense.tables;
         for (size_t i = 0; i + 1 < dm.size(); ++i) {
             const uint64_t used = (uint64_t) dm[i].model + (uint64_t) dm[i].context + (uint64_t) dm[i].compute;
             pl.device_bytes += used;
             // The remainder of a card the fitter placed layers on: its free memory, as the fitter
             // read it, less the placement and the margin it was told to leave there (the fitter's
             // own, plus the projector's room on the first device).
-            if (pl.n_gpu_layers > 0 && i < devs.size() && used > 0) {
+            if (pl.n_gpu_layers != 0 && i < devs.size() && used > 0) {
                 const char * name = ggml_backend_dev_name(devs[i]);
                 const bool placed = name && std::any_of(pl.device_split.begin(), pl.device_split.end(),
                                                         [&](const auto & e) { return e.first == name; });
@@ -326,9 +358,9 @@ Placement probe_placement(const char * model_path,
             llama_context_params half = cparams;
             half.n_ubatch = cparams.n_ubatch / 2;
             std::vector<ggml_backend_dev_t> devs_half;
-            uint32_t a = 0, b = 0, c = 0;
-            const common_device_memory_data_vec hm =
-                common_get_device_memory_data(model_path, &mparams, &half, devs_half, a, b, c, GGML_LOG_LEVEL_WARN);
+            uint32_t a = 0, sk = 0, b = 0, c = 0;
+            const common_device_memory_data_vec hm = common_get_device_memory_data(
+                model_paths, &mparams, &half, devs_half, a, sk, b, c, GGML_LOG_LEVEL_WARN);
             if (hm.size() == dm.size()) {
                 const uint64_t span = cparams.n_ubatch - half.n_ubatch;
                 uint64_t dev_half = 0;
@@ -339,6 +371,19 @@ Placement probe_placement(const char * model_path,
                     pl.host_compute_per_token = (pl.raw_host_compute_bytes - host_half) / span;
                 if (pl.device_compute_bytes > dev_half)
                     pl.device_compute_per_token = (pl.device_compute_bytes - dev_half) / span;
+                // The context moves with the width only where a window holds one ubatch of cells beyond
+                // itself; the cells the two widths hold apart are what the difference is made of.
+                pl.n_ctx = cparams.n_ctx;
+                pl.n_swa = model.n_swa;
+                const uint64_t cells = pl.window_cells(cparams.n_ubatch) - pl.window_cells(half.n_ubatch);
+                uint64_t dev_ctx_half = 0;
+                for (size_t i = 0; i + 1 < hm.size(); ++i)
+                    dev_ctx_half += (uint64_t) hm[i].context;
+                const uint64_t host_ctx_half = (uint64_t) hm.back().context;
+                if (cells > 0 && pl.raw_host_context_bytes > host_ctx_half)
+                    pl.host_window_cell_bytes = (pl.raw_host_context_bytes - host_ctx_half) / cells;
+                if (cells > 0 && pl.device_context_bytes > dev_ctx_half)
+                    pl.device_window_cell_bytes = (pl.device_context_bytes - dev_ctx_half) / cells;
             }
         }
 
@@ -352,9 +397,9 @@ Placement probe_placement(const char * model_path,
             half.n_batch = half.n_ctx;
             half.n_ubatch = std::min(cparams.n_ubatch, half.n_ctx);
             std::vector<ggml_backend_dev_t> devs_half;
-            uint32_t a = 0, b = 0, c = 0;
-            const common_device_memory_data_vec hm =
-                common_get_device_memory_data(model_path, &mparams, &half, devs_half, a, b, c, GGML_LOG_LEVEL_WARN);
+            uint32_t a = 0, sk = 0, b = 0, c = 0;
+            const common_device_memory_data_vec hm = common_get_device_memory_data(
+                model_paths, &mparams, &half, devs_half, a, sk, b, c, GGML_LOG_LEVEL_WARN);
             if (hm.size() == dm.size()) {
                 uint64_t whole = 0, halved = 0;
                 for (size_t i = 0; i < dm.size(); ++i) {
@@ -363,6 +408,18 @@ Placement probe_placement(const char * model_path,
                 }
                 pl.context_fixed_bytes = 2 * halved > whole ? 2 * halved - whole : 0;
             }
+        }
+        // A windowed cache holds the window and one ubatch of cells, where a checkpoint copies the window
+        // alone: measured on Gemma 4 26B-A4B, a checkpoint of 106 MiB, 1024 cells, where twice the half
+        // less the whole at an 8192-wide graph was 744 (and nothing at a context too short to halve).
+        // So where a window is measured, a checkpoint is the window at what a cell costs, plus what the
+        // fixed part holds beyond the window and its ubatch of cells (a recurrent state, on a model with
+        // both), never less than the window alone.
+        const uint64_t per_cell = pl.host_window_cell_bytes + pl.device_window_cell_bytes;
+        if (per_cell > 0) {
+            const uint64_t window = per_cell * std::min<uint64_t>(pl.n_swa, cparams.n_ctx);
+            const uint64_t held = per_cell * ((uint64_t) pl.n_swa + cparams.n_ubatch);
+            pl.context_fixed_bytes = window + (pl.context_fixed_bytes > held ? pl.context_fixed_bytes - held : 0);
         }
     }
 

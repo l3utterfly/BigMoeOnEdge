@@ -2,14 +2,25 @@
 
 `bmoe-server` is the engine behind a local web UI. It keeps one model loaded in one `Session`,
 serves the UI's static files, and exposes a small JSON API plus an OpenAI-compatible chat
-endpoint, so any OpenAI client can use it too, and the Anthropic Messages and OpenAI Responses
-APIs that Claude Code and Codex CLI speak.
+endpoint, so any OpenAI client can use it too, the Anthropic Messages and OpenAI Responses
+APIs that Claude Code and Codex CLI speak, and the parts of llama.cpp's own server that its clients
+read ([llama-server compatibility](#llama-server-compatibility)).
 
-It binds to `127.0.0.1` on port 8765 by default and, unless started with a key (`--api-key-file` or
+It binds to `127.0.0.1` on port 8765 by default (`--port N` to change it; `--port 0` takes any free
+port and prints the one it took) and, unless started with a key (`--api-key-file` or
 `--api-key`), has no authentication:
 it is a local program, like the CLI. See [Security model](#security-model) for exactly what that
 does and does not protect. On a machine that stays on it runs as a service of the person's init
 system, started at login and back after a failure: [Running as a service](#running-as-a-service).
+
+**The port, when another program holds it.** Remote-access tools and other servers often sit on
+8765 too. `--port-fallback` lets the server take the next free port instead (up to 20 from the one
+asked for, the one asked for included), and `--port-file PATH` writes the port it took to `PATH`
+(the digits and a newline, through a temporary file and a rename) as soon as the socket is bound,
+before the slow start-up. That is how a program that starts the server learns where it listens: the
+desktop app, the phone apps and a supervisor of your own pass both, remove the file before a start,
+and read the port from it rather than assume one. Without `--port-fallback` a port in use stops the
+server at start, as before. The code is `server/listen_port.h`.
 
 It is also the application framework of this project: the same server, reached the same way,
 stands behind every UI, on the desktop and on a phone ([application-framework.md](application-framework.md)).
@@ -45,6 +56,13 @@ other software, or other people, on that machine or on a network it was told to 
   widens it. A `--host` beyond loopback is refused at start unless a key is set (`--api-key-file`
   or `--api-key`) or `--no-api-key` says the open server is meant, and the server prints a warning
   in that case.
+- The port is the server's alone. Its listening socket is bound exclusively (`SO_EXCLUSIVEADDRUSE`
+  where the stack has it, otherwise only `SO_REUSEADDR`, never the `SO_REUSEPORT` the HTTP library
+  sets by default), so no program started after it can bind the same port and be handed part of its
+  connections, keys and all (up to 0.43.2, one running as the same user could, and on Windows any). Before it binds, the
+  server checks that nothing already answers on the port (a stack may let a specific address be
+  bound beside a wildcard one), and a port something answers on counts as taken. A front-end talks
+  only to the port its own server wrote to `--port-file`, never to one it assumed.
 - With a key, every request to `/api/*` or `/v1/*` must carry `Authorization: Bearer KEY` (or
   `X-Api-Key: KEY`, as Anthropic clients send it), whatever its origin, or is refused with `401` and a `WWW-Authenticate: Bearer` header. The key is
   compared in constant time. The UI's own files are served without it: the UI asks for the key
@@ -53,6 +71,9 @@ other software, or other people, on that machine or on a network it was told to 
   ignored; an empty file refuses to start), and is the way to pass one: a command line, and so
   `--api-key KEY`, is visible to every local user in the process list. `--api-key` stays for
   compatibility; the two together are refused.
+- One exception to the key, as llama-server makes it: `GET` and `HEAD` on `/health` and
+  `/v1/health` answer without it, since a supervisor asks before it holds the key and the answer
+  says only whether a model is ready. The host and origin rules below still apply to them.
 - On loopback it answers only to loopback host names, so a DNS-rebinding page cannot reach it
   through a name of its own.
 - A browser request to `/api/*` or `/v1/*` from anywhere but the UI's own page is refused with
@@ -84,14 +105,28 @@ other software, or other people, on that machine or on a network it was told to 
   responses and a `blob:` the page made from bytes it fetched.
 - A workspace file served for that preview (`GET /api/conversations/<id>/file`, answered `200`) is
   the agent's work, not the UI, and may be a page with script of its own. It carries a policy of
-  its own instead: `Content-Security-Policy: sandbox allow-scripts; default-src 'none'; script-src
-  'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data:
-  blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';
-  frame-ancestors 'self'` and `X-Frame-Options: SAMEORIGIN`, with the same `nosniff` and referrer
-  rules. The `sandbox` directive gives the document an opaque origin however it is opened (framed
-  by the UI with `sandbox="allow-scripts"` and no `allow-same-origin`, or opened directly), so its
-  script runs but cannot read the UI, its storage or the key, cannot reach this server's API or any
-  other host, cannot submit a form, and only the UI's own page may frame it. With a key set, the
+  its own instead, with `X-Frame-Options: SAMEORIGIN` and the same `nosniff` and referrer rules. The
+  `sandbox` directive gives the document an opaque origin however it is opened (framed by the UI
+  with `sandbox="allow-scripts"` and no `allow-same-origin`, or opened directly), so its script runs
+  but cannot read the UI, its storage or the key, cannot reach this server's API (an `http` origin
+  on this machine, which no source in either policy names), cannot submit a form or frame a page,
+  and only the UI's own page may frame it. Whether it may also reach the internet is
+  `--preview-network`:
+  - **off**: `sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src
+    'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; connect-src 'none';
+    object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'`. The page loads
+    nothing from anywhere: anything it takes from the network (a library, a font, data it fetches)
+    is missing. It is not a seal on what leaves: a policy does not govern navigation, so a script
+    that sets `location`, or a link a person follows, can still carry what the page holds to another
+    site. What a preview holds is the agent's own work, so read a page the agent wrote before you
+    preview it when the conversation handled anything private.
+  - **on**: the same, with `https:` added to every kind of load (`script-src 'unsafe-inline'
+    'unsafe-eval' blob: https:`, `style-src`, `img-src`, `font-src`, `media-src`, `connect-src
+    https: wss:`, `worker-src blob: https:`). The page reaches https hosts as any page a person opens
+    does, whatever it loads them for; what it can send there is what the page holds, which is the
+    agent's own work.
+  - **auto** (the default): on when the server listens on loopback only, where the person
+    previewing is the one at this machine; off beyond loopback. With a key set, the
   frame's own request could not carry it: the UI then fetches the bytes with the key and frames a
   `blob:` of them, where the UI's own policy holds and the page's inline script does not run.
 - `max_tokens` on a chat request is clamped to the `n-predict` parameter's upper bound, and one
@@ -117,8 +152,8 @@ other software, or other people, on that machine or on a network it was told to 
 - Some routes answer only a client whose connection comes from this machine, whatever `--host`
   and the key say: they install software, read the network on the person's behalf, or change
   files. They are one list, `local_only_routes()` in `server/access.h`, enforced before routing
-  (`403`, `code: "local_only"`): deleting a model, adding one from a link, and the backend-pack and
-  update routes ([Backend packs and updates](#backend-packs-and-updates)).
+  (`403`, `code: "local_only"`): deleting a model, adding one from a link, choosing the folders
+  models are kept in, and the backend-pack and update routes ([Backend packs and updates](#backend-packs-and-updates)).
 - A server started by an app with `--parent-pid PID` stops when that process ends, so an app that
   crashes leaves no server holding the port and a model's memory.
 - Over the API a client may name one file to open, the model, and it is only read (what it may delete is a model as the listing names it, above). Parameters that make
@@ -238,8 +273,8 @@ metrics show for that answer: tokens generated and the decode speed, prompt toke
 in how long, the context length after the turn, the expert bytes read and the cache hit rate.
 A server that served an agent for a day answers "how much did it read" from its log.
 
-**With the desktop app.** The app looks for a free port from 8765 up, so a service on 8765 and the
-app's own server live side by side; the app's conversations and tasks are the app's. A service
+**With the desktop app.** The app starts its server with `--port-fallback`, so a service on 8765 and
+the app's own server live side by side, the app's on the next free port; the app's conversations and tasks are the app's. A service
 listening beyond loopback is what the phone and the apps connect to over the network, with the
 key, under the same security statement.
 
@@ -278,13 +313,21 @@ key, under the same security statement.
             "compute_threads": 8, "busy_threads": 12,
             "ctx_advice": {"recommended": 16384, "short": true, "param": "ctx-size", "refused": false,
                            "warn": false}},
-  "generating": false
+  "generating": false,
+  "load_elapsed_s": 12.4
 }
 ```
 
+`load_elapsed_s` is present while `state` is `planning` or `loading`: the seconds since that load
+began, planning included. A UI that shows them counts on from the value and the moment it received
+it, so the count is the server's, the same on every screen and after a screen change.
+
 `state` is one of `empty` (no model), `planning` (a load in auto mode is measuring the machine
 before it loads: tens of seconds on a phone, nothing loaded meanwhile), `loading`, `ready`, `error`
-(the last load failed; `error` says why). `model` is `null` unless `state` is `ready`. `streaming` is whether expert streaming is
+(the last load failed; `error` says why). A request that needs the model while one is loading or a
+load in auto mode is measuring first, whoever started it, waits for it rather than being refused,
+and is answered with the loaded model's name.
+`model` is `null` unless `state` is `ready`. `streaming` is whether expert streaming is
 on for the loaded session: with it off the engine is plain llama.cpp on mmap, and the UI must say so.
 Whether a model will stream is only known once it has loaded (a dense model, a plan that declines),
 so a UI says nothing about it before. `compute_threads` and `busy_threads` are what a CPU figure is
@@ -308,7 +351,10 @@ See [Sizing the context for a client](#sizing-the-context-for-a-client).
 ### `POST /api/session/load`
 
 Opens a session with the current config (unloading any loaded one first). Body: optional
-`{"model": "<path>"}`, which sets the `model` parameter first. Returns `202` once the load is under
+`{"model": "<path>"}`, which sets the `model` parameter first; it is saved, and stays the model a
+load opens (and the Plan page plans for while nothing is loaded) until its file is gone: the server
+forgets a saved model whose file no longer exists, at start and after a delete, while one given
+with `-m` at launch stays. Returns `202` once the load is under
 way; progress arrives as `state` events. `400` if the config does not validate (body carries the
 error). With `auto_plan` on, the previous session is unloaded, the machine is measured and the plan
 applied before the load starts, which adds the planner's probes (about 15 s) to the request. When
@@ -321,7 +367,8 @@ Cancels any generation and closes the session. `state` becomes `empty`.
 
 ### `POST /api/cancel`
 
-Stops the running generation at the next decode boundary. Always `200`.
+Stops the running generation at the next decode boundary, or where an image's encoder is when one
+is being encoded. Always `200`.
 
 ## Parameters and config
 
@@ -382,7 +429,9 @@ runs replaces the flag's. `args` is the equivalent `bmoe-cli` command line (for 
 command"). `reload_required` is true when a session-scoped value differs from the loaded
 session's, and `reload_keys` names those parameters in table order (empty with no session). `plan` is the last applied plan's decisions (see below), or `null`. `auto_plan` is
 whether every load plans first: on by default in a build with the planner, always false without
-one; `PUT /api/config` with `{"auto_plan": false}` turns it off, and the choice is saved.
+one; `PUT /api/config` with `{"auto_plan": false}` turns it off, and the choice is saved. The
+server's `--auto` and `--no-auto` set it for one run, over the saved choice and without saving it,
+as engine parameters given at launch do; a choice made through `PUT /api/config` replaces theirs.
 
 ### `PUT /api/config`
 
@@ -390,7 +439,9 @@ Body: `{"values": {key: value, ...}, "reset": [key, ...]}`. Sets the given keys 
 `user_keys`) and resets the listed keys to the server default (they leave `user_keys`), then
 validates. Returns the same object as `GET /api/config`, plus `"rejected": {key: reason}` for
 values that did not parse. A config that fails `validate()` is still stored (a form mid-edit is
-often briefly invalid); `valid`/`error` say so, and `load` refuses it.
+often briefly invalid); `valid`/`error` say so, and `load` refuses it. The config is judged, and
+`args` written, as a load opens it: with streaming off, the knobs that only act on a stream (overlap,
+which the server turns on by default, among them) are dropped first, as the load drops them.
 
 Persisted to `settings.json` in the data directory, so it survives a restart.
 
@@ -408,26 +459,41 @@ Request fields that are read:
 | `tools` | functions the model may call: `{type: "function", function: {name, description, parameters}}`. Any other tool type is refused with `400`. |
 | `tool_choice` | `"auto"` (default), `"none"`, `"required"`. A named function is honoured as `"required"`: the engine can require a call, not choose which. |
 | `stream`, `stream_options.include_usage` | streaming, and a last chunk with the token counts. |
+| `return_progress` | llama-server's field: while the prompt is prefilled, streamed chunks with an empty assistant delta and `prompt_progress: {total, cache, processed, time_ms}`, one before the first piece and one after each. `cache` is the part the context already held; `processed` reaches `total - cache`. |
 | `max_tokens` / `max_completion_tokens` | default: the `n-predict` parameter (also for `null` and `0`), whose server default `0` means no ceiling but the context. Clamped to that parameter's upper bound; a negative or non-integer value is refused with `400`. It is a ceiling, not a reservation: the answer gets at most what the context has left after the prompt and then stops with `finish_reason: "length"`. Only a conversation that leaves no room at all is refused, with `400`. |
 | `think`, `chat_template_kwargs.enable_thinking`, `reasoning_effort` | thinking on or off, most specific first: this server's own `think` (bool), the template argument llama.cpp clients send, then `reasoning_effort`, where `"none"` turns it off and any other level turns it on. Default: on, unless the person set the `think` parameter (a launch flag or a saved setting), which then holds. The apps' conversations do not use this route and keep `think` off by default; a client that never asks gets the model's own reasoning, as from a llama.cpp server. |
 | `response_format` | `{"type":"json_object"}` requests JSON object output; `{"type":"json_schema","json_schema":{"schema":{...}}}` supplies a schema. Omitted, `null` or `{"type":"text"}` leaves the top-level `json_schema` unchanged; without one, output is ordinary text. See the support boundary below. |
 | `json_schema` | llama.cpp-compatible top-level schema for this request. A JSON object supplies schema keywords; `null` or omission adds no constraint. An empty object defaults to `{"type":"object"}`. |
+| `temperature`, `top_p`, `top_k`, `min_p`, `seed` | this request's sampling. A field left out keeps the session's (the `temp`, `top-k`, `top-p` and `seed` parameters); `temperature: 0` is greedy, `seed: -1` a fresh seed. A request that sets none samples exactly as the session does. Bounds: `temperature` 0 to 100, `top_p` and `min_p` 0 to 1, `top_k` a non-negative integer. |
+| `presence_penalty`, `frequency_penalty`, `repeat_penalty`, `repeat_last_n` | the penalties of llama.cpp's sampler (-2 to 2, -2 to 2, above 0, and the tokens looked back over: default 64, `-1` the whole context), counted over the prompt too. Off by default. |
+| `logit_bias` | `{"<token id>": bias}` (OpenAI's) or `[[id, bias], ...]` (llama-server's); a bias of `false` forbids the token. Ids only: a token named by its text is refused. An id outside the vocabulary is a `400`. |
+| `stop` | a string or a list of them: the answer stops before the first that appears (`finish_reason: "stop"`). While the text ends partway into one, that part is held back from the stream, so a client never sees a stop the server then takes back. Matched in the answer only, as the model wrote it (a tool call's syntax included): the reasoning before the answer is not searched, so a stop that appears there does not end the turn with an empty answer. |
+| `grammar` | a GBNF grammar (llama.cpp's grammar language, rule `root`) the whole answer must follow. Not with `tools` or `response_format`, which build their own (`400`). The model is asked not to reason first; a grammar that does not parse is a `400`. |
+| `logprobs`, `top_logprobs` (or llama-server's `n_probs`) | each token's log-probability and up to 20 candidates at its position, from the model's own distribution before sampling, in `choices[0].logprobs.content` (`token`, `logprob`, `bytes`, `top_logprobs` with `id`, `token`, `logprob`, `bytes`). Streamed, each token's chunk carries its own. |
+| `n` | must be 1 (or absent): one choice per request. |
 
-Ignored, because the session fixes them: `model`, `temperature`, `top_p`, `seed` and every
-other sampling field. Sampling is configured with the `temp`, `top-k`, `top-p` and `seed`
-parameters. An audio or file content part is refused with `400` rather than dropped.
+`model` is not read: the loaded model answers. With speculation armed (`mtp`, or the n-gram
+drafter) the session decodes greedily, since a draft is accepted by the model's own argmax: there,
+a request's sampling fields are read and not applied (said once in the log), while `stop`,
+`grammar` and `logprobs` still are. An audio or file content part is refused with `400` rather than
+dropped.
 
 **Images.** A model loaded with its projector reads them (`GET /api/info` says so: `model.vision`,
 and `model.projector` names the file). The projector is the `mmproj` GGUF the model's own conversion
-writes; put it in the model's folder and the server pairs the two by their headers (both name the
-same base model in `general.name`; failing that, the folder's only projector), or name it with the
-`mmproj` parameter. Any model llama.cpp's projector library knows, in any quantization of either
+writes; put it in the model's folder and the server pairs the two by their headers: both name the
+same base model in `general.name`, letters and digits compared. A projector that names another
+model is never paired, however alone it is in the folder; the folder's only projector goes with a
+model only when one of the two headers has no name to check. Or name it with the `mmproj`
+parameter. Any model llama.cpp's projector library knows, in any quantization of either
 file: nothing here names a family. An image travels inline, as a data URL on every protocol; a URL
 to fetch is refused with `400`, since a server on a network must not be made to fetch what a client
 names. Only a user message carries images, at most 8 of them, and one declaring more than 64
-megapixels is refused with the reason before it is decoded (the projector downsizes every image to
-its own few hundred pixels a side, so no photo loses by being sent smaller); each is `400`. An image
-part placed between text parts keeps its place in the prompt. The same image sent
+megapixels is refused with the reason before it is decoded; each is `400`. What an image costs is
+its tokens, each prefilled like a prompt token: a fixed-size projector takes the same few hundred
+from any image, one whose count follows the image's size takes thousands from a photo at its own
+cap, and the `image-max-tokens` parameter lowers that cap (the projector sizes the image down to
+fit), which a host that prefills image tokens slowly wants. An image part placed between text parts
+keeps its place in the prompt. The same image sent
 again in the same conversation is not encoded or prefilled again: the KV prefix is reused through
 it, and a different image at the same place is where the reuse ends. A request with images to a
 model loaded without a projector is `400` with `code: "no_vision"`. While a conversation holds an
@@ -493,10 +559,11 @@ unsupported keywords do not gain a guarantee merely because they appear in the r
 JSON syntax and a schema cannot guarantee that the generated values are factually correct.
 
 Thinking and speculative decoding use the existing template grammar path. Tool combinations
-are template-dependent: the pinned Qwen3.5 specialized parser produces an invalid lazy grammar
-for a response schema with offered tools and `tool_choice: "auto"`; that request returns `400`
-with `code: "template_rejected"` before inference. The differential Qwen3 parser accepts this
-combination and produces a JSON answer. Both tested parsers give JSON precedence over required
+are template-dependent. A response schema with offered tools and `tool_choice: "auto"` produces a
+JSON answer with both tested parsers (the differential Qwen3 one and the specialized Qwen3.5 one,
+whose grammar llama.cpp could not build before the pin of 0.47.0: that request returned `400` with
+`code: "template_rejected"`, as any template whose grammar cannot be built still does, before
+inference). Both tested parsers give JSON precedence over required
 tool calls, so a response schema with `tool_choice: "required"` (including a named-function choice)
 is explicitly refused with `400` / `invalid_request`, instead of silently ignoring the requirement.
 These cases are covered by vendored-template regressions; tools are not universally disabled.
@@ -528,7 +595,10 @@ other.
 
 **One generation at a time, in order.** A request that arrives while another runs waits its turn;
 while it waits, a streaming response receives SSE comment lines (`: waiting for a turn`) so the
-connection stays open. A client that disconnects while it waits gives its place up and stops
+connection stays open. Once its turn runs, any 15 s with nothing to send (a long prefill, a
+stretch the parser holds back) gets a keep-alive on every streaming endpoint (a `: ping`
+comment; `event: ping` on `/v1/messages`): a client or proxy that drops a silent stream never sees
+one, however slow the machine or long the call. A client that disconnects while it waits gives its place up and stops
 nothing else; a streaming client that disconnects during its own answer stops that answer. A
 disconnect never ends another client's turn. With 16 requests already waiting the next gets `429`.
 
@@ -537,19 +607,28 @@ Chunks are OpenAI `chat.completion.chunk` objects; the delta carries `content` a
 reasoning models, `reasoning_content`. When the chat parser reclassifies already-sent text (a
 closing reasoning tag), a chunk carries `"bmoe": {"reset": true}` and its delta holds the FULL
 `content` / `reasoning_content` so far, which the client must use to replace, not append; a client
-that does not know the extension appends it. Tool calls arrive in one delta after the text, each
-whole (`index`, `id`, `type`, `function.name`, `function.arguments`), because a call is only known
-once the turn has been parsed. The last choice chunk has `finish_reason` (`stop`, `length`,
-`tool_calls`, or `cancelled`) and `"bmoe": {"summary": {...}}` with the run summary (same keys as
-the `done` event). With `stream_options.include_usage`, one more chunk follows with empty `choices`
+that does not know the extension appends it. Tool calls stream while the model writes them, as
+the protocol has it: a call's first delta carries its `index`, `id`, `type` and `function.name`,
+and the following ones pieces of `function.arguments` by `index`, which a client appends. The
+same per-token parse that separates the reasoning reads the calls, with the model's own template,
+so this holds for every tool, model and call format; a call opens once its arguments begin (its
+name is whole by then), keeps the id it opened with, and its arguments are only ever appended to,
+held back to the last whole UTF-8 character. A call no token showed (a template the partial parse
+cannot read) arrives whole after the text, as before. The last choice chunk has `finish_reason` (`stop`, `length`,
+`tool_calls`, or `cancelled`), `"bmoe": {"summary": {...}}` with the run summary (same keys as
+the `done` event) and llama-server's `timings` object. With `stream_options.include_usage`, one more chunk follows with empty `choices`
 and `usage`.
 
 Non-streaming response: a `chat.completion` object with `message.content` (`null` on a turn that
 only calls tools), `message.reasoning_content`, `message.tool_calls`, `usage` and `bmoe.summary`.
-`usage.prompt_tokens` is the whole prompt the answer was conditioned on.
+`usage.prompt_tokens` is the whole prompt the answer was conditioned on. Both forms carry
+llama-server's `timings`: `cache_n` (prompt tokens the context held), `prompt_n`, `prompt_ms`,
+`prompt_per_token_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`,
+`predicted_per_token_ms`, `predicted_per_second`.
 
-Not implemented: `/v1/completions`, `/v1/embeddings`, `stop`, `n` above 1, and per-request
-sampling.
+The route answers at `/chat/completions` too, as llama-server's does.
+
+Not implemented: `/v1/completions`, `/v1/embeddings`, and `n` above 1.
 
 ### Sizing the context for a client
 
@@ -575,7 +654,7 @@ leaves a smaller cache and a slower decode on a machine that is short of memory.
 ### `GET /v1/models`
 
 `{"object": "list", "data": [{"id": "<model file name>", "object": "model", "owned_by": "local",
-"modalities": ["text", "image"]}]}` with the loaded model, or an empty list. `modalities` is this
+"modalities": ["text", "image"]}]}` with the loaded model, or an empty list. Also at `/models`. `modalities` is this
 server's addition: `["text"]` without a projector, so a client knows whether to send an image.
 
 ### Agent protocols: what the two below share
@@ -605,14 +684,21 @@ each agent at the server. What they share:
   snapshot that reclassifies earlier text is not sent until a later one extends it again. The
   parser holds back markup it cannot classify yet, so in practice the stream carries the whole
   answer; if a final answer does not extend what was sent, the client keeps what it holds. Tool
-  calls are known whole once the turn is parsed, and arrive after the text, each in one piece.
+  calls stream the same way while the model writes them: a call opens as a `tool_use` block
+  (Messages) or a `function_call` item (Responses) once its arguments begin, its input arriving as
+  `input_json_delta` / `function_call_arguments.delta` pieces under the id the final answer uses.
+  Blocks and items are sequential, so the open text block closes first, and text the model writes
+  while a call is open waits for it. The pieces are what the model wrote; a call whose arguments do
+  not end as a JSON object reaches the client as written (sent before the turn ended, it cannot be
+  replaced by `{}`). A call no token showed arrives whole after the text, as before.
   A reasoning model's thinking is sent as thinking (Messages) or reasoning items (Responses)
   whether or not the client asked to see it, so that the client returns it in the next request
   and the prompt still matches the KV.
 - **Images** are read as on the chat endpoint (Images, above): inline as base64, on a model loaded
   with its projector. **Files** are refused with `400` rather than dropped.
-- **Ignored**: `model` (the loaded one answers), `temperature`, `top_p`, `top_k` and every other
-  sampling field, as on the chat endpoint, and the fields that only mean something to a hosted
+- **Sampling**: `temperature` and `top_p` on both, and `top_k` on Messages, are this request's, as
+  on the chat endpoint (with its bounds, and its rule under speculation).
+- **Ignored**: `model` (the loaded one answers), and the fields that only mean something to a hosted
   service (prompt caching, metadata, `store`, `include`, `prompt_cache_key`, `parallel_tool_calls`).
 
 ### `POST /v1/messages`
@@ -628,14 +714,16 @@ The Anthropic Messages API. Request fields that are read:
 | `max_tokens` | the budget, read as `max_tokens` on the chat endpoint. Required by the protocol; absent, the `n-predict` parameter. |
 | `thinking` | `{type: "enabled"}` or `"adaptive"` turns thinking on, `"disabled"` off; absent, on unless the person set the `think` parameter. `budget_tokens` and `display` are not read. |
 | `output_config.format` | `{type: "json_schema", schema}`: the answer must match the schema, as `response_format` on the chat endpoint. |
+| `temperature`, `top_p`, `top_k` | this request's sampling, as on the chat endpoint. |
+| `stop_sequences` | the answer stops before the first that appears, as `stop` on the chat endpoint; `stop_reason` is then `stop_sequence` and `stop_sequence` names it. |
 | `stream` | stream the answer as events. |
 
-Also accepted and not read: `stop_sequences` (the engine has no stop strings), `metadata`,
+Also accepted and not read: `metadata`,
 `cache_control`, `context_management`, `output_config.effort`.
 
 Non-streaming response: a `message` with `content` blocks in order, a `thinking` block (with an
 empty `signature`: a local model has none to give), a `text` block, then a `tool_use` block per call
-with its `input` as an object; `stop_reason` `end_turn`, `max_tokens` or `tool_use` (a cancelled
+with its `input` as an object; `stop_reason` `end_turn`, `max_tokens`, `tool_use` or `stop_sequence` (a cancelled
 turn is `end_turn`); `usage` with `input_tokens` (the part of the prompt prefilled for this turn),
 `cache_read_input_tokens` (the part the KV already held) and `output_tokens`; and `bmoe.summary`.
 
@@ -644,14 +732,16 @@ run), then content blocks, each `content_block_start` / `content_block_delta` / 
 thinking (`thinking_delta`, closed by an empty `signature_delta`), text (`text_delta`), and one
 `tool_use` block per call with its whole input in one `input_json_delta`. Then `message_delta` with
 the `stop_reason` and the full `usage` (and `bmoe.summary`), and `message_stop`. While the request
-waits its place in line, `event: ping`.
+waits its place in line, and after any 15 s of its turn with nothing else to send, `event: ping`.
 
 ### `POST /v1/messages/count_tokens`
 
-The same body as `/v1/messages`, answered with `{"input_tokens": N}`. N is an estimate from the
-request's length (about 3 bytes of text per token, on the high side for an agent's prompt of code
-and JSON schemas), not a count: the engine exposes no tokenizer outside a turn. It needs no loaded
-model.
+The same body as `/v1/messages`, answered with `{"input_tokens": N}`. With a model ready, N is the
+prompt the request renders to, by the model's own template, counted by its tokenizer: what a turn
+would decode from an empty context. With no model ready, or for a request carrying images (the
+projector sizes those), it is an estimate from the request's length (about 3 bytes of text per
+token, on the high side for an agent's prompt of code and JSON schemas). Counting never waits for
+a running turn.
 
 ### `POST /v1/responses`
 
@@ -669,6 +759,7 @@ state they name; `store` itself is accepted and not read. Request fields that ar
 | `max_output_tokens` | the budget, read as `max_tokens` on the chat endpoint. |
 | `reasoning.effort` | `"none"` turns thinking off, any other level on; absent, on unless the person set the `think` parameter. |
 | `text.format` | `{type: "json_schema", schema}` or `{type: "json_object"}` constrains the answer, as `response_format` on the chat endpoint. |
+| `temperature`, `top_p` | this request's sampling, as on the chat endpoint. |
 | `stream` | stream the answer as events. |
 
 Non-streaming response: a `response` object with `status` `completed`, or `incomplete` with
@@ -682,10 +773,38 @@ Streaming response: each event named in `event:` and in its data's `type`, numbe
 `sequence_number`. `response.created` and `response.in_progress`; then per item
 `response.output_item.added`, its deltas (`response.reasoning_text.delta` for reasoning;
 `response.content_part.added`, `response.output_text.delta`, `.done` and
-`response.content_part.done` for a message; `response.function_call_arguments.delta` and `.done`,
-the whole arguments in one delta, for a call) and `response.output_item.done` with the item whole;
+`response.content_part.done` for a message; `response.function_call_arguments.delta` and `.done`
+for a call, the arguments in pieces while the model writes them) and `response.output_item.done` with the item whole;
 and last `response.completed` (or `response.incomplete`) with the response object, its `output`
-and `usage`. While the request waits its place in line, an SSE comment.
+and `usage`. While the request waits its place in line, and after any 15 s of its turn with
+nothing else to send, an SSE comment.
+
+## llama-server compatibility
+
+Clients written for llama.cpp's own server (`llama-server`) read more than the OpenAI protocol: its
+answer timings, its prompt progress, and a handful of endpoints of its own. These answer here in
+llama-server's shapes (`server/llama_compat.h`), copied as a wire format: nothing of llama-server
+is linked, so a llama.cpp upgrade does not touch them. None of them runs a turn, and none waits for
+one. Each answers `503` `no_model` when it needs a model and none is ready. They are the engine,
+under the same key and origin rules as `/api/*` and `/v1/*`, except that `/health` (and
+`/v1/health`) answers without the key.
+
+| route | answer |
+|---|---|
+| `GET /health` (and `/v1/health`) | answered without the API key (`GET` and `HEAD`), as llama-server does. `{"status": "ok"}` with a model ready; `503` with `code: "loading"` while one loads or the plan measures, `no_model` with none (after a load that failed, its message says why). |
+| `GET /props` | `default_generation_settings` (`n_ctx`, and `params` with `n_predict`, `temperature`, `top_k`, `top_p`, `seed`: the session's sampling), `total_slots: 1`, `model_alias`, `model_path`, `modalities` (`vision`), `build_info`. |
+| `GET /metrics` | Prometheus text under llama-server's names: the counters `llamacpp:prompt_tokens_total` (decoded, the cached part excluded), `prompt_tokens_cached_total`, `prompt_seconds_total`, `tokens_predicted_total`, `tokens_predicted_seconds_total`, `n_tokens_max`, and the gauges `prompt_tokens_seconds` and `predicted_tokens_seconds` (rates over the turns since the previous scrape) and `requests_processing`, `requests_deferred`. Always on: there is no `--metrics` flag. |
+| `GET /slots` | the one slot: `[{"id": 0, "n_ctx": ..., "is_processing": ...}]`. Saving and restoring a slot is not implemented. |
+| `POST /tokenize` | `{"content": "...", "add_special": false, "parse_special": true, "with_pieces": false}` (llama-server's defaults) to `{"tokens": [ids]}`, or `[{"id", "piece"}]` with `with_pieces`; a piece that is not whole UTF-8 is its bytes. `content` must be a string. |
+| `POST /detokenize` | `{"tokens": [ids]}` to `{"content": "..."}`, special tokens spelled out. An id outside the vocabulary is a `400`. |
+| `POST /apply-template` | a chat completions body (messages, tools, `think`, `response_format`) to `{"prompt": "..."}`: what a turn would decode, by the model's own template. |
+| `POST /chat/completions/input_tokens` (and `/v1/...`) | a chat completions body to `{"input_tokens": N}`, counted as `count_tokens` counts. |
+| `POST /responses/input_tokens` (and `/v1/...`) | a Responses body to `{"object": "response.input_tokens", "input_tokens": N}`. |
+
+`/chat/completions`, `/responses` and `/models` answer as their `/v1` routes. Not implemented, from
+llama-server: `/completion` and `/v1/completions` (raw text completion), `/infill`, embeddings and
+reranking, LoRA adapters, slot save and restore, serving several models (`/models/load`), and
+parallel slots: this server answers one turn at a time.
 
 ## Decide
 
@@ -711,7 +830,7 @@ prompt past the context; `503` with no model loaded. The request waits its turn 
  "n_prefilled": 32, "restore_s": 0.02, "store_s": 0.01, "prefill_s": 0.9, "prefill_cpu_s": 3.1,
  "prefill_read_mib": 410.0, "prefill_io_s": 0.3, "prefill_stall_s": 0.1, "prefill_mgmt_s": 0.0,
  "prefill_dev_tokens": 0, "prefill_dev_read_mib": 0.0, "prefill_dev_stall_s": 0.0,
- "prefill_dev_routed": 0, "prefill_dev_demand": 0, "prefix_state_mib": 48.0}
+ "prefill_dev_cache_mib": 0.0, "prefill_dev_routed": 0, "prefill_dev_demand": 0, "prefix_state_mib": 48.0}
 ```
 
 `choice_logp[i]` is the log-probability of the first token of `choices[i]` over the whole
@@ -744,10 +863,31 @@ their state and tools (to a client on loopback; `[]` to one on the network). A s
 chat, sent to the model with no system prompt and no tools, as before the agent, and adding a
 workspace or a task is `409` with `code: "chat_only"`. A UI reads this and shows only what works.
 
+**The system prompt.** A conversation's `system` is the person's own system prompt, set on `POST
+/api/conversations` or `PATCH /api/conversations/<id>` (`""` for none, at most 8 KiB, `409 busy`
+while a run goes): the whole prompt in a conversation with no folder, after the agent's lines in one
+with a folder. `GET /api/conversations/<id>/system` answers what the model reads before the
+conversation, exactly as sent (`text`), the person's part (`own`), and `tokens`, its size counted by
+the loaded model's tokenizer (the count [`/tokenize`](#llama-server-compatibility) gives; `null` with
+no model ready or on a provider route). A client of `/v1/chat/completions`, `/v1/messages`
+(`system`) or `/v1/responses` (`instructions`) sends its own, which reaches the model as written.
+
 **Runs.** `POST /api/conversations/<id>/messages` answers `202 {item}` as soon as the person's item
 is stored; everything after that arrives on `/api/events` (`conversation`, `item`, `delta`) and is
 in the stored conversation. A UI that reconnects reads `GET /api/conversations/<id>`. An approval
-card is a `tool` item in state `waiting`, answered with `POST .../approval` on its conversation. `POST .../stop` answers once the run has ended.
+card is a `tool` item in state `waiting`, answered with `POST .../approval` on its conversation.
+
+`POST /api/conversations/<id>/stop` requests cancellation for that conversation and waits up to
+30 s for its run to finish. The response is `{stopped}`: `false` when no run was found, `true`
+when a stop was requested, including if that wait expires before completion. Read the
+conversation's state or follow its events to observe the end of the run. For the local-model
+route, cancellation reaches the session that owns the turn independently of generated-token
+callbacks, so an image encoder or prompt prefill can stop at the engine's cancellation points
+before any answer token. Stopping a round still queued for the engine withdraws only its own
+place, leaving another client's active turn running. The engine reads the run's own atomic flag
+alongside its cancel latch, only during that turn, so a latch reset cannot drop the stop and it
+cannot carry over to the next. `POST /api/cancel` remains the route for cancelling the server's
+current generation.
 
 **Errors.** `{"error", "code"}`, with these codes:
 
@@ -794,7 +934,7 @@ limit.
 |---|---|
 | `state` | the `GET /api/info` object, on every state change |
 | `token` | per generated token: `step`, `steps`, `wall_ms`, `io_ms`, `compute_ms`, `mgmt_ms`, `stall_ms`, `flash_wait_ms`, `read_mib`, `cache_hit_pct` (-1 without a cache), `cache_budget_mib`, `rss_mib`, `mem_available_mib`, `majflt`, `cpu_ms`, `dense_resident_frac` (-1 unmeasured), `mtp_batch`, `cpu_temp_c` (the mean of the CPU's thermal sensors in °C, sampled every 1.5 s; absent where the platform publishes none a process may read: macOS, iOS, Windows) |
-| `done` | per generation, the CLI's `BMOE_DONE` keys (`docs/telemetry.md`): `cancelled`, `tokens`, `tok_s`, `load_s`, `prefill_s`, `prefill_tps`, `prefill_read_mib`, `prefill_dev_tokens`, `n_prompt`, `n_past`, `cache_hit_pct`, `read_mib`, `io_s_tok`, `compute_s_tok`, `stall_s_tok`, `flash_wait_s_tok`, `mgmt_s_tok`, `majflt_tok`, `cpu_s_tok`, `loop_overhead_s_tok`, `cache_resident_mib`, `cache_budget_mib`, `cache_evictions`, `cache_rereads`, `token_demand_mib`, `mtp_drafted`, `mtp_accepted`, `mtp_decodes`, `drafted_steps`, `mtp_draft_s_tok`, `ttft_s` |
+| `done` | per generation, the CLI's `BMOE_DONE` keys (`docs/telemetry.md`): `cancelled`, `tokens`, `tok_s`, `load_s`, `prefill_s`, `prefill_tps`, `prefill_read_mib`, `prefill_dev_tokens`, `n_prompt`, `n_past`, `cache_hit_pct`, `read_mib`, `io_s_tok`, `compute_s_tok`, `stall_s_tok`, `flash_wait_s_tok`, `mgmt_s_tok`, `majflt_tok`, `cpu_s_tok`, `loop_overhead_s_tok`, `cache_resident_mib`, `cache_budget_mib`, `cache_evictions`, `cache_rereads`, `cache_discarded`, `token_demand_mib`, `mtp_drafted`, `mtp_accepted`, `mtp_decodes`, `drafted_steps`, `mtp_draft_s_tok`, `ttft_s` |
 | `decide` | per decision: the `POST /api/decide` answer |
 | `download` | a download's progress: `id`, `file`, `received`, `total`, `state` (`running`, `done`, `error`, `cancelled`), `error` (with `running`: why the last attempt failed while the server waits to resume) |
 | `backend` | a backend pack's install: `id` (the pack), `kind` (`backend`), `file`, `received`, `total`, `state` (`running`, `done`, `error`, `cancelled`), `error` (with `running`: the step, such as `unpacking`); with `done`, `restart_required` and `in_place` (false when the pack replaces one in use and takes its place at the next start) |
@@ -803,7 +943,7 @@ limit.
 | `plan_progress` | a measurement (`GET /api/plan?measure=1`, or an auto load) entering a stage: `step` (`devices`, `model`, `compute`, `storage`, `memory`, `placement`, `rules`), its words `label`, `index` from 0 and `count`; then `{"step": "done"}` when it ends. A UI shows `label`; `step` is the protocol |
 | `conversation` | an agent conversation's `{id, title, state, updated}`, whenever one of those changes ([agent.md](agent.md#events)) |
 | `item` | `{conversation, item}`: an agent item added or changed, whole |
-| `delta` | `{conversation, item, text?, reasoning?}`: what a streaming assistant item adds |
+| `delta` | `{conversation, item, text?, reasoning?, arguments?}`: what a streaming assistant item adds, or (`arguments`) what a `composing` tool call adds to its arguments |
 | `task` | an agent task, after it is saved and after a run of it starts or ends |
 | `log` | one engine diagnostic (`bmoe/log.h`): `level` (`info`, `warn`, `error`) and `message`, the line the server also writes to stderr after `bmoe: `. For a person to read; a client decides nothing on its wording |
 
@@ -821,6 +961,8 @@ a UI shows "flash" from them without knowing whether the session overlaps.
 {
   "models_dir": "C:/Users/me/AppData/Local/BigMoeOnEdge/models",
   "scan_dirs": [],
+  "folders": {"default_models_dir": "C:/Users/me/AppData/Local/BigMoeOnEdge/models", "chosen_models_dir": "",
+              "models_dir_at_launch": false, "launch_scan_dirs": [], "chosen_scan_dirs": []},
   "local": [{"name": "Qwen3-30B-A3B-Q4_K_M.gguf", "path": "...", "dir": "C:/Users/me/AppData/Local/BigMoeOnEdge/models",
              "folder": "", "bytes": 18556686912, "shards": 1, "files": ["..."], "arch": "qwen3moe",
              "role": "model", "streamable": true, "complete": true}],
@@ -844,10 +986,15 @@ the directory a model was found in, `folder` the folder inside it ("" for the di
 and `files`
 every file of it that is present, in shard order, so a client that deletes a model deletes the set
 and never has to know how shards are named. A scan directory is only read: downloads land in the
-models directory, and a model in a scan directory is loaded in place by its `path`. The host app is
+models directory, and a model in a scan directory is loaded in place by its `path`. A file reachable
+from two of the listed places (a scan directory inside the models directory, a link) is one row, from
+the first place that listed it. The host app is
 what knows where else models sit (the phone's adb-pushed and shared-storage folders); the server is
 what says what they are. `streamable` is whether this build streams the
-architecture. `role` is what the file is for, read from its header and never from its name:
+architecture, `arch` the header's (`""` when it could not be read, as for a split set missing a
+shard: the reading takes every shard's header). The reading is kept with each present shard's size
+and modification time, so a shard that lands or changes later retakes it on the next listing; a UI
+says how a model runs only once `complete` and `arch` are set. `role` is what the file is for, read from its header and never from its name:
 `model`; `projector` (a multimodal projector: `general.type` is `mmproj`, or the projector
 architecture `clip`; a model entry's own `projector` is the name of the one in its folder that goes
 with it, by `general.name`, "" when none does); `draft` (a draft head for speculative decoding: it names another model's
@@ -862,12 +1009,66 @@ app too; `file` and `bytes` are the first file's name and the whole entry's size
 become: `name` a bare file name (no separator, no `.` or `..`, no drive colon), `url` an https
 URL (plain http only under an http mirror named with `--hf-endpoint`), `sha256` a digest when present. An entry with a file that fails this is not listed, and the
 reason is in the server's start-up log; the Android and iOS apps drop such an entry too.
+The shipped catalog names every file at a repository commit (`resolve/<40-hex commit>/`), never at
+a branch: a branch moves when the repository's owner uploads again, and the row's `bytes` and
+`sha256` would then refuse the new file at the end of its download, on every release already out
+(#663). `bmoe_server_test` fails a row that names a branch or carries no `sha256`.
 `received` is what of the entry is already in the models directory, complete files and `.part`
 files alike, and `partial` is true when the entry is `available` with a `.part` on disk: a download
 stopped by a failure, a cancel or a restart of the server (jobs live in memory, the `.part` files do
 not), which downloading again resumes. A UI labels that action **Resume (X of Y GB)** (decimal GB,
 `received` of `bytes`) and offers **Delete partial download** beside it. The phone's app downloads
 into the server's models directory, so the same two fields describe its downloads too.
+
+`folders` says where the two lists come from. The models directory is `--models-dir` when the server
+was started with one (`models_dir_at_launch`), otherwise the one a person chose
+(`chosen_models_dir`, "" for none), otherwise `default_models_dir` (`<data dir>/models`). The scan
+directories are those of `--scan-dir` (`launch_scan_dirs`) followed by the chosen ones
+(`chosen_scan_dirs`). A chosen folder that is gone when the server starts (a drive unplugged) is set
+aside for that run, with a warning in the log, and comes back with the drive.
+
+### `PUT /api/models/folders`
+
+```json
+{"models_dir": "D:/models", "scan_dirs": ["E:/gguf"]}
+```
+
+Chooses where models are kept, as a person would in a settings screen, and keeps the choice in
+`settings.json` (`model_folders`). `models_dir` is the folder downloads land in, "" for the default;
+`scan_dirs` the other folders listed, each read only, replacing the chosen ones (the launch's stay).
+A field left out is left as it is. The change applies at once and the answer is the new
+`GET /api/models`, and a `models_folders` event is published for clients that list on events. Every path must be
+absolute, the models folder is created when missing and must take a new file, each scan folder must
+exist (`400` with the reason otherwise). `409` while a download runs (its files are being written to
+the folder it started in), and for a models folder when the server was started with `--models-dir`.
+Models and partial downloads in the old folder stay where they are, and are listed again only when
+that folder is among the scan folders. Local-only (`403`, `code: "local_only"`, from the network):
+it names a folder the server writes to.
+
+### `POST /api/models/inspect`
+
+Body `{"id": "<catalog id>"}`. What a catalog entry is on this machine before a byte of it is
+downloaded: the check [`POST /api/hf/inspect`](#post-apihfinspect) makes of a repository's model,
+asked by the entry's id and read from the entry's own files (the first tens of megabytes of each,
+through a range request), so a client never takes a URL apart to ask it.
+
+```json
+{"id": "gemma-4-26b-a4b-it-q4_0", "title": "Gemma-4-26B-A4B-it", "quant": "Q4_0", "bytes": 14618145824, "files": 1,
+ "model": {...}, "machine": {...},
+ "verdict": {"downloadable": true, "mode": "streams", "fit": "fits",
+             "headline": "Fits here: the experts stream from flash",
+             "summary": "Runs here. It is larger than the memory free now, so it reads the parts it needs from storage as it answers.",
+             "tone": "ok", "disk": "...", "memory": "..."}}
+```
+
+`model`, `machine` and `verdict` are those of `/api/hf/inspect`, field for field. The first run of
+every front-end asks this when a model is picked, the suggested one included, and shows
+`verdict.summary` in the colour of `verdict.tone`, with Download held while the answer is on its way
+and where `downloadable` is false. No token goes with the request, whatever the entry: an entry
+added from a link may be on any host, and a repository's token is for the repository alone, so an
+entry of a gated repository is not checked here (`502`). `404` (`code: "not_found"`) for an id no
+entry has, `502` (`code: "upstream"`) when a header could not be fetched: a client then says the
+check could not be made and lets the download go ahead, which has its own checks.
 
 ### `POST /api/models/download`
 
@@ -909,7 +1110,9 @@ Windows) puts the others back, deletes nothing and answers `500` naming it. `400
 that is not one (a separator, `..`, a drive), `404` when the models directory has no such model (a
 scan directory's models are loaded in place and never deleted here), `409` with `code: "in_use"`
 while it is loaded or loading (unload it first) or while a running download writes one of its
-files, `403` with `code: "local_only"` from a client whose connection is not loopback.
+files, `403` with `code: "local_only"` from a client whose connection is not loopback. When the
+deleted model was the saved `model` setting, that setting is forgotten too and a `config` event says
+so: there is nothing left to load or plan for under that name.
 
 ### `POST /api/models/url`
 
@@ -979,7 +1182,7 @@ megabytes of each shard) and parsed by the planner's own model probe, set agains
 {"repo": "...", "revision": "main", "name": "gemma-4-26B-A4B-it-Q4_0.gguf", "quant": "Q4_0",
  "bytes": 14618145824, "files": 1, "complete": true,
  "model": {"readable": true, "arch": "gemma4", "role": "model", "type": "model", "block_count": 30, "is_moe": true, "n_expert": 128, "n_expert_used": 8,
-           "n_layer": 30, "n_moe_layer": 30, "n_embd": 2816, "dense_bytes": 1755954296,
+           "n_layer": 30, "n_moe_layer": 30, "n_embd": 2816, "dense_bytes": 1755954296, "resident_bytes": 1755954296,
            "expert_bytes": 12846366720, "token_cycle_bytes": 802897920, "largest_dense_tensor": 784334848,
            "has_mtp": false, "streamable": true, "refusal": ""},
  "machine": {"residency_budget": 5736517632, "budget_if_loaded": 5736517632, "loaded_model": "", "loaded_held": 0,
@@ -990,7 +1193,10 @@ megabytes of each shard) and parsed by the planner's own model probe, set agains
              "memory": "the experts stream from flash and 1674 MiB stays resident, plus a cache of at least one token cycle (765 MiB); that fits in the 5470 MiB this process may hold, and the plan sizes the cache from the rest"}}
 ```
 
-`model.readable` false means the header did not parse, and the rest of `model` is empty; a MoE
+`model.resident_bytes` is what stays in memory while the experts stream: `dense_bytes` less the
+tables the graph only reads a row at a time (an embedding table not tied to the head, and a
+per-layer one, which on some models is most of the dense bytes), since the plan leaves them mapped;
+the verdict weighs it, not `dense_bytes`. `model.readable` false means the header did not parse, and the rest of `model` is empty; a MoE
 whose experts this engine does not stream carries the reason in `refusal` and `streamable` false.
 `model.role` is what the file is for, by its header, as `GET /api/models` has it; `type` and
 `block_count` are the header's `general.type` and `<arch>.block_count` it was read from. A file
@@ -1008,6 +1214,16 @@ floor is more than this process may hold), `no_disk` (the disk cannot take it), 
 `unknown` (the header did not parse, or it streams and the memory free here could not be read,
 which the headline says). A UI keeps no threshold of its own; it shows the line and
 colours by the code, and a code it does not know gets no colour.
+
+`verdict.summary` and `verdict.tone` are the same answer for a person who is not choosing an
+engine: one sentence with no engine term in it ("Runs here, whole in memory: the fastest answers.",
+"Runs here. It is larger than the memory free now, so it reads the parts it needs from storage as
+it answers.", "Too large for the memory free here now: it may not start, or answer very slowly.",
+"Not enough free storage here to download it."), and the tone it is said in: `ok`, `warn`, `err`,
+or `""` where nothing is claimed (the free memory could not be read, or the header did not parse).
+A first run shows these two, maps the tone to a colour and nothing else, and keeps `headline` and
+`memory` behind them for whoever asks how it was checked. The memory in question is what is free
+when the check is made, so the same model can read differently an hour later.
 
 The memory verdict answers "what happens if I load this", and a load unloads the model loaded now
 first. `residency_budget` is what this process may hold as measured now, with that model still
@@ -1044,7 +1260,8 @@ an id that is not an added entry.
 `{"available": true, "error": "..."}` when there is nothing to plan (no model selected).
 Otherwise the planner's proposal for the configured model on this machine. It runs the planner's
 probes (a second or two of storage reads and a bandwidth run, never the intrusive memory probe)
-without loading the model; `409` while a generation runs, since that would skew the measurement.
+without loading the model; `409` while a generation runs, since that would skew the measurement,
+and while a model loads, since the probes run on the engine's one thread it holds.
 Each compute device beyond the host is first asked in a process of its own (the server started
 again with `--probe-device`), so a driver that ends the process it is used from marks the device
 unusable instead of ending the server; `--no-isolated-probes` runs them in-process.
@@ -1097,12 +1314,17 @@ so a stage or a role the server adds reaches every UI with no UI change:
 
 - `summary.sentence` is what the plan decided, in a sentence; `summary.lanes` which device names
   compute the prompt and the tokens (a device holding layers in memory of its own is on the
-  tokens lane beside the host).
+  tokens lane beside the host; a device that shares the host's memory and runs the whole model, the
+  plan's `shared-device` decision, is on both lanes alone). The prompt lane is the prefill device
+  where one is armed; else that whole-model device; else the devices holding layers, where the run
+  lets the backends take a wide graph's matmuls (`offloads_wide_matmuls`, the rule the session loads
+  by); else the host.
 - `predicted` is decode as the plan priced it, the figures `bmoe-cli --auto` prints after a run:
   `s_per_token`; `cache_hit_pct` where there is a cache, the hit rate the cost model credited the
   cache with (`Allocation::cache_hit_credited`), not the cache's share of the experts: read off
   the model's own hit curve when the server kept a routing record for that file (`routing/` in the
-  data folder, one file per model; see `docs/hardware-planning.md`), else the linear credit; and
+  data folder, one file per model; see `docs/hardware-planning.md`), else the prior in token cycles every model without a record
+  starts from (`docs/measured-planning.md`); and
   `s_per_token_worst`, the same token with nothing resident and every byte read again, a bound
   beside the prediction and never divided into it. Each is absent when not predicted.
 - `memory.pools` is the ledger the plan charged: the host's pool (`name` `host`; `cap_bytes`
@@ -1135,12 +1357,24 @@ Until the model's lossless knobs are measured on this machine, a plan's `values`
 `trial-threads` and `trial-overlap`: the first answer after the load decodes in alternating windows
 to measure them (`docs/hardware-planning.md`), and the server keeps the verdict beside the model's
 routing record under `routing/`. The next plan of that model reads it, its `threads` and `overlap`
-decisions say `measured on this model`, and those two values are gone.
+decisions say `measured on this model`, and those two values are gone. Every load also keeps what
+its decode cost there (compute per token, the thread count, the cache's hits at its budget); the
+next plan of the same configuration prices `predicted` with it and says so in a `decode-cost` note
+(`docs/measured-planning.md`, Step 5). The plan a loaded model runs is answered as it was made, so
+the new figure shows on the next measurement or load.
 With a model loaded that an auto load planned, `GET /api/plan` answers at once with that plan and
 `"from_last_load": true`, without measuring, as long as nothing was measured after that load; once
 the model has answered it also carries `measured`: what its last complete turn measured for decode
 (`s_per_token`, `cache_hit_pct` over that turn's decode alone, -1 without a cache, and `tokens`), to
-set beside `predicted`; a cancelled turn does not count. `GET /api/plan?cached=1` never measures:
+set beside `predicted`; a cancelled turn does not count. Beside it, `speed_check` says the
+comparison in words, so every UI shows the same thing without working it out:
+`{"badge": "+26%", "against": "against the 3.3 expected", "tone": "ok"}` while measured and expected
+are within 2x of each other, and a ratio once they are further apart either way
+(`{"badge": "84x", "against": "the 0.020 expected", ...}`, where a percentage would read +8314%).
+`tone` is `ok` when the turn met or beat the plan and `warn` when not, a code that only picks the
+badge's colour; the expected rate keeps two significant digits below 0.1 tok/s, so it never reads
+0.0. `speed_check` comes only with the plan the model runs (`from_last_load`) and only when both
+figures are there; the numbers stay in `predicted` and `measured`. `GET /api/plan?cached=1` never measures:
 it answers the last plan this server holds (the last measurement, else the last load's) with
 `"cached": true`, or `{"available": true, "none": true}` when it holds none, so a screen can open on
 it at no cost; with a model loaded and that plan measured for it by hand after the load, the plan
@@ -1169,12 +1403,19 @@ elsewhere, for testing.
 
 ### `GET /api/backends`
 
-`{registered, target, feed, packs, installed, restart_required, feed_error?}`. `registered` is every
-backend that registered at start (`CPU`, `MTL`, `Vulkan`, ...); `target` the build's
+`{registered, graphics, target, feed, packs, installed, restart_required, feed_error?}`. `registered`
+is every backend that registered at start (`CPU`, `MTL`, `Vulkan`, ...); `graphics` the local
+graphics cards they offer, discrete or integrated, `{backend, description}` with the device's own
+description, read from each device's type and never from a backend's name (a remote backend's
+devices are not local, and the processor's are not graphics); `target` the build's
 (`macos-arm64`, ...); `feed` `{version, published}` of the verified feed known, or `null`. `packs`
 is that feed's packs for this target: `{id, title, size, applies, installed, installed_version,
 current}`, `applies` when one of the pack's driver libraries loads here, `current` when the
-installed copy is this feed's file. `installed` lists every pack on disk (`{id, version, offered}`).
+installed copy is this feed's file. `installed` lists every pack on disk (`{id, version, offered,
+loaded}`): `loaded` is false for a pack another release left, which the engine does not load, since a
+backend module is built against one llama.cpp; installing it again replaces it. An install is
+refused (`409`, `code: "version_mismatch"`) while the feed's packs are a newer release's than the
+server: the update comes first.
 `restart_required` is true once a pack was installed since the server started. With `?refresh=1`
 the feed is read from the network first; a feed that cannot be read or does not verify is said in
 `feed_error`, and the rest of the answer stands. Without it, the feed kept from the last read
@@ -1196,8 +1437,9 @@ is installed. The engine loads the pack at the next start of the server.
 ### `GET /api/update`
 
 Reads the feed and answers `{current, latest, available, notes, published, target, installer}`:
-`available` when the feed's version is newer than this server's and has an installer for this
-target, `installer` `{url, sha256, size, file}` or `null`. `502` `feed` when the feed cannot be read
+`available` when the feed's version is newer than this server's, `installer` this target's
+`{url, sha256, size, file}`, or `null` where the feed carries none (a phone: its app ships beside
+the feed on the release, and the app sends the person to `notes` for it). `502` `feed` when the feed cannot be read
 or does not verify.
 
 ### `POST /api/update/download`
@@ -1205,4 +1447,4 @@ or does not verify.
 Downloads the installer of the feed last read into `<data>/updates/`, checks its size and SHA-256,
 and answers once it is there: `200` with `{ok, version, path}`; progress as `update` events. The
 desktop app runs `path` (`bmoeDesktop.applyUpdate`), which accepts nothing outside that folder.
-`409` with `no_feed` or `up_to_date`, or `busy`; `502` `failed` when it does not arrive whole.
+`409` with `no_feed`, `up_to_date` or `no_installer` (the feed has none for this target), or `busy`; `502` `failed` when it does not arrive whole.

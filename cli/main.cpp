@@ -17,8 +17,11 @@
 #include "bmoe/route_trace.h"
 #include "bmoe/routing.h"
 #include "bmoe/measured_knobs.h"
+#include "bmoe/model_records.h"
 #include "bmoe/decode_trace.h"
 #include "bmoe/version.h"
+#include "backend_env.h"
+#include "user_dirs.h"
 
 #include <atomic>
 #include <cmath>
@@ -295,102 +298,37 @@ static bool emit_decide(Session & session, const SessionCmd & cmd) {
                 "\"n_reused\":%d,\"n_prefilled\":%d,\"restore_s\":%.3f,\"store_s\":%.3f,\"prefill_s\":%.3f,"
                 "\"prefill_cpu_s\":%.3f,\"prefill_read_mib\":%.1f,\"prefill_io_s\":%.3f,\"prefill_stall_s\":%.3f,"
                 "\"prefill_mgmt_s\":%.3f,\"prefill_dev_tokens\":%d,\"prefill_dev_read_mib\":%.1f,"
-                "\"prefill_dev_stall_s\":%.3f,\"prefill_dev_routed\":%lld,\"prefill_dev_demand\":%lld,"
+                "\"prefill_dev_stall_s\":%.3f,\"prefill_dev_cache_mib\":%.1f,\"prefill_dev_routed\":%lld,\"prefill_dev_"
+                "demand\":%lld,"
                 "\"prefix_state_mib\":%.1f}\n",
                 cmd.id, r.cancelled ? "true" : "false", r.best, logp.c_str(), r.n_tokens, r.n_reused, r.n_prefilled,
                 r.restore_seconds, r.store_seconds, p.seconds, p.cpu_seconds, p.read_mib, p.io_seconds, p.stall_seconds,
-                p.mgmt_seconds, p.device_tokens, p.device_read_mib, p.device_stall_seconds, p.device_routed,
-                p.device_demand, (double) r.prefix_state_bytes / (1024.0 * 1024.0));
+                p.mgmt_seconds, p.device_tokens, p.device_read_mib, p.device_stall_seconds, p.device_cache_mib,
+                p.device_routed, p.device_demand, (double) r.prefix_state_bytes / (1024.0 * 1024.0));
     std::fflush(stdout);
     return true;
 }
 
-// ── the model's own measurements, kept between runs (--routing-dir) ──────────────────────────
-// The engine records what the model routed during its first tokens and returns it as a value; where
-// that lives is this front-end's decision. One file per model, named by the model file's content
-// fingerprint, so a copied or renamed file finds its record and another model never does. The next
-// --auto plan of the same file prices the cache on it (docs/measured-planning.md, Step 1).
-struct RoutingStore {
-    std::string path;       // empty: no --routing-dir, or the model could not be fingerprinted
-    std::string knobs_path; // the lossless knobs' verdicts beside it (bmoe/measured_knobs.h)
-    std::string hardware;   // this machine's hardware_fingerprint, once a plan probed it
+// ── the model's own measurements, kept between runs (bmoe/model_records.h) ─────────────────────
+// What this run's model measured about itself here, kept where every front-end keeps it (the per-user
+// data folder, frontend/user_dirs.h, unless --routing-dir names another, or none): the next --auto plan
+// of the same file starts from it, whichever front-end makes that plan.
+struct RunRecords {
+    ModelRecords store;
+    std::string model;
+    std::string hardware; // this machine's hardware_fingerprint, once a plan probed it
 
-    static RoutingStore open(const std::string & dir, const std::string & model_path) {
-        RoutingStore s;
-        if (dir.empty() || model_path.empty()) return s;
-        const std::string fp = model_fingerprint(model_path.c_str());
-        if (fp.empty()) {
-            std::fprintf(stderr, "warning: cannot fingerprint %s; its routing is not kept\n", model_path.c_str());
-            return s;
-        }
-        s.path = (std::filesystem::u8path(dir) / (fp + ".routing")).u8string();
-        s.knobs_path = (std::filesystem::u8path(dir) / (fp + ".knobs")).u8string();
-        return s;
-    }
-
-    // Every verdict kept for this model, one per machine and engine; the plan picks this machine's.
-    bool load_knobs(std::vector<MeasuredKnobs> & out) const {
-        out.clear();
-        if (knobs_path.empty()) return false;
-        std::ifstream f(std::filesystem::u8path(knobs_path), std::ios::binary);
-        if (!f) return false;
-        std::ostringstream text;
-        text << f.rdbuf();
-        std::string err;
-        if (parse_measured_knobs(text.str(), out, err)) return true;
-        std::fprintf(stderr, "warning: ignoring the knob measurements kept in %s: %s\n", knobs_path.c_str(),
-                     err.c_str());
-        return false;
-    }
-
-    // This machine's verdict, replacing the one it had: the next --auto plan of the file starts from it.
-    void keep_knobs(MeasuredKnobs rec) const {
-        if (knobs_path.empty() || hardware.empty() || rec.empty()) return;
+    RunRecords(const std::string & dir, std::string model_path) : store(dir), model(std::move(model_path)) {}
+    bool kept() { return !store.path_for(model).empty(); }
+    bool load(RoutingTrace & out) { return store.load(model, out); }
+    bool load_knobs(std::vector<MeasuredKnobs> & out) { return store.load_knobs(model, out); }
+    void keep(const RoutingTrace & rec) { store.keep(model, rec); }
+    // This machine's measurements, stamped with the machine and engine they answer for.
+    void keep_knobs(MeasuredKnobs rec) {
+        if (hardware.empty() || rec.empty()) return;
         rec.hardware = hardware;
         rec.engine = version();
-        std::vector<MeasuredKnobs> all;
-        load_knobs(all);
-        keep_measured_knobs(all, rec);
-        write_file(knobs_path, format_measured_knobs(all), "knob measurements");
-    }
-
-    static void write_file(const std::string & path, const std::string & text, const char * what) {
-        const std::filesystem::path p = std::filesystem::u8path(path);
-        std::error_code ec;
-        std::filesystem::create_directories(p.parent_path(), ec);
-        std::filesystem::path tmp = p;
-        tmp += ".tmp";
-        {
-            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-            if (!f) {
-                std::fprintf(stderr, "warning: cannot write the %s %s\n", what, path.c_str());
-                return;
-            }
-            f << text;
-        }
-        std::filesystem::rename(tmp, p, ec);
-        if (ec) std::fprintf(stderr, "warning: cannot write the %s %s\n", what, path.c_str());
-    }
-
-    bool load(RoutingTrace & out) const {
-        if (path.empty()) return false;
-        std::ifstream f(std::filesystem::u8path(path), std::ios::binary);
-        if (!f) return false;
-        std::ostringstream text;
-        text << f.rdbuf();
-        std::string err;
-        if (parse_routing_trace(text.str(), out, err)) return true;
-        std::fprintf(stderr, "warning: ignoring the routing kept in %s: %s\n", path.c_str(), err.c_str());
-        return false;
-    }
-
-    // Kept when it decoded at least as far as the one already there: a short run does not replace a
-    // longer record of the same model. Written beside and renamed, so a reader never sees half of one.
-    void keep(const RoutingTrace & rec) const {
-        if (path.empty() || rec.empty() || rec.decode_tokens == 0) return;
-        RoutingTrace old;
-        if (load(old) && old.decode_tokens > rec.decode_tokens) return;
-        write_file(path, format_routing_trace(rec), "routing record");
+        store.keep_knobs(model, rec);
     }
 };
 
@@ -402,7 +340,7 @@ static int run_session_loop(const RunConfig & cfg,
                             IRouteTraceSink * route_trace,
                             IComputeTraceSink * compute_trace,
                             IIoTraceSink * io_trace,
-                            const RoutingStore & routing) {
+                            RunRecords & routing) {
     const SessionConfig sc = session_config_from(cfg);
     uint32_t routing_kept = 0; // decoded tokens of the record last written
     int knobs_kept = 0;        // verdicts in the knob record last written
@@ -414,6 +352,15 @@ static int run_session_loop(const RunConfig & cfg,
                     run_error_name(RunError::Failed), json_escape(flags_named(error)).c_str());
         std::fflush(stdout);
         return 1;
+    }
+    // What came of the prefill device is known once the session is open: kept now, so a session no
+    // request reaches does not leave the record saying it never finished opening.
+    {
+        const MeasuredKnobs mk = session->measured_knobs();
+        if (mk.verdicts() > 0) {
+            routing.keep_knobs(mk);
+            knobs_kept = mk.verdicts();
+        }
     }
     // think_ctl states, once, whether this model can honour a think=false request at all, so a UI
     // can disable its Thinking control instead of leaving one that silently does nothing (#82).
@@ -528,32 +475,32 @@ static int run_session_loop(const RunConfig & cfg,
             continue;
         }
         const RunSummary & s = r.summary;
-        std::printf("BMOE_DONE {\"id\":%d,\"cancelled\":%s,\"tokens\":%d,\"tok_s\":%.3f,\"prefill_s\":%.3f,"
-                    "\"prefill_tps\":%.2f,\"load_s\":%.3f,\"cache_hit_pct\":%.1f,\"n_prompt\":%d,\"n_past\":%d,"
-                    "\"compute_s_tok\":%.4f,\"io_s_tok\":%.4f,\"cache_resident_mib\":%.0f,\"cache_budget_mib\":%.0f,"
-                    "\"read_mib\":%.1f,\"stall_s_tok\":%.4f,\"flash_wait_s_tok\":%.4f,\"mgmt_s_tok\":%.4f,"
-                    "\"majflt_tok\":%.2f,\"cpu_s_tok\":%.4f,"
-                    "\"prefill_cpu_s\":%.3f,\"prefill_read_mib\":%.1f,\"prefill_io_s\":%.3f,"
-                    "\"prefill_stall_s\":%.3f,\"prefill_mgmt_s\":%.3f,"
-                    "\"prefill_dev_tokens\":%d,\"prefill_dev_nodes\":%lld,\"prefill_dev_read_mib\":%.1f,"
-                    "\"prefill_dev_stall_s\":%.3f,"
-                    "\"token_demand_mib\":%.1f,\"mtp_drafted\":%lld,\"mtp_accepted\":%lld,\"mtp_decodes\":%lld,"
-                    "\"mtp_draft_s_tok\":%.4f,\"drafted_steps\":%lld,\"loop_overhead_s_tok\":%.4f,"
-                    "\"reasoning\":\"%s\",\"text\":\"%s\"}\n",
-                    cmd.id, r.cancelled ? "true" : "false", s.n_generated, s.tokens_per_second, s.prefill_seconds,
-                    (s.prefill_seconds > 0 ? s.n_prompt / s.prefill_seconds : 0.0), s.load_seconds, s.cache_hit_pct,
-                    s.n_prompt, s.n_past, s.moe_compute_s_per_token, s.moe_io_s_per_token, s.cache_resident_mib,
-                    s.cache_budget_mib, s.moe_read_mib, s.moe_stall_s_per_token, s.moe_flash_wait_s_per_token,
-                    s.moe_mgmt_s_per_token, s.majflt_per_token, s.cpu_s_per_token, s.prefill_cpu_seconds,
-                    s.prefill_read_mib, s.prefill_io_seconds, s.prefill_stall_seconds, s.prefill_mgmt_seconds,
-                    s.prefill_device_tokens, s.prefill_device_nodes, s.prefill_device_read_mib,
-                    s.prefill_device_stall_seconds, s.token_demand_mib, s.mtp_drafted, s.mtp_accepted, s.mtp_decodes,
-                    s.mtp_draft_s_per_token, s.drafted_steps, s.loop_overhead_s_per_token,
-                    json_escape(r.reasoning_text).c_str(), json_escape(r.generated_text).c_str());
+        std::printf(
+            "BMOE_DONE {\"id\":%d,\"cancelled\":%s,\"tokens\":%d,\"tok_s\":%.3f,\"prefill_s\":%.3f,"
+            "\"prefill_tps\":%.2f,\"load_s\":%.3f,\"cache_hit_pct\":%.1f,\"n_prompt\":%d,\"n_past\":%d,"
+            "\"compute_s_tok\":%.4f,\"io_s_tok\":%.4f,\"cache_resident_mib\":%.0f,\"cache_budget_mib\":%.0f,"
+            "\"read_mib\":%.1f,\"stall_s_tok\":%.4f,\"flash_wait_s_tok\":%.4f,\"mgmt_s_tok\":%.4f,"
+            "\"majflt_tok\":%.2f,\"cpu_s_tok\":%.4f,"
+            "\"prefill_cpu_s\":%.3f,\"prefill_read_mib\":%.1f,\"prefill_io_s\":%.3f,"
+            "\"prefill_stall_s\":%.3f,\"prefill_mgmt_s\":%.3f,"
+            "\"prefill_dev_tokens\":%d,\"prefill_dev_nodes\":%lld,\"prefill_dev_read_mib\":%.1f,"
+            "\"prefill_dev_stall_s\":%.3f,\"prefill_dev_cache_mib\":%.1f,"
+            "\"token_demand_mib\":%.1f,\"mtp_drafted\":%lld,\"mtp_accepted\":%lld,\"mtp_decodes\":%lld,"
+            "\"mtp_draft_s_tok\":%.4f,\"drafted_steps\":%lld,\"loop_overhead_s_tok\":%.4f,"
+            "\"reasoning\":\"%s\",\"text\":\"%s\"}\n",
+            cmd.id, r.cancelled ? "true" : "false", s.n_generated, s.tokens_per_second, s.prefill_seconds,
+            (s.prefill_seconds > 0 ? s.n_prompt / s.prefill_seconds : 0.0), s.load_seconds, s.cache_hit_pct, s.n_prompt,
+            s.n_past, s.moe_compute_s_per_token, s.moe_io_s_per_token, s.cache_resident_mib, s.cache_budget_mib,
+            s.moe_read_mib, s.moe_stall_s_per_token, s.moe_flash_wait_s_per_token, s.moe_mgmt_s_per_token,
+            s.majflt_per_token, s.cpu_s_per_token, s.prefill_cpu_seconds, s.prefill_read_mib, s.prefill_io_seconds,
+            s.prefill_stall_seconds, s.prefill_mgmt_seconds, s.prefill_device_tokens, s.prefill_device_nodes,
+            s.prefill_device_read_mib, s.prefill_device_stall_seconds, s.prefill_device_cache_mib, s.token_demand_mib,
+            s.mtp_drafted, s.mtp_accepted, s.mtp_decodes, s.mtp_draft_s_per_token, s.drafted_steps,
+            s.loop_overhead_s_per_token, json_escape(r.reasoning_text).c_str(), json_escape(r.generated_text).c_str());
         std::fflush(stdout);
         // The record grows over the first turns and then stops; it is written each time it grew, so a
         // session ended any way at all has kept what it recorded.
-        if (!routing.path.empty()) {
+        if (routing.kept()) {
             const RoutingTrace rec = session->routing_record();
             if (rec.decode_tokens > routing_kept) {
                 routing.keep(rec);
@@ -561,7 +508,7 @@ static int run_session_loop(const RunConfig & cfg,
             }
             // Likewise the knob trial's verdicts, each written as it comes in.
             const MeasuredKnobs mk = session->measured_knobs();
-            const int verdicts = (mk.threads > 0) + (mk.overlap >= 0);
+            const int verdicts = mk.verdicts();
             if (verdicts > knobs_kept) {
                 routing.keep_knobs(mk);
                 knobs_kept = verdicts;
@@ -695,11 +642,11 @@ static void print_usage(const char * argv0) {
                 "                          machine under real pressure, so it is off unless asked\n"
                 "      --session           keep the model loaded and serve JSON prompt requests from stdin\n"
                 "      --csv PATH          also write per-token metrics as CSV\n"
-                "      --routing-dir DIR   keep this model's recorded routing in DIR (one file per model,\n"
-                "                          named by its content). A streamed run writes it; the next --auto\n"
-                "                          plan of the same file sizes the cache on the hit rate it implies.\n"
-                "                          With --auto, the first answer also measures the thread count and\n"
-                "                          overlap, kept beside it; the next plan starts from the verdict\n"
+                "      --routing-dir DIR   where this model's measurements are kept between runs (its routing,\n"
+                "                          and what --auto timed on this machine): by default the per-user data\n"
+                "                          folder bmoe-server and the app use too, so what one of them\n"
+                "                          measured is the others'. \"\" keeps nothing: --auto then plans from\n"
+                "                          the probes alone every run\n"
                 "      --route-trace PATH  diagnostics: write the per-step per-layer MoE routing trace\n"
                 "                          (which experts each layer routed, their weight, cache state).\n"
                 "                          Needs --moe-stream; costs speed — not for benchmark runs\n"
@@ -823,7 +770,8 @@ int main(int argc, char ** argv) {
     // `probe_device` is that child's mode: probe the one device named, print its facts, exit.
     bool isolated_probes = true;
     std::string probe_device;
-    std::string routing_dir; // --routing-dir: where this model's recorded routing is kept between runs
+    std::string routing_dir; // --routing-dir: where this model's measurements are kept ("": nowhere)
+    bool routing_dir_set = false;
 
     // Which parameters the user actually typed, by key. The env overrides below consult this rather
     // than comparing against the default, so passing a flag its default value still wins.
@@ -882,9 +830,10 @@ int main(int argc, char ** argv) {
             session_mode = true;
         else if (a == "--csv")
             csv_path = next("--csv");
-        else if (a == "--routing-dir")
+        else if (a == "--routing-dir") {
             routing_dir = next("--routing-dir");
-        else if (a == "--route-trace")
+            routing_dir_set = true;
+        } else if (a == "--route-trace")
             route_trace_path = next("--route-trace");
         else if (a == "--compute-trace")
             compute_trace_path = next("--compute-trace");
@@ -1004,11 +953,12 @@ int main(int argc, char ** argv) {
     // which is the name a Decision uses for its knob. See docs/hardware-planning.md.
     double predicted_s_per_token = 0.0;
     double predicted_hit_pct = -1.0;
-    bool predicted_hit_measured = false;                 // the credit came from the model's own hit curve
-    if (seen.count("dense-on-device")) auto_plan = true; // a request to the planner, as before
+    bool predicted_hit_measured = false; // the credit came from the model's own hit curve
     // The child of an isolated device probe: one device, its facts on one line, nothing else. If
     // the driver ends this process, or it never returns, that is the parent's answer about the device.
-    // Every backend beside the executable, once, before anything asks ggml about devices.
+    // What the backends read from their environment, as every front-end sets it (frontend/backend_env.h),
+    // then every backend beside the executable, once, before anything asks ggml about devices.
+    frontend::prepare_compute_backends(frontend::default_data_dir());
     register_backends();
     if (!probe_device.empty()) {
         std::string line;
@@ -1021,7 +971,9 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    RoutingStore routing = RoutingStore::open(routing_dir, cfg.model_path);
+    // Kept where every front-end keeps it unless --routing-dir names another folder ("" keeps nothing).
+    RunRecords routing(routing_dir_set ? routing_dir : frontend::records_dir(frontend::default_data_dir()),
+                       cfg.model_path);
     if (auto_plan && !cfg.model_path.empty()) {
         PlanRequest req;
         req.pinned.assign(seen.begin(), seen.end());
@@ -1048,20 +1000,29 @@ int main(int argc, char ** argv) {
         // verdict, the first answer measures what is not measured yet (docs/measured-planning.md).
         std::vector<MeasuredKnobs> knobs_kept;
         if (routing.load_knobs(knobs_kept)) opt.knobs = &knobs_kept;
-        req.measure_knobs = !routing.knobs_path.empty();
+        req.measure_knobs = routing.kept();
         const AutoPlan planned = probe_and_plan(cfg, req, opt);
         const HardwareProfile & hw = planned.hw;
         const ModelProfile & mp = planned.model;
         const Plan & plan = planned.plan;
         cfg = plan.config;
         routing.hardware = hardware_fingerprint(hw);
+        // A prefill device this run arms is marked unconfirmed for this model before the session opens;
+        // what the session makes of it replaces the word (MeasuredKnobs::prefill_verdict), and a run
+        // that never gets that far leaves it, so the next plan does not arm the device again.
+        if (!plan_only && !cfg.prefill.device.empty()) {
+            MeasuredKnobs here;
+            if (const MeasuredKnobs * k = find_measured_knobs(knobs_kept, routing.hardware, version())) here = *k;
+            routing.keep_knobs(here.armed_unconfirmed(cfg.prefill.device));
+        }
         predicted_s_per_token = plan.allocation.seconds_per_token;
         // What the plan credited, from the curve when there was one: the figure its prediction stands on.
         if (plan.allocation.cache_bytes > 0 && plan.allocation.cache_hit_credited > 0)
             predicted_hit_pct = 100.0 * plan.allocation.cache_hit_credited;
         predicted_hit_measured = mp.hit_curve.measured;
         if (plan_explain && opt.routing)
-            std::fprintf(stderr, "plan: this model's routing read from %s\n", routing.path.c_str());
+            std::fprintf(stderr, "plan: this model's routing read from %s\n",
+                         routing.store.path_for(routing.model).c_str());
 
         if (plan_explain) {
             std::fprintf(stderr, "plan: machine %s\n", hw.label.c_str());
@@ -1101,7 +1062,7 @@ int main(int argc, char ** argv) {
             // the figures it was made from. 0 is "not measured", never "slow".
             for (const ComputeDevice & d : hw.devices) {
                 const auto verdict = [](Tri t) {
-                    return t == Tri::Yes ? "same result" : t == Tri::No ? "WRONG result" : "unverified";
+                    return t == Tri::Yes ? "same result" : t == Tri::No ? "different result" : "unverified";
                 };
                 if (d.usable == Tri::No) {
                     std::fprintf(stderr, "plan: device %s: UNUSABLE - %s\n", d.name.c_str(), d.unusable_reason.c_str());
@@ -1120,8 +1081,13 @@ int main(int argc, char ** argv) {
                              d.probed_out_of_process ? ", probed in a process of its own" : "");
             }
             if (mp.ok) {
-                std::fprintf(stderr, "plan: model %s, %u experts top-%u over %u of %u blocks\n", mp.arch.c_str(),
-                             mp.n_expert, mp.n_expert_used, mp.n_moe_layer, mp.n_layer);
+                // A model whose graph runs some blocks more than once has more layers than blocks,
+                // and the per-token column below is counted over the layers.
+                char runs[64] = "";
+                if (mp.n_layer != mp.n_block)
+                    std::snprintf(runs, sizeof(runs), ", run as %u layers per token", mp.n_layer);
+                std::fprintf(stderr, "plan: model %s, %u experts top-%u over %u of %u blocks%s\n", mp.arch.c_str(),
+                             mp.n_expert, mp.n_expert_used, mp.n_moe_layer, mp.n_block, runs);
                 for (int gi = 0; gi < (int) WeightGroup::count; ++gi) {
                     const GroupDemand & d = mp.groups[gi];
                     if (d.bytes == 0) continue;
@@ -1306,6 +1272,9 @@ int main(int argc, char ** argv) {
     outs.route_trace = route_trace.get();
     outs.compute_trace = compute_trace.get();
     outs.io_trace = io_trace.get();
+    outs.on_open = [&](const MeasuredKnobs & mk) {
+        if (mk.verdicts() > 0) routing.keep_knobs(mk);
+    };
     RunResult r = run(cfg, outs);
     if (!r) {
         std::fprintf(stderr, "\nerror: %s\n", flags_named(r.error).c_str());
@@ -1439,6 +1408,9 @@ int main(int argc, char ** argv) {
                             "already paid for once\n",
                             s.cache_evictions, s.cache_rereads,
                             s.n_generated ? (double) s.cache_rereads / s.n_generated : 0.0);
+            // Pressure answered by dropping cached experts rather than swapping anything.
+            if (s.cache_discarded > 0)
+                std::printf("moe-cache: %lld experts dropped by the system under memory pressure\n", s.cache_discarded);
         }
         // The row policy's own line: what it took out of RAM, what it holds instead, and what
         // that cost in reads. Printed only when a table qualified, so a run that discovered

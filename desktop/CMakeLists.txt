@@ -8,13 +8,11 @@ if(NOT TARGET cpp-httplib)
                      ${CMAKE_BINARY_DIR}/vendor/cpp-httplib EXCLUDE_FROM_ALL)
 endif()
 
-# The rules apart from any window (app_core.h), for tests/desktop_test.cpp; httplib for the check
-# of whether a port is free.
+# The rules apart from any window (app_core.h), for tests/desktop_test.cpp.
 add_library(bmoe_desktop_core STATIC app_core.cpp)
 target_include_directories(bmoe_desktop_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(bmoe_desktop_core SYSTEM PUBLIC ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/vendor)
 target_compile_features(bmoe_desktop_core PUBLIC cxx_std_17)
-target_link_libraries(bmoe_desktop_core PRIVATE cpp-httplib)
 
 if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/webview/CMakeLists.txt")
     message(STATUS "bmoe-desktop: third_party/webview is missing (git submodule update --init); not built")
@@ -28,7 +26,10 @@ if(APPLE)
     set(BMOE_DESKTOP_OS_SOURCES os_macos.mm)
     set(BMOE_DESKTOP_OS_LIBS "-framework AppKit" "-framework WebKit" "-framework UserNotifications")
 elseif(WIN32)
-    set(BMOE_DESKTOP_OS_SOURCES os_windows.cpp)
+    # The app's icon, built into the executable (bmoe-desktop.rc.in).
+    set(BMOE_DESKTOP_ICON "${CMAKE_SOURCE_DIR}/packaging/windows/bigmoeonedge.ico")
+    configure_file(bmoe-desktop.rc.in ${CMAKE_CURRENT_BINARY_DIR}/bmoe-desktop.rc @ONLY)
+    set(BMOE_DESKTOP_OS_SOURCES os_windows.cpp ${CMAKE_CURRENT_BINARY_DIR}/bmoe-desktop.rc)
     set(BMOE_DESKTOP_OS_LIBS comctl32 shell32 ole32 user32)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     find_package(PkgConfig QUIET)
@@ -76,6 +77,7 @@ set_property(TARGET webview_core_headers PROPERTY INTERFACE_SYSTEM_INCLUDE_DIREC
 
 # WIN32: a windowed program, with no console of its own.
 add_executable(bmoe-desktop WIN32 main.cpp supervisor.cpp ${BMOE_DESKTOP_OS_SOURCES})
+bmoe_utf8_process(bmoe-desktop)
 target_link_libraries(bmoe-desktop PRIVATE bmoe_desktop_core bmoe_server_platform cpp-httplib webview::core
                                            ${BMOE_DESKTOP_OS_LIBS})
 target_include_directories(bmoe-desktop PRIVATE ${CMAKE_SOURCE_DIR}/core/include ${CMAKE_SOURCE_DIR}/server)

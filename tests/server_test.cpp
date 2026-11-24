@@ -15,6 +15,8 @@
 //   * downloads: which curl failures are retried and after how long, what a resume still needs on
 //     disk, and that deleting a partial download stays inside the models folder;
 //   * events: how many streams may be open, and that a stream that ends gives its place back;
+//   * a streamed turn: a stretch with nothing to send is broken by a keep-alive after the ping
+//     interval, whatever the machine's speed, and never between two frames of the turn;
 //   * a model from a link: which links are taken, the entry they become, the size a HEAD gives,
 //     and that a server with no curl leaves the size unknown rather than refuse the link;
 //   * deleting a model: named as the listing names it, a split set whole, nothing outside the
@@ -33,21 +35,27 @@
 #include "http_fetch.h"
 #include "image_part.h"
 #include "json_util.h"
+#include "llama_compat.h"
 #include "model_delete.h"
 #include "model_files.h"
 #include "openai_chat.h"
 #include "openai_responses.h"
 #include "plan_view.h"
+#include "request_sampling.h"
 #include "log_file.h"
 #include "service_spec.h"
 #include "settings_store.h"
+#include "stream_keepalive.h"
 #include "sha256.h"
 #include "turn_queue.h"
 #include "url_entry.h"
 
 #include "bmoe/planner.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <condition_variable>
 #include <chrono>
 #include <limits>
 #include <cstdio>
@@ -479,6 +487,108 @@ static void block_stream_tests() {
     ChatRequest est;
     est.messages = {{"user", std::string(3000, 'x')}};
     check(estimate_prompt_tokens(est) > 900 && estimate_prompt_tokens(est) < 1100, "the estimate grows with the text");
+}
+
+// Calls streamed while the model writes them: the rules every protocol shares, then each framing.
+static void tool_call_stream_tests() {
+    using T = ToolCallEvent::Type;
+    const auto id_for = [](size_t i) { return "call_r_" + std::to_string(i); };
+    ToolCallStream s(id_for);
+    std::vector<ToolCallEvent> e = s.update({{"", "write", ""}});
+    check(e.empty() && s.opened() == 0, "a call whose arguments have not begun is not opened: its name may still grow");
+    e = s.update({{"", "write_file", "{\"path\":\"a"}});
+    check(e.size() == 2 && e[0].type == T::Open && e[0].id == "call_r_0" && e[0].name == "write_file" &&
+              e[1].type == T::Delta && e[1].arguments == "{\"path\":\"a",
+          "a call opens once its arguments begin, with the id it keeps, and sends what it has");
+    e = s.update({{"", "write_file", "{\"path\":\"a.html\",\"content\":\"\xC3"}});
+    check(e.size() == 1 && e[0].arguments == ".html\",\"content\":\"",
+          "arguments that grow send the rest, held to whole characters");
+    e = s.update({{"", "write_file", "{\"path\":\"b"}});
+    check(e.empty() && !s.diverged(), "a snapshot that takes arguments back sends nothing, and waits");
+    e = s.update({{"", "write_file", "{\"path\":\"a.html\",\"content\":\"\xC3\xA9\"}"}, {"", "run", "{\"c"}});
+    check(e.size() == 4 && e[0].arguments == "\xC3\xA9\"}" && e[1].type == T::Close && e[1].index == 0 &&
+              e[2].type == T::Open && e[2].index == 1 && e[3].arguments == "{\"c",
+          "a second call opening closes the first, whose arguments are whole");
+    std::vector<ChatToolCall> final_calls = {{"", "write_file", "{\"path\":\"a.html\",\"content\":\"\xC3\xA9\"}"},
+                                             {"", "run", "{\"cmd\":\"ls\"}"},
+                                             {"model_id", "get_info", "{}"}};
+    e = s.finish(final_calls);
+    check(e.size() == 5 && e[0].index == 1 && e[0].arguments == "md\":\"ls\"}" && e[1].type == T::Close &&
+              e[2].type == T::Open && e[2].id == "model_id" && e[3].arguments == "{}" && e[4].type == T::Close &&
+              !s.diverged(),
+          "finish sends what the parsed calls add, and a call no token showed opens whole");
+    check(final_calls[0].id == "call_r_0" && final_calls[1].id == "call_r_1" && final_calls[2].id == "model_id",
+          "every final call carries the id its stream announced");
+    ToolCallStream d(id_for);
+    d.update({{"", "f", "{\"a\":1"}});
+    std::vector<ChatToolCall> other = {{"", "f", "{\"b\":2}"}};
+    d.finish(other);
+    check(d.diverged(), "final arguments that contradict the stream are reported, never sent over it");
+
+    // What a call's card reads while the model writes: the whole scalar members, never an exception.
+    check(json_object_prefix("").empty() && json_object_prefix("[1,").empty() && json_object_prefix("{\"pa").empty() &&
+              json_object_prefix("{\"path\":\"src/ma").empty(),
+          "nothing whole yet is an empty object");
+    check(json_object_prefix("{\"path\":\"a.html\",\"content\":\"<html>") == json{{"path", "a.html"}},
+          "a whole member is read while the next is still being written");
+    check(json_object_prefix("{\"cmd\":\"ls \\\"x\\\"\", \"n\": true, \"o\": {\"k\": [1, \"}\"]}, \"t\": 2,") ==
+              json{{"cmd", "ls \"x\""}, {"n", true}, {"t", 2}},
+          "escapes are decoded, nested values left out, scalars after them still read");
+
+    // OpenAI chat: a call opens with its index, id and name, then its arguments by index.
+    ToolCallStream o(id_for);
+    const json opened = tool_call_events_delta(o.update({{"", "run", "{\"c"}}));
+    check(opened["tool_calls"].size() == 2 && opened["tool_calls"][0]["index"] == 0 &&
+              opened["tool_calls"][0]["id"] == "call_r_0" && opened["tool_calls"][0]["function"]["name"] == "run" &&
+              opened["tool_calls"][0]["function"]["arguments"] == "" &&
+              opened["tool_calls"][1]["function"]["arguments"] == "{\"c" && !opened["tool_calls"][1].contains("id"),
+          "the chat delta names a call once, then streams its arguments");
+    check(tool_call_events_delta(o.update({{"", "run", "{\"c"}})).is_null(), "nothing new is no chunk");
+
+    // Anthropic: the text block closes before the call's block, the input arrives in pieces.
+    RunResult r;
+    r.generated_text = "On it.";
+    r.tool_calls = {{"", "write_file", "{\"path\":\"h.txt\"}"}};
+    const ChatResponseMeta meta{"msg_9", 5, "m.gguf"};
+    AnthropicStream a(meta);
+    std::string wire = a.start();
+    wire += a.on_token("On it.", "");
+    wire += a.on_token("On it.", "", {{"", "write_file", "{\"pa"}});
+    wire += a.on_token("On it.", "", {{"", "write_file", "{\"path\":\"h."}});
+    wire += a.finish(r, "tool_calls");
+    const auto af = sse_frames(wire);
+    check(names_of(af) == "message_start content_block_start content_block_delta content_block_stop "
+                          "content_block_start content_block_delta content_block_delta content_block_delta "
+                          "content_block_stop message_delta message_stop",
+          "the call becomes a tool_use block while it is written, after the text block closes");
+    std::string input;
+    for (size_t i = 5; i <= 7; ++i)
+        input += af[i].second["delta"]["partial_json"].get<std::string>();
+    check(af[4].second["content_block"]["id"] == "call_msg_9_0" && af[4].second["index"] == 1 &&
+              json::parse(input)["path"] == "h.txt",
+          "the pieces join into the call's input, under the id the final answer uses");
+
+    // Responses: the call is a function_call item from its first piece.
+    ResponsesStream rs(meta);
+    wire = rs.start();
+    wire += rs.on_token("On it.", "");
+    wire += rs.on_token("On it.", "", {{"", "write_file", "{\"pa"}});
+    wire += rs.finish(r, "tool_calls");
+    const auto rf = sse_frames(wire);
+    std::string args;
+    for (const auto & fr : rf)
+        if (fr.first == "response.function_call_arguments.delta") args += fr.second["delta"].get<std::string>();
+    const json & done = rf.back().second["response"];
+    check(json::parse(args)["path"] == "h.txt" && done["output"].size() == 2 &&
+              done["output"][0]["type"] == "message" && done["output"][1]["call_id"] == "call_msg_9_0" &&
+              done["output"][1]["arguments"] == "{\"path\":\"h.txt\"}",
+          "a Responses stream sends the arguments in pieces, and completes with the message then the call");
+    bool same_index = true;
+    for (const auto & fr : rf)
+        if (fr.first.rfind("response.function_call_arguments", 0) == 0 ||
+            (fr.first.rfind("response.output_item", 0) == 0 && fr.second["item"]["type"] == "function_call"))
+            same_index = same_index && fr.second["output_index"] == 1;
+    check(same_index, "every event of a call after text names the call's own output_index, the added one too");
 }
 
 static AnthropicRequest
@@ -924,6 +1034,13 @@ static void settings_tests() {
     SettingsStore third(defaults, path.u8string());
     third.load();
     check(!third.auto_plan(true), "auto_plan, once turned off, stays off across a restart");
+    third.set_launch_auto_plan(true);
+    check(third.auto_plan(false), "--auto at launch holds for this run over the saved choice");
+    SettingsStore fresh(defaults, path.u8string());
+    fresh.load();
+    check(!fresh.auto_plan(true), "and is never saved");
+    third.set_auto_plan(false);
+    check(!third.auto_plan(true), "a person's choice replaces what the server was launched with");
 
     // A value saved by an earlier run is under the flags of this one: -m / -c at start win.
     third.set_launch_values({{"temp", "0.2"}});
@@ -937,6 +1054,27 @@ static void settings_tests() {
     third.set_launch_values({});
     third.apply(json{{"think", false}}, {});
     check(!third.api_config().think, "and so does a saved off");
+
+    // A saved model whose file is gone names nothing to load or to plan for: forgotten, and the
+    // forgetting persists. One that is there, or one the server was launched with, stays.
+    const auto present = [](const std::string &) { return true; };
+    const auto gone = [](const std::string &) { return false; };
+    third.apply(json{{"model", "/models/a.gguf"}}, {});
+    check(!third.forget_missing_model(present) && third.config().model_path == "/models/a.gguf",
+          "a saved model whose file is there stays selected");
+    check(third.forget_missing_model(gone) && third.config().model_path.empty(),
+          "a saved model whose file is gone is forgotten");
+    check(!third.forget_missing_model(gone), "and there is nothing left to forget");
+    SettingsStore fourth(defaults, path.u8string());
+    fourth.load();
+    check(fourth.config().model_path.empty(), "the forgetting persists across a restart");
+    fourth.set_launch_values({{"model", "/models/b.gguf"}});
+    check(!fourth.forget_missing_model(gone) && fourth.config().model_path == "/models/b.gguf",
+          "a model the server was launched with is the operator's word: never forgotten here");
+    fourth.set_launch_values({});
+    fourth.apply(json{{"threads", 3}}, {});
+    check(!fourth.forget_missing_model(gone) && fourth.config().n_threads == 3,
+          "with no saved model nothing else is touched");
 
     std::filesystem::remove(path, ec);
 }
@@ -1036,10 +1174,124 @@ static void json_tests() {
           "UTF-8 boundaries reject invalid, overlong, surrogate and out-of-range encodings");
 }
 
+static void llama_compat_tests() {
+    RunSummary s;
+    // A prompt of 80 tokens, 50 of them already in the context, and an answer of 30.
+    s.n_prompt = 30;
+    s.n_past = 110;
+    s.n_generated = 30;
+    s.prefill_seconds = 0.5;
+    s.gen_seconds = 2.0;
+    const json t = timings_json(s);
+    check(t["cache_n"] == 50 && t["prompt_n"] == 30 && t["predicted_n"] == 30 && t["prompt_ms"] == 500.0 &&
+              t["predicted_per_second"] == 15.0 && t["prompt_per_second"] == 60.0,
+          "timings: the cached part of the prompt, and each phase's tokens, time and rate");
+    RunSummary empty;
+    check(timings_json(empty)["predicted_per_second"] == 0.0 && timings_json(empty)["prompt_per_token_ms"] == 0.0,
+          "timings of a turn with nothing timed are zeros, not a division by zero");
+
+    const json p = prompt_progress_json(PrefillProgress{100, 20, 40, 0.25});
+    check(p["total"] == 100 && p["cache"] == 20 && p["processed"] == 40 && p["time_ms"] == 250.0,
+          "prompt_progress is llama-server's object, time in milliseconds");
+
+    ServeTotals tot;
+    tot.add(s);
+    tot.add(s);
+    std::string m = metrics_text(tot, 1, 2);
+    check(m.find("llamacpp:prompt_tokens_total 60\n") != std::string::npos &&
+              m.find("llamacpp:prompt_tokens_cached_total 100\n") != std::string::npos &&
+              m.find("llamacpp:tokens_predicted_total 60\n") != std::string::npos &&
+              m.find("# TYPE llamacpp:requests_deferred gauge\nllamacpp:requests_deferred 2\n") != std::string::npos &&
+              m.find("llamacpp:predicted_tokens_seconds 15\n") != std::string::npos,
+          "metrics: counters sum the turns, gauges are the window's rates and the line's lengths");
+
+    TokenizeRequest tr;
+    std::string err;
+    check(parse_tokenize_request(json{{"content", "hi"}}, tr, err) && tr.content == "hi" && !tr.add_special &&
+              tr.parse_special && !tr.with_pieces,
+          "tokenize: llama-server's defaults (no BOS, special text parsed, ids only)");
+    check(!parse_tokenize_request(json{{"content", json::array({"a", 12})}}, tr, err) &&
+              !parse_tokenize_request(json{{"content", "a"}, {"with_pieces", "yes"}}, tr, err),
+          "tokenize: a mixed content array and a non-boolean flag are refused");
+    std::vector<int32_t> ids;
+    check(parse_detokenize_request(json{{"tokens", {1, 2, 3}}}, ids, err) && ids.size() == 3 &&
+              !parse_detokenize_request(json{{"tokens", {1, -2}}}, ids, err) &&
+              !parse_detokenize_request(json{{"tokens", "1 2"}}, ids, err),
+          "detokenize: an array of non-negative ids, nothing else");
+    check(token_piece_json("ab") == json("ab") && token_piece_json(std::string("\xE4", 1)) == json::array({0xE4}),
+          "a piece that splits a code point goes out as its bytes");
+    check(slots_json(4096, true)[0]["is_processing"] == true && props_json(PropsFacts{})["total_slots"] == 1,
+          "one slot: the server answers one turn at a time");
+}
+
+static void request_sampling_tests() {
+    const auto parse = [](const json & body, SamplingDialect d, ChatRequest & t, std::string & e) {
+        t = ChatRequest{};
+        return parse_request_sampling(body, d, t, e);
+    };
+    ChatRequest t;
+    std::string err;
+    check(parse(json::object(), SamplingDialect::Chat, t, err) && !t.sampling && t.stop_text.empty() &&
+              t.grammar.empty() && !t.logprobs,
+          "sampling: a request that names nothing samples as the session does");
+    check(parse(json{{"temperature", 0.2}, {"top_p", 0.5}, {"top_k", 7}, {"min_p", 0.1}, {"seed", 9}},
+                SamplingDialect::Chat, t, err) &&
+              t.sampling && *t.sampling->temp == 0.2f && *t.sampling->top_p == 0.5f && *t.sampling->top_k == 7 &&
+              *t.sampling->min_p == 0.1f && *t.sampling->seed == 9u,
+          "sampling: OpenAI's and llama-server's fields, each read");
+    check(parse(json{{"seed", -1}}, SamplingDialect::Chat, t, err) && *t.sampling->seed == SamplingConfig::seed_random,
+          "sampling: seed -1 is a fresh seed, as in llama-server");
+    check(!parse(json{{"temperature", -0.1}}, SamplingDialect::Chat, t, err) &&
+              !parse(json{{"top_p", 1.5}}, SamplingDialect::Chat, t, err) &&
+              !parse(json{{"top_k", 2.5}}, SamplingDialect::Chat, t, err) &&
+              !parse(json{{"presence_penalty", 3}}, SamplingDialect::Chat, t, err) &&
+              !parse(json{{"temperature", "hot"}}, SamplingDialect::Chat, t, err),
+          "sampling: a value out of its range or of the wrong type is refused, not clamped");
+    check(parse(json{{"logit_bias", {{"15", -100}, {"7", false}}}}, SamplingDialect::Chat, t, err) &&
+              t.sampling->logit_bias.size() == 2 &&
+              t.sampling->logit_bias[0] == std::pair<int32_t, float>{15, -100.0f} &&
+              std::isinf(t.sampling->logit_bias[1].second) &&
+              parse(json{{"logit_bias", json::array({json::array({3, 1.5})})}}, SamplingDialect::Chat, t, err) &&
+              t.sampling->logit_bias[0].first == 3 &&
+              !parse(json{{"logit_bias", {{"Hello", 1}}}}, SamplingDialect::Chat, t, err),
+          "sampling: logit_bias by id, as an object or pairs; false forbids; a token's text is refused");
+    check(parse(json{{"stop", "END"}}, SamplingDialect::Chat, t, err) &&
+              t.stop_text == std::vector<std::string>{"END"} &&
+              parse(json{{"stop", {"a", "", "b"}}}, SamplingDialect::Chat, t, err) && t.stop_text.size() == 2 &&
+              !parse(json{{"stop", 3}}, SamplingDialect::Chat, t, err),
+          "sampling: stop is a string or a list of them, empty ones dropped");
+    check(parse(json{{"stop_sequences", {"Human:"}}, {"top_k", 5}}, SamplingDialect::Messages, t, err) &&
+              t.stop_text.size() == 1 && *t.sampling->top_k == 5 &&
+              parse(json{{"stop", {"x"}}, {"seed", 3}}, SamplingDialect::Messages, t, err) && t.stop_text.empty() &&
+              !t.sampling,
+          "sampling: Messages reads Anthropic's names and not OpenAI's");
+    check(parse(json{{"temperature", 0.5}, {"top_k", 5}, {"stop", "x"}}, SamplingDialect::Responses, t, err) &&
+              !t.sampling->top_k && t.stop_text.empty(),
+          "sampling: Responses reads temperature and top_p");
+    check(parse(json{{"logprobs", true}, {"top_logprobs", 3}}, SamplingDialect::Chat, t, err) && t.logprobs &&
+              t.top_logprobs == 3 && parse(json{{"n_probs", 4}}, SamplingDialect::Chat, t, err) && t.logprobs &&
+              t.top_logprobs == 4 && !parse(json{{"top_logprobs", 21}}, SamplingDialect::Chat, t, err),
+          "sampling: logprobs, top_logprobs, and llama-server's n_probs");
+    check(parse(json{{"n", 1}}, SamplingDialect::Chat, t, err) && !parse(json{{"n", 2}}, SamplingDialect::Chat, t, err),
+          "sampling: one choice per request");
+    check(parse(json{{"grammar", "root ::= \"a\""}}, SamplingDialect::Chat, t, err) && !t.grammar.empty(),
+          "sampling: a GBNF grammar is read");
+    OpenAiChatRequest cr;
+    check(!parse_chat_request(json{{"messages", {{{"role", "user"}, {"content", "hi"}}}},
+                                   {"grammar", "root ::= \"a\""},
+                                   {"response_format", {{"type", "json_object"}}}},
+                              RunConfig{}, cr, err),
+          "sampling: a grammar beside a response format is refused");
+}
+
 static void access_tests() {
     check(is_api_path("/api/info") && is_api_path("/v1/chat/completions") && !is_api_path("/") &&
               !is_api_path("/assets/app.js") && !is_api_path("/apix"),
           "the API is /api/* and /v1/*, nothing else");
+    check(is_api_path("/health") && is_api_path("/tokenize") && is_api_path("/chat/completions") &&
+              is_api_path("/chat/completions/input_tokens") && is_api_path("/models") && is_api_path("/metrics") &&
+              !is_api_path("/healthz") && !is_api_path("/modelsx") && !is_api_path("/index.html"),
+          "llama-server's unprefixed paths are the engine, under the same key and origin rules");
     check(is_loopback_host("127.0.0.1") && is_loopback_host("localhost:8765") && is_loopback_host("[::1]:8765") &&
               is_loopback_host("::1") && !is_loopback_host("0.0.0.0") && !is_loopback_host("example.com:8765") &&
               !is_loopback_host("192.168.1.10"),
@@ -1135,6 +1387,23 @@ static void access_tests() {
         check(check_access(keyed, a).status == 401, "and a wrong one there is 401");
         RequestFacts page = req("GET", "/index.html");
         check(check_access(keyed, page).allowed(), "the key gates the API, not the UI's files");
+        check(check_access(keyed, req("GET", "/health")).allowed() &&
+                  check_access(keyed, req("HEAD", "/health")).allowed() &&
+                  check_access(keyed, req("GET", "/v1/health")).allowed() &&
+                  check_access(keyed, req("HEAD", "/v1/health")).allowed(),
+              "/health answers without the key, as llama-server's does");
+        check(check_access(keyed, req("GET", "/props")).status == 401 &&
+                  check_access(keyed, req("GET", "/health/x")).status == 401 &&
+                  check_access(keyed, req("GET", "/v1/health/x")).status == 401 &&
+                  check_access(keyed, req("POST", "/health")).status == 401,
+              "only reads of exactly /health and /v1/health skip the key: other routes, sub-paths and writes keep it");
+        RequestFacts h = req("GET", "/health");
+        h.has_origin = true;
+        h.origin = "http://evil.example";
+        check(check_access(keyed, h).status == 403, "an open /health is still refused to a foreign page");
+        h.has_origin = false;
+        h.sec_fetch_site = "cross-site";
+        check(check_access(keyed, h).status == 403, "and to one that loads it without an Origin, as an image does");
         RequestFacts w = req("PUT", "/api/config");
         w.authorization = "Bearer s3cret";
         check(check_access(keyed, w).status == 415, "the key does not excuse a write from naming JSON");
@@ -1180,15 +1449,29 @@ static void access_tests() {
               !is_preview_path("/api/conversations/a/b/file") && !is_preview_path("/api/conversations/abc") &&
               !is_preview_path("/api/conversations/abc/files"),
           "a preview is one conversation's file route");
-    const auto pcsp = [] {
-        for (const auto & h : preview_headers())
+    const auto preview_csp = [](bool network) {
+        for (const auto & h : preview_headers(network))
             if (h.first == "Content-Security-Policy") return h.second;
         return std::string();
-    }();
-    check(pcsp.rfind("sandbox allow-scripts;", 0) == 0 && pcsp.find("allow-same-origin") == std::string::npos &&
-              pcsp.find("connect-src 'none'") != std::string::npos &&
-              pcsp.find("frame-ancestors 'self'") != std::string::npos && pcsp.find("'self';") == std::string::npos,
-          "a preview runs sandboxed in an opaque origin, reaches nothing, and only the UI frames it");
+    };
+    const std::string pcsp = preview_csp(false), ncsp = preview_csp(true);
+    // Either way: sandboxed in an opaque origin, never this server (an http origin, and no 'self'),
+    // no form, no frame of its own, and only the UI frames it.
+    for (const std::string & c : {pcsp, ncsp})
+        check(c.rfind("sandbox allow-scripts;", 0) == 0 && c.find("allow-same-origin") == std::string::npos &&
+                  c.find("'self';") == std::string::npos && c.find("http:") == std::string::npos &&
+                  c.find("frame-src") == std::string::npos && c.find("form-action 'none'") != std::string::npos &&
+                  c.find("frame-ancestors 'self'") != std::string::npos,
+              "a preview runs sandboxed, apart from this server, and only the UI frames it");
+    check(pcsp.find("connect-src 'none'") != std::string::npos && pcsp.find("https:") == std::string::npos,
+          "without the network a preview loads nothing from anywhere");
+    check(ncsp.find("script-src 'unsafe-inline' 'unsafe-eval' blob: https:") != std::string::npos &&
+              ncsp.find("connect-src https: wss:") != std::string::npos &&
+              ncsp.find("img-src data: blob: https:") != std::string::npos,
+          "with it a preview reaches https hosts for every kind of load, as any page does");
+    check(preview_network_for("auto", true) && !preview_network_for("auto", false) &&
+              preview_network_for("on", false) && !preview_network_for("off", true),
+          "auto follows where the server listens; on and off are the operator's");
 }
 
 static void file_tests() {
@@ -1281,6 +1564,26 @@ static void file_tests() {
     check(!confine_model_path("set/../../secret.gguf", models, out, err) &&
               !confine_model_path((dir / "models" / "set" / ".." / ".." / "secret.gguf").u8string(), models, out, err),
           "scan: a way out through the subfolder is refused");
+
+    // A reading of a split set takes every shard's header, so what it is kept against covers every
+    // shard present: one that lands, or changes, after the first is unchanged makes it differ.
+    const fs::path half = dir / "models" / "half";
+    write(half / "big-00001-of-00002.gguf", "first");
+    const std::vector<FileStamp> one = model_set_stamp((half / "big-00001-of-00002.gguf").u8string());
+    check(one.size() == 1 && one.front().name == "big-00001-of-00002.gguf" && one.front().size == 5,
+          "stamp: a set with one shard here is that shard");
+    write(half / "big-00002-of-00002.gguf", "second");
+    const std::vector<FileStamp> both = model_set_stamp((half / "big-00001-of-00002.gguf").u8string());
+    check(both.size() == 2 && both != one, "stamp: the second shard landing changes it, the first unchanged");
+    write(half / "big-00002-of-00002.gguf", "second, longer");
+    check(model_set_stamp((half / "big-00001-of-00002.gguf").u8string()) != both,
+          "stamp: a shard that changes changes it");
+    write(half / "other.gguf", "x");
+    check(model_set_stamp((half / "big-00001-of-00002.gguf").u8string()).size() == 2,
+          "stamp: another model in the folder is not part of it");
+    const std::vector<FileStamp> lone = model_set_stamp((half / "other.gguf").u8string());
+    check(lone.size() == 1 && lone.front().name == "other.gguf" && lone.front().size == 1,
+          "stamp: a single-file model is itself");
     fs::remove_all(dir, ec);
 }
 
@@ -1388,8 +1691,15 @@ static void model_files_tests() {
         GgufHeaderFacts unnamed = model;
         unnamed.name = "Something else";
         check(projector_for(unnamed, folder).empty(), "pairing: two projectors and no name match is no choice");
-        check(projector_for(unnamed, {{"/m/mmproj-only.gguf", proj("Whatever")}}) == "/m/mmproj-only.gguf",
-              "pairing: the folder's only projector goes with any model in it");
+        check(projector_for(unnamed, {{"/m/mmproj-only.gguf", proj("Whatever")}}).empty(),
+              "pairing: the folder's only projector names another model, so it is nobody else's");
+        check(projector_for(unnamed, {{"/m/mmproj-only.gguf", proj("")}}) == "/m/mmproj-only.gguf",
+              "pairing: the folder's only projector with no name of its own goes with the model");
+        GgufHeaderFacts nameless = model;
+        nameless.name = "";
+        check(projector_for(nameless, {{"/m/mmproj-only.gguf", proj("Whatever")}}) == "/m/mmproj-only.gguf",
+              "pairing: a model with no name takes the folder's only projector");
+        check(projector_for(nameless, folder).empty(), "pairing: ...but never one of two");
         check(projector_for(model, {{"/m/draft.gguf", other}}).empty(), "pairing: a folder without a projector");
         check(name_key("Qwen3.6-35B-A3B") == "qwen3635ba3b" && name_key("Qwen3.6 35B A3B") == "qwen3635ba3b",
               "pairing: the name key keeps letters and digits only");
@@ -1554,6 +1864,18 @@ static void hf_tests() {
     in.budget = 1ull << 30;
     check(fit_verdict(in).memory.find("more than the 1024 MiB") != std::string::npos,
           "hf: a floor past the budget says so");
+    // A per-layer table gathered by row can be most of the dense bytes; the plan leaves it mapped.
+    in.dense_bytes = 31ull << 30;
+    in.mapped_bytes = 27ull << 30;
+    in.budget = 9ull << 30;
+    v = fit_verdict(in);
+    check(v.fit == "fits" && v.memory.find("4096 MiB stays resident") != std::string::npos &&
+              v.memory.find("27648 MiB of tables") != std::string::npos,
+          "hf: tables read a row at a time are not counted resident");
+    in.mapped_bytes = 0;
+    check(fit_verdict(in).fit == "will_not_fit", "hf: without them the same dense bytes do not fit");
+    in.dense_bytes = 1ull << 30;
+    in.budget = 1ull << 30;
     in.is_moe = false;
     in.streamable = false;
     check(fit_verdict(in).mode == "plain mmap", "hf: a dense model runs as plain mmap");
@@ -1633,6 +1955,44 @@ static void hf_tests() {
     check(fit_verdict(f).fit == "no_disk" && !fit_verdict(f).downloadable, "hf: a disk too small comes first");
     f.role = "projector";
     check(fit_verdict(f).fit == "not_a_model", "hf: but a file that is no model says that first");
+
+    // The same answer for a person: a sentence with no engine term, and the tone a UI colours it by.
+    const auto plain = [](const FitVerdict & w) {
+        for (const char * term : {"stream", "flash", "mmap", "resident", "expert", "MiB", "process"})
+            if (w.summary.find(term) != std::string::npos) return false;
+        return !w.summary.empty();
+    };
+    FitInputs s;
+    s.file_bytes = 10ull << 30;
+    s.disk_free = 40ull << 30;
+    s.readable = s.is_moe = s.streamable = true;
+    s.dense_bytes = 1ull << 30;
+    s.token_cycle = 512ull << 20;
+    s.budget = 6ull << 30;
+    v = fit_verdict(s);
+    check(v.tone == "ok" && plain(v) && v.summary.find("larger than the memory free now") != std::string::npos,
+          "summary: a model that streams runs here, and is said to read what it needs from storage");
+    s.budget = 12ull << 30;
+    check(fit_verdict(s).tone == "ok" && fit_verdict(s).summary.find("within the memory") != std::string::npos,
+          "summary: one that is smaller than what is free is said to be within it");
+    s.budget = 1ull << 30;
+    check(fit_verdict(s).tone == "err" && plain(fit_verdict(s)),
+          "summary: a floor past the budget is too large, in red");
+    s.budget = 0;
+    check(fit_verdict(s).tone.empty() && plain(fit_verdict(s)), "summary: an unknown budget claims no tone");
+    s.is_moe = s.streamable = false;
+    s.budget = 12ull << 30;
+    check(fit_verdict(s).tone == "ok" && fit_verdict(s).summary.find("whole in memory") != std::string::npos,
+          "summary: a dense model that fits what is free is the fastest");
+    s.budget = 4ull << 30;
+    check(fit_verdict(s).tone == "warn" && plain(fit_verdict(s)),
+          "summary: a dense model past it is slow, and said so");
+    s.disk_free = 1ull << 30;
+    check(fit_verdict(s).tone == "err" && fit_verdict(s).summary.find("storage") != std::string::npos,
+          "summary: a disk too small comes first here too");
+    s.readable = false;
+    s.disk_free = 40ull << 30;
+    check(fit_verdict(s).tone.empty() && plain(fit_verdict(s)), "summary: an unreadable header claims nothing");
     f.readable = false;
     check(fit_verdict(f).fit == "no_disk", "hf: an unreadable file on a full disk is still refused for the disk");
     f.disk_free = 40ull << 30;
@@ -1713,9 +2073,9 @@ static void plan_view_tests() {
     plan.allocation.seconds_worst_case = 1.2;
     plan.allocation.cache_hit_credited = 0.2;
     plan.allocation.ledger.holdable_cap = 5ull << 30;
-    plan.allocation.ledger.rows = {{"dense", 1ull << 30, true, false},
-                                   {"expert cache", 2ull << 30, true, false},
-                                   {"device slots", 1ull << 29, true, true}};
+    plan.allocation.ledger.rows = {{LedgerKind::Dense, "dense", 1ull << 30, true, false},
+                                   {LedgerKind::ExpertCache, "expert cache", 2ull << 30, true, false},
+                                   {LedgerKind::DeviceSlots, "device slots", 1ull << 29, true, true}};
     json v = plan_view(hw, plan);
     check(v["summary"]["sentence"] == "Experts stream from flash, with a 2.0 GiB cache.", "plan view: the sentence");
     check(v["summary"]["lanes"][0]["on"] == json::array({"NPU0"}) && v["summary"]["lanes"][0]["label"] == "Prompt",
@@ -1777,10 +2137,49 @@ static void plan_view_tests() {
               v["memory"]["pools"][1]["estimated"] == false,
           "plan view: a device's own memory is its own pool");
     check(v["summary"]["lanes"][1]["on"] == json::array({"CPU", "CUDA0"}), "plan view: layers put the card on tokens");
-    check((*device_named(v, "CUDA0"))["badge"] == "Layers", "plan view: the card's badge");
+    // A prompt's wide matmuls go to the card that holds layers, the host's weights copied over for the
+    // pass: the prompt lane says so, as the session loads (offloads_wide_matmuls).
+    check(v["summary"]["lanes"][0]["on"] == json::array({"CUDA0"}) &&
+              (*device_named(v, "CUDA0"))["badge"] == "Layers and prompt" &&
+              (*device_named(v, "CPU"))["badge"] == "Tokens",
+          "plan view: layers on a card put the prompt there too");
+    Plan overlapped = dp; // a run that gives the offload up keeps the prompt on the host
+    overlapped.config.moe.enabled = true;
+    overlapped.config.moe.overlap = true;
+    overlapped.config.n_gpu_layers = 12;
+    const json ov = plan_view(desk, overlapped);
+    check(ov["summary"]["lanes"][0]["on"] == json::array({"CPU"}) && (*device_named(ov, "CUDA0"))["badge"] == "Layers",
+          "plan view: under overlap the prompt stays on the host");
     dp.placement.shared_memory_placement = true;
     v = plan_view(desk, dp);
     check(v["memory"]["pools"].size() == 1, "plan view: a declined placement holds nothing on the device");
+
+    // A laptop whose GPU reads its own memory, the whole model moved there by the shared-device
+    // decision: the GPU runs the prompt and the tokens, the host neither.
+    HardwareProfile lap;
+    lap.backends_looked = true;
+    lap.devices.push_back(device("CPU", true));
+    ComputeDevice igpu = device("Vulkan0");
+    igpu.shares_host_memory = Tri::Yes;
+    lap.devices.push_back(igpu);
+    Plan sp;
+    sp.regime = Regime::Fits;
+    sp.placement.shared_memory_placement = true;
+    sp.config.n_gpu_layers = 49;
+    sp.config.device_split = {{"Vulkan0", 49}};
+    const json sv = plan_view(lap, sp);
+    check(sv["summary"]["lanes"][0]["on"] == json::array({"Vulkan0"}) &&
+              sv["summary"]["lanes"][1]["on"] == json::array({"Vulkan0"}),
+          "plan view: a model moved onto a shared-memory GPU runs its prompt and tokens there");
+    check((*device_named(sv, "Vulkan0"))["badge"] == "Layers, prompt and tokens" &&
+              (*device_named(sv, "CPU"))["badge"] == "Not used",
+          "plan view: the GPU's row says it runs the model, the host's that it does not");
+    sp.config.n_gpu_layers = 0;
+    sp.config.device_split.clear();
+    const json kept = plan_view(lap, sp);
+    check(kept["summary"]["lanes"][1]["on"] == json::array({"CPU"}) &&
+              (*device_named(kept, "Vulkan0"))["badge"] == "Not used",
+          "plan view: on the cores, the shared-memory GPU is not used");
 
     // The cores alone: three answers to "no device", kept apart.
     HardwareProfile cpu;
@@ -1803,13 +2202,36 @@ static void plan_view_tests() {
     check(decision_json(dec)["group"] == "kept", "plan view: the person's value is kept");
     dec.source = Source::Unprobed;
     check(decision_json(dec)["group"] == "kept", "plan view: an unmeasured value is kept");
+    {
+        // Measured against predicted, worded once for every UI: a percentage while the two are
+        // within 2x, a ratio once they are further apart, and an expected rate never rounded to 0.0.
+        const json close = speed_check(0.302, 0.24);
+        check(close["badge"] == "+26%" && close["against"] == "against the 3.3 expected" && close["tone"] == "ok",
+              "speed check: close reads as a percentage");
+        const json behind = speed_check(0.25, 0.3);
+        check(behind["badge"] == "-17%" && behind["tone"] == "warn", "speed check: behind the plan warns");
+        // Measured on a phone: 1.7 tok/s against a prediction of ~0.02, once shown as "+8314%".
+        const json fast = speed_check(49.5, 0.588);
+        check(fast["badge"] == "84x" && fast["against"] == "the 0.020 expected" && fast["tone"] == "ok",
+              "speed check: far ahead reads as a ratio");
+        const json slow = speed_check(0.25, 0.8);
+        check(slow["badge"] == "0.31x" && slow["against"] == "the 4.0 expected" && slow["tone"] == "warn",
+              "speed check: far behind reads as a ratio");
+        check(speed_check(0.25, 0.5)["badge"] == "0.50x" && speed_check(1.0, 0.5)["badge"] == "2.0x",
+              "speed check: 2x apart is a ratio");
+        check(speed_check(0, 0.5).is_null() && speed_check(0.5, 0).is_null(), "speed check: none without both");
+        check(decode_rate_text(1.7) == "1.7" && decode_rate_text(0.0202) == "0.020" &&
+                  decode_rate_text(0.0049) == "0.0049" && decode_rate_text(0) == "-",
+              "speed check: a rate as a person reads it");
+    }
     check(value_text(Decision{"cache-mb", "4737", Source::Derived, "r", "b"}) == "4.6 GiB" &&
               value_text(Decision{"dense-weights", "pinned", Source::Derived, "r", "b"}) == "pinned in memory" &&
               value_text(Decision{"o-direct", "true", Source::Measured, "r", "b"}) == "on" &&
               value_text(Decision{"memory-ledger", "7265 MiB", Source::Derived, "r", "b"}) == "7.1 GiB" &&
               value_text(Decision{"regime", "experts-stream", Source::Derived, "r", "b"}) == "experts stream" &&
               value_text(Decision{"shared-memory", "-", Source::Derived, "r", "b"}).empty() &&
-              value_text(Decision{"ubatch", "0", Source::Derived, "r", "b"}) == "as wide as the context",
+              value_text(Decision{"ubatch", "0", Source::Derived, "r", "b"}) ==
+                  "as wide as the context, up to " + std::to_string(RunConfig::ubatch_auto_max),
           "plan view: a value as a person reads it");
     check(decision_json(Decision{"storage-rate", "6.3 GiB/s", Source::Derived, "r", "b"})["group"] == "notes",
           "plan view: a cost model's note is a note");
@@ -1868,6 +2290,41 @@ static void plan_view_tests() {
     }
     check(plan_step_label("rules") == "Decisions" && plan_step_label("future") == "Future",
           "plan view: stage words, and a stage it does not know");
+}
+
+// The shipped catalog names each file at a commit, never at a branch: a branch moves when its
+// owner uploads again, and the catalog's size and SHA-256 then refuse the new file at the end of a
+// download, on every release already out (#663). A commit's file never changes, so its size and
+// digest stay true.
+static void catalog_tests() {
+    std::ifstream in(BMOE_CATALOG_PATH);
+    json cat;
+    try {
+        cat = json::parse(in);
+    } catch (const std::exception & e) {
+        check(false, std::string("catalog: models.json parses: ") + e.what());
+        return;
+    }
+    const auto is_commit = [](const std::string & s) {
+        return s.size() == 40 &&
+               std::all_of(s.begin(), s.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+    };
+    std::string bad;
+    size_t files = 0;
+    for (const auto & m : cat.value("models", json::array())) {
+        for (const auto & f : m.value("files", json::array())) {
+            ++files;
+            const std::string url = f.value("url", "");
+            static const std::string mark = "/resolve/";
+            const size_t at = url.find(mark);
+            const size_t end = at == std::string::npos ? at : url.find('/', at + mark.size());
+            const std::string rev =
+                end == std::string::npos ? "" : url.substr(at + mark.size(), end - at - mark.size());
+            if (!is_commit(rev) || f.value("sha256", "").size() != 64) bad += " " + f.value("name", "?");
+        }
+    }
+    check(files > 0 && bad.empty(), "catalog: every file is named at a commit and carries its SHA-256" +
+                                        (bad.empty() ? std::string() : ":" + bad));
 }
 
 static void download_tests() {
@@ -2215,6 +2672,50 @@ static void model_delete_tests() {
 
 // The CPU temperature is the mean of the sensors, and a threshold published as a zone is not one
 // (#311, #465): a fake thermal directory with a trip zone and moving sensors.
+static void model_folders_tests() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path root = fs::temp_directory_path() / "bmoe_server_test_folders";
+    fs::remove_all(root, ec);
+    fs::create_directories(root / "other", ec);
+    const std::string models = (root / "models").u8string();
+    const std::string other = (root / "other").u8string();
+
+    std::string dir;
+    std::vector<std::string> scans;
+    check(!model_folders_refusal("models", {}, dir, scans).empty(), "a relative models folder is refused");
+    check(!model_folders_refusal("", {}, dir, scans).empty(), "an empty models folder is refused");
+    check(!model_folders_refusal(models, {"other"}, dir, scans).empty(), "a relative scan folder is refused");
+    check(!model_folders_refusal(models, {(root / "missing").u8string()}, dir, scans).empty(),
+          "a scan folder that does not exist is refused");
+    check(model_folders_refusal(models, {other, other, models, ""}, dir, scans).empty(), "absolute folders are taken");
+    check(fs::is_directory(fs::u8path(models)), "the models folder is created when missing");
+    check(scans == std::vector<std::string>{other}, "repeats, empties and the models folder leave the scan list");
+    check(!fs::exists(fs::u8path(models) / ".bmoe-write-test"), "the write test leaves nothing behind");
+
+    // Chosen folders are a server setting: kept across a restart, beside the parameter values.
+    const fs::path path = root / "settings.json";
+    RunConfig defaults;
+    {
+        SettingsStore s(defaults, path.u8string());
+        s.load();
+        check(s.model_folders().models_dir.empty() && s.model_folders().scan_dirs.empty(),
+              "no folders chosen on a clean start");
+        s.set_model_folders({models, {other}});
+    }
+    SettingsStore again(defaults, path.u8string());
+    check(again.load().empty(), "saved folders reload without warnings");
+    check(again.model_folders().models_dir == models &&
+              again.model_folders().scan_dirs == std::vector<std::string>{other},
+          "the chosen folders persist");
+
+    // A folder the server writes to is the person's to choose, never a network client's.
+    check(local_only_route("PUT", "/api/models/folders") != nullptr, "choosing the folders is local-only");
+    check(local_only_route("GET", "/api/models") == nullptr, "listing the models is not");
+
+    fs::remove_all(root, ec);
+}
+
 static void thermal_tests() {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -2338,7 +2839,8 @@ static void service_tests() {
     check(a.args == std::vector<std::string>{"--data-dir", D, "--log-file", L, "--autoload"} && a.key_file.empty(),
           "service args: nothing given gets the data folder, the log file and --autoload, and no key");
     a = service_arguments({"--host", "0.0.0.0"}, D, L);
-    check(a.key_file == D + "/api-key", "service args: a host beyond loopback with no key gets a key file");
+    check(a.key_file == (fs::u8path(D) / "api-key").u8string(),
+          "service args: a host beyond loopback with no key gets a key file");
     check(a.args.size() >= 2 && a.args[a.args.size() - 2] == "--api-key-file" && a.args.back() == a.key_file,
           "service args: ...named on the command line");
     check(service_arguments({"--host", "0.0.0.0", "--no-api-key"}, D, L).key_file.empty(),
@@ -2380,11 +2882,80 @@ static void service_tests() {
     fs::remove_all(root, ec);
 }
 
+// A streamed turn's writer (stream_keepalive.h). Timing-based: the margins are wide (a keep-alive
+// interval of 30 ms checked over 400 ms; writes every 10 ms against an interval of 1 s) so a
+// loaded CI machine does not flip them.
+static void keepalive_tests() {
+    using namespace std::chrono_literals;
+    struct Sink {
+        std::mutex m;
+        std::vector<std::string> frames;
+        bool fail = false;
+        void set_fail(bool v) {
+            std::lock_guard<std::mutex> g(m);
+            fail = v;
+        }
+        bool write(const std::string & f) {
+            std::lock_guard<std::mutex> g(m);
+            if (fail) return false;
+            frames.push_back(f);
+            return true;
+        }
+        int count(const std::string & f) {
+            std::lock_guard<std::mutex> g(m);
+            int n = 0;
+            for (const auto & x : frames)
+                n += x == f;
+            return n;
+        }
+        size_t size() {
+            std::lock_guard<std::mutex> g(m);
+            return frames.size();
+        }
+    };
+    {
+        Sink sink;
+        StreamKeepalive w([&](const std::string & f) { return sink.write(f); }, "PING", 30ms);
+        check(w.write("a"), "keepalive: a write reports the client alive");
+        std::this_thread::sleep_for(400ms);
+        w.stop();
+        const int pings = sink.count("PING");
+        check(pings >= 2, "keepalive: a silent turn is pinged once per interval (" + std::to_string(pings) + ")");
+        const size_t after_stop = sink.size();
+        std::this_thread::sleep_for(100ms);
+        check(sink.size() == after_stop, "keepalive: nothing is written once stopped");
+        w.stop(); // idempotent
+    }
+    {
+        Sink sink;
+        StreamKeepalive w([&](const std::string & f) { return sink.write(f); }, "PING", 1000ms);
+        for (int i = 0; i < 30; ++i) {
+            w.write("t");
+            std::this_thread::sleep_for(10ms);
+        }
+        w.write(""); // an empty frame is no write
+        w.stop();
+        check(sink.count("PING") == 0, "keepalive: a turn that keeps writing is never pinged");
+        check(sink.size() == 30, "keepalive: an empty frame writes nothing");
+    }
+    {
+        Sink sink;
+        StreamKeepalive w([&](const std::string & f) { return sink.write(f); }, "PING", 20ms);
+        sink.set_fail(true);
+        check(!w.write("x"), "keepalive: a failed write marks the client gone");
+        check(!w.alive(), "keepalive: and it stays gone");
+        sink.set_fail(false);
+        std::this_thread::sleep_for(100ms);
+        check(!w.write("y") && sink.size() == 0, "keepalive: nothing is written after a failed write, ping included");
+    }
+}
+
 int main() {
     thermal_tests();
     service_tests();
     protocol_tests();
     block_stream_tests();
+    tool_call_stream_tests();
     anthropic_tests();
     responses_tests();
     queue_tests();
@@ -2392,15 +2963,20 @@ int main() {
     planning_config_tests();
     json_tests();
     access_tests();
+    llama_compat_tests();
+    request_sampling_tests();
     file_tests();
     decide_tests();
     model_files_tests();
     hf_tests();
     plan_view_tests();
+    catalog_tests();
     download_tests();
     event_bus_tests();
+    keepalive_tests();
     url_entry_tests();
     model_delete_tests();
+    model_folders_tests();
     if (failures) {
         std::printf("\n%d check(s) FAILED\n", failures);
         return 1;

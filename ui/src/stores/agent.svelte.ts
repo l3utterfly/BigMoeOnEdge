@@ -22,9 +22,8 @@ import { isDoneSummary } from '../lib/guards';
 import { applyDelta, lastUserItem, truncateFrom, upsertItem, upsertSummary, sortNewest } from '../lib/items';
 import { importLegacy } from '../lib/legacyImport';
 import type { SseEvent } from '../lib/sse';
-import { turnMetrics } from '../lib/turnMetrics';
 import { api } from '../lib/api';
-import type { ChoiceScore } from '../lib/types';
+import type { ChoiceScore, DoneSummary } from '../lib/types';
 import { t } from '../lib/text';
 import { desktopState } from './desktop.svelte';
 import { server } from './server.svelte';
@@ -48,6 +47,8 @@ export interface Draft {
   mode: Mode;
   route: string;
   agent: string;
+  /** The person's own system prompt for this conversation; '' for none. */
+  system: string;
 }
 
 const BUSY: ReadonlySet<string> = new Set(['running', 'waiting']);
@@ -76,14 +77,14 @@ class AgentStore {
   sending = $state(false);
   /** Approvals sent and not answered by an event yet, by item id. */
   answering = $state<Record<string, boolean>>({});
-  /** The one-line figure under a local answer, from the engine's `done` event, by item id. */
-  metrics = $state<Record<string, string>>({});
+  /** The engine's summary of a local answer (its `done` event) and the context size then, by item id. */
+  metrics = $state<Record<string, { summary: DoneSummary; nCtx: number }>>({});
   decisions = $state<Decision[]>([]);
   /** How many conversations the first start moved from this browser to the server. */
   imported = $state(0);
 
   /** What a new conversation starts with: the composer's chips before the first message. */
-  draft = $state<Draft>({ workspace: null, mode: 'ask', route: 'local', agent: BUILTIN_AGENT });
+  draft = $state<Draft>({ workspace: null, mode: 'ask', route: 'local', agent: BUILTIN_AGENT, system: '' });
   /** What conversations here can do; until the server says, plain chat with the built-in agent. */
   caps = $state<AgentCapabilities>({ tools: true, commands: false, agents: [] });
 
@@ -93,6 +94,7 @@ class AgentStore {
   mode = $derived<Mode>(((this.current?.mode as Mode) ?? this.draft.mode) || 'ask');
   route = $derived(this.current?.route ?? this.draft.route);
   agentId = $derived(this.current?.agent ?? this.draft.agent);
+  system = $derived(this.current ? (this.current.system ?? '') : this.draft.system);
 
   private started = false;
   private opening = 0;
@@ -175,7 +177,8 @@ class AgentStore {
     this.decisions = [];
     this.currentError = '';
     this.clearError();
-    if (draft) this.draft = { ...this.draft, ...draft };
+    // A system prompt is the conversation's own: a new one starts without, as llama.cpp's web UI does.
+    this.draft = { ...this.draft, system: '', ...draft };
   }
 
   async open(id: string): Promise<void> {
@@ -227,7 +230,7 @@ class AgentStore {
     const d = this.draft;
     const c = await agentApi.createConversation(
       d.agent === BUILTIN_AGENT
-        ? { workspace: d.workspace, mode: d.mode, route: d.route }
+        ? { workspace: d.workspace, mode: d.mode, route: d.route, system: d.system }
         : { workspace: d.workspace, mode: d.mode, agent: d.agent },
     );
     this.currentId = c.id;
@@ -281,7 +284,7 @@ class AgentStore {
   /** The last answer again: the last question, resent as it was. */
   async regenerate(): Promise<void> {
     const last = lastUserItem(this.items);
-    if (last && last.kind === 'user') await this.edit(last.id, last.text);
+    if (last && last.kind === 'user') await this.edit(last.id, last.text, last.images);
   }
 
   async answer(itemId: string, decision: 'approve' | 'deny'): Promise<void> {
@@ -316,6 +319,11 @@ class AgentStore {
   }
   async setWorkspace(workspace: string | null): Promise<void> {
     await this.change({ workspace });
+  }
+  /** The person's own system prompt: true once the open conversation (or the draft) has it. */
+  async setSystem(system: string): Promise<boolean> {
+    await this.change({ system });
+    return this.system === system;
   }
   async setAgent(agent: string): Promise<void> {
     await this.change({ agent });
@@ -443,7 +451,7 @@ class AgentStore {
           for (let i = this.items.length - 1; i >= 0; i--) {
             const it = this.items[i];
             if (it.kind === 'assistant') {
-              this.metrics = { ...this.metrics, [it.id]: turnMetrics(data, server.info?.model?.n_ctx ?? 0, data.cancelled) };
+              this.metrics = { ...this.metrics, [it.id]: { summary: data, nCtx: server.info?.model?.n_ctx ?? 0 } };
               break;
             }
           }

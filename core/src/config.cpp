@@ -82,6 +82,17 @@ ValidationResult validate(const RunConfig & cfg) {
         r.error = std::move(msg);
         return r;
     };
+    // The other part of the plan is a configuration like any, and the one the session may end on: it
+    // is the same model, it names no part of its own, and it holds up by itself.
+    if (cfg.fallback) {
+        if (cfg.trial.answer_device.empty())
+            return fail("a fallback configuration is what a load reopens with where {trial-device-answer} does not "
+                        "keep the model on its device: it needs a device named there");
+        if (cfg.fallback->fallback) return fail("a fallback configuration has no fallback of its own");
+        if (cfg.fallback->model_path != cfg.model_path) return fail("a fallback configuration is the same model's");
+        const ValidationResult other = validate(*cfg.fallback);
+        if (!other.ok) return fail("the fallback configuration is not valid: " + other.error);
+    }
 
     if (cfg.model_path.empty()) {
         return fail("{model} is required: choose the model file to load");
@@ -95,13 +106,14 @@ ValidationResult validate(const RunConfig & cfg) {
     if (cfg.n_ctx <= 0) {
         return fail("{ctx-size} must be at least 1 token");
     }
-    // 0 means "as wide as the context"; anything larger than the context would be reserved for a
-    // batch that can never arrive, which is the opposite of what this knob is for.
+    // 0 means "as wide as the context", up to RunConfig::ubatch_auto_max; anything larger than the context would be
+    // reserved for a batch that can never arrive, which is the opposite of what this knob is for.
     if (cfg.ctx_checkpoints < 0) return fail("{ctx-checkpoints} cannot be negative (0 keeps none)");
     if (cfg.checkpoint_min_step < 0)
         return fail("{checkpoint-min-step} cannot be negative (0 sets no minimum spacing)");
     if (cfg.n_ubatch < 0) {
-        return fail("{ubatch} cannot be negative (0 makes it as wide as the context)");
+        return fail("{ubatch} cannot be negative (0 makes it as wide as the context, up to " +
+                    std::to_string(RunConfig::ubatch_auto_max) + ")");
     }
     if (cfg.n_ubatch > cfg.n_ctx) {
         return fail("{ubatch} (" + std::to_string(cfg.n_ubatch) + ") is wider than {ctx-size} (" +
@@ -112,12 +124,57 @@ ValidationResult validate(const RunConfig & cfg) {
     // Lower bound only: 0 means "use the model default". The upper bound (<= the model's
     // real expert count) needs the loaded gguf, so it is deferred to run() where the model
     // is available — same rationale as the streaming checks that stay out of this pure path.
+    if (cfg.trial.width_side < -1 || cfg.trial.width_side > 1)
+        return fail("{trial-width} is the graph width's side a load measures: -1 (none), 0 or 1");
+    if (cfg.trial.width_side >= 0 && cfg.trial.width_narrow < 1)
+        return fail("{trial-width} compares a narrower graph: it needs {trial-width-narrow}");
+    if (cfg.trial.width_side >= 0 && cfg.trial.device_tier >= 0)
+        return fail("{trial-width} and {trial-device-cache} each time a load's decode: one at a time");
+    if (cfg.trial.device_tier < -1 || cfg.trial.device_tier > 1)
+        return fail("{trial-device-cache} is the device tier's side a load measures: -1 (none), 0 or 1");
+    if (cfg.trial.shared_device_side < -1 || cfg.trial.shared_device_side > 1)
+        return fail("{trial-shared-device} is the shared-memory device's side a load measures: -1 (none), 0 or 1");
+    if (cfg.trial.shared_device_side >= 0 && (cfg.trial.device_tier >= 0 || cfg.trial.width_side >= 0))
+        return fail("{trial-shared-device} and {trial-device-cache} or {trial-width} each time a load's decode: one at "
+                    "a time");
+    if (cfg.trial.shared_device_side == 1 && cfg.n_gpu_layers == 0)
+        return fail("{trial-shared-device} 1 times the model on a device: it needs {gpu-layers} above 0");
+    // The answer check compares a model held whole in memory on a device with the same file on the
+    // cores, and reopens on the cores where they differ: there has to be a device placement to compare,
+    // and nothing in the load that only a device placement can carry.
+    if (cfg.trial.answer_prompt_per_token >= 0.0f && cfg.trial.answer_device.empty())
+        return fail("{trial-answer-mix} weighs the two sides {trial-device-answer} decodes: it needs a device named "
+                    "there");
+    if (cfg.trial.answer_prompt_per_token > KnobTrialConfig::answer_prompt_per_token_max)
+        return fail("{trial-answer-mix} is the prompt tokens a request brings per decoded token: at most " +
+                    std::to_string((long long) KnobTrialConfig::answer_prompt_per_token_max));
+    if (!cfg.trial.answer_device.empty()) {
+        if (cfg.n_gpu_layers == 0)
+            return fail("{trial-device-answer} compares the model on a device with the cores: it needs {gpu-layers} "
+                        "above 0");
+        if (cfg.moe.enabled)
+            return fail("{trial-device-answer} compares a model held in memory: it does not combine with "
+                        "{moe-stream}");
+        if (cfg.moe.device_cache_mb > 0 || !cfg.moe.expert_host_buffer.empty() || cfg.prefill.enabled())
+            return fail("{trial-device-answer} reopens the model on the cores where the device's answers differ: it "
+                        "does not combine with {device-cache-mb}, {expert-host-buffer} or {prefill-device}");
+    }
     if (cfg.n_expert_used < 0) {
         return fail("{n-expert-used} cannot be negative (0 keeps the model's own)");
     }
     if (!cfg.moe.expert_host_buffer.empty() && (cfg.moe.device_cache_mb <= 0 || cfg.moe.enabled))
         return fail("{expert-host-buffer} is where a device cache uploads resident experts from: it needs "
                     "{device-cache-mb} and {moe-stream} off");
+    if (!(cfg.moe.device_cache_cpu_share >= 0.0f &&
+          cfg.moe.device_cache_cpu_share <= MoeStreamConfig::device_cache_cpu_share_max))
+        return fail("{device-cache-cpu-share} is a share of the device cache's misses: from 0 to 1");
+    if (cfg.moe.device_cache_cpu_share > 0.0f && cfg.moe.device_cache_mb <= 0)
+        return fail("{device-cache-cpu-share} splits the misses of a device expert cache: it needs {device-cache-mb}");
+    // The host half reads the experts' host copy as the layer runs; over streamed experts that copy is
+    // the streamer's slots, and no gate covers the pair yet (tests/moe_gates.cpp, G25d is resident).
+    if (cfg.moe.device_cache_cpu_share > 0.0f && cfg.moe.enabled)
+        return fail(
+            "{device-cache-cpu-share} computes misses from the experts' resident copy: it needs {moe-stream} off");
 
     // Sampling ranges are enforced only when sampling is actually on (temp > 0). With temp <= 0
     // the engine takes the argmax path and the other knobs are inert, so a caller that leaves them
@@ -301,6 +358,10 @@ ValidationResult validate(const RunConfig & cfg) {
         if (m.prefetch_layers < 0 || m.prefetch_layers > MoeStreamConfig::prefetch_layers_max) {
             return fail("{prefetch} must be between 0 and " + std::to_string(MoeStreamConfig::prefetch_layers_max));
         }
+        if (m.cache_freq_half_life < 0 || m.cache_freq_half_life > MoeStreamConfig::cache_freq_half_life_max) {
+            return fail("{cache-half-life} must be between 0 and " +
+                        std::to_string(MoeStreamConfig::cache_freq_half_life_max));
+        }
         if (m.routing_record_tokens < 0 || m.routing_record_tokens > MoeStreamConfig::routing_record_tokens_max) {
             return fail("{routing-record} must be between 0 and " +
                         std::to_string(MoeStreamConfig::routing_record_tokens_max));
@@ -417,6 +478,25 @@ ValidationResult validate(const RunConfig & cfg) {
     }
 
     return r;
+}
+
+bool offloads_wide_matmuls(const MoeStreamConfig & moe, int n_gpu_layers, bool prefill_device) {
+    // Placement is decided by moving weights: a prefill device takes the layers for the prompt itself.
+    if (prefill_device) return false;
+    // Under overlap a streamed expert is waited for inside the CPU's expert matmul, as it is read.
+    // With layers on a device, a wide graph's host-weight matmuls are offered to that device, which
+    // copies the expert tensor before the reads land: a Metal run with 12 layers placed and a
+    // 548-token prompt printed blank lines where the serial run printed the resident text. Serial
+    // streaming has every routed expert in place before the matmul's split starts, so only overlap
+    // gives the offload up; the decode's one-token graphs are never offloaded either way.
+    if (moe.enabled && moe.overlap && n_gpu_layers != 0) return false;
+    // With no layer placed at all, a device is registered only because the caller asked for every
+    // one (`devices=all`); the streamer still rebinds the expert tensors at compute time, on the
+    // CPU, and a backend that takes those ops copies whatever the tensors pointed at before.
+    // Measured on a phone with its GPU backends registered and nothing placed: a 15-token prompt
+    // that answers in 22 s on the CPU alone had not produced a token after eight minutes.
+    if (moe.enabled && n_gpu_layers == 0) return false;
+    return true;
 }
 
 } // namespace bmoe

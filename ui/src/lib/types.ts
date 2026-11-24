@@ -91,6 +91,8 @@ export interface Info {
   error: string;
   model: ModelInfo | null;
   generating: boolean;
+  /** While `planning` or `loading`: seconds since that load began (absent from an older server). */
+  load_elapsed_s?: number;
 }
 
 export type PlanSource = 'measured' | 'derived' | 'policy' | 'operator' | 'unprobed';
@@ -237,6 +239,9 @@ export interface PlanAvailable {
   predicted?: { s_per_token?: number; cache_hit_pct?: number };
   /** What the loaded model's last turn measured; compared to `predicted` only under `from_last_load`. */
   measured?: PlanMeasured;
+  /** `measured` against `predicted` in words, sent only when the loaded model runs this plan:
+   *  `tone` (`ok`, `warn`) only picks the badge's colour. */
+  speed_check?: { badge: string; against: string; tone: 'ok' | 'warn' | (string & {}) };
   memory?: { pools: PlanMemoryPool[] };
   devices?: PlanDevice[];
   /** Why there is no device beyond the host: '' when there is one. */
@@ -336,6 +341,8 @@ export interface HfFacts {
     n_moe_layer: number;
     n_embd: number;
     dense_bytes: number;
+    /** What stays in memory while the experts stream: the dense bytes less the tables read a row at a time. */
+    resident_bytes?: number;
     expert_bytes: number;
     token_cycle_bytes: number;
     largest_dense_tensor: number;
@@ -360,9 +367,23 @@ export interface HfFacts {
      *  "not_a_model", "unknown") and the server's line for it; absent from an older server. */
     fit?: string;
     headline?: string;
+    /** The answer in one sentence with no engine term, and the tone it is said in ("ok", "warn",
+     *  "err", or ""): what a first run shows. Absent from an older server. */
+    summary?: string;
+    tone?: string;
     disk: string;
     memory: string;
   };
+}
+
+/** A catalog entry against this machine, before its download (`POST /api/models/inspect`): the
+ *  check `HfFacts` carries, asked by the entry's id. */
+export interface CatalogCheck extends Pick<HfFacts, 'model' | 'machine' | 'verdict'> {
+  id: string;
+  title: string;
+  quant: string;
+  bytes: number;
+  files: number;
 }
 
 /** One repository a search found (`POST /api/hf/search`). */
@@ -388,12 +409,25 @@ export interface HfAdded {
   bytes: number;
 }
 
+/** Which folders the person chose and which the server was launched with (those stay). */
+export interface ModelFolders {
+  default_models_dir: string;
+  /** "" when the default is used. */
+  chosen_models_dir: string;
+  /** The launch named the models folder (`--models-dir`): it is not changed from here. */
+  models_dir_at_launch: boolean;
+  launch_scan_dirs: string[];
+  chosen_scan_dirs: string[];
+}
+
 export interface ModelsResponse {
   models_dir: string;
-  /** Other directories whose models are listed and loaded in place (`--scan-dir`). */
+  /** Other directories whose models are listed and loaded in place: the launch's, then the chosen ones. */
   scan_dirs: string[];
   local: LocalModel[];
   catalog: CatalogEntry[];
+  /** Absent from a server older than the folder setting. */
+  folders?: ModelFolders;
 }
 
 export interface TokenEvent {

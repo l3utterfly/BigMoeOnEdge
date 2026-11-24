@@ -6,6 +6,7 @@
 // as CSV for benchmarking. The engine itself makes no formatting decisions.
 #pragma once
 
+#include "bmoe/chat.h"
 #include "bmoe/predict_stats.h"
 
 #include <cstdint>
@@ -14,6 +15,14 @@
 #include <vector>
 
 namespace bmoe {
+
+// One candidate at a token's position: its id, its text (special tokens spelled out) and its
+// natural log-probability.
+struct TokenLogprob {
+    int32_t id = 0;
+    std::string piece;
+    float logprob = 0.0f;
+};
 
 struct TokenMetrics {
     int step = 0;            // 1-based index of this token
@@ -107,6 +116,19 @@ struct TokenMetrics {
     // Display-only, and kept apart from `text` on purpose: the UI shows it as a distinct thinking
     // block rather than letting it leak into the answer. See docs/telemetry.md.
     std::string reasoning;
+    // The calls the answer holds so far, as the same per-token parse reads them: the model's own
+    // template recognises them, so no format, model or tool is named here. A call's name is known
+    // once its arguments begin; its id may stay empty until the turn ends; the last call's
+    // arguments are the JSON written so far, and grow by appending (the parser's contract, which a
+    // client that concatenates fragments relies on). Display-only: what the turn decided is
+    // RunResult::tool_calls. Empty with chat off or when the answer has no call.
+    std::vector<ChatToolCall> tool_calls;
+    // Only when GenerateRequest::n_probs asks: this token's log-probability and the most likely
+    // tokens at its position, most likely first, from the model's own distribution before any
+    // sampling stage (what llama.cpp's server and the OpenAI protocol report as logprobs).
+    bool has_logprobs = false;
+    float logprob = 0.0f;
+    std::vector<TokenLogprob> top_logprobs;
 };
 
 struct RunSummary {
@@ -158,8 +180,14 @@ struct RunSummary {
     // own prefill_read_mib/prefill_stall_seconds above do not see. Zero without an arena.
     double prefill_device_read_mib = 0.0;
     double prefill_device_stall_seconds = 0.0;
+    // What the arena copied from the expert cache instead of reading it (PrefillDeviceConfig::
+    // from_cache): the experts a device prefill did NOT read from flash. Zero without an arena.
+    double prefill_device_cache_mib = 0.0;
 
-    // MoE streaming totals (zero when streaming is off)
+    // MoE streaming totals (zero when streaming is off), except moe_compute_s_per_token: the residual
+    // of the wall once the flash and cache terms are taken out, which with nothing streamed is the
+    // whole token, as TokenMetrics::compute_ms is. Zero there would read as a token whose time went
+    // nowhere measured, and a UI's split of it as "other 100%".
     double moe_read_mib = 0.0;
     double moe_io_seconds = 0.0;
     double moe_compute_s_per_token = 0.0;
@@ -195,6 +223,9 @@ struct RunSummary {
     // claiming its reads are useful is doing it here.
     long long cache_evictions = 0;
     long long cache_rereads = 0;
+    long long cache_cold_admits = 0;      // misses a prompt admitted cold (MoeStreamConfig::cache_prefill_cold)
+    long long cache_discarded = 0;        // cached experts the system dropped under memory pressure
+    long long cache_discarded_on_hit = 0; // of those, the ones a lookup found dropped and read again
 
     // Row-gathered dense tables served from flash (MoeStreamConfig::row_stream). The pair that says
     // whether the policy paid: row_table_mib is what those tables would have occupied resident,
@@ -323,8 +354,8 @@ struct RunInfo {
     int n_expert_used = 0; // effective top-k, after any override
     int n_threads = 0;
     int n_ctx = 0;
-    int n_ubatch = 0;                 // widest graph computed at once; 0 = follow n_batch. Sets the compute-buffer
-                                      // reservation, so it moves the very memory columns these rows record.
+    int n_ubatch = 0; // widest graph computed at once, as the context opened it. Sets the compute-buffer
+                      // reservation, so it moves the very memory columns these rows record.
     std::string cache_type_k = "f16"; // the K and V caches' element types: a quantized one is lossy
     std::string cache_type_v = "f16";
     bool chatml = false; // a chat-templated prompt is not the prompt that was typed

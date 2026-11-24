@@ -1,16 +1,30 @@
 package io.bigmoeonedge.app.engine
 
+import java.math.BigDecimal
+import java.math.MathContext
+import java.util.Locale
+
 /**
  * The Plan screen's figures, worked out from what `GET /api/plan` and the parameter table say:
  * decode expected against measured, the cache hit rate credited against measured, the memory held
  * against what the process may hold, and what Apply changed. Nothing here names a
- * device or a knob. Same rules as the web UI (ui/src/lib/plan.ts).
+ * device or a knob, and the comparison of measured against expected is the server's words
+ * (`speed_check`), never worked out here. Same rules as the web UI (ui/src/lib/plan.ts).
  */
+/** A decode rate as a person reads it: one decimal, or two significant digits where one decimal would read 0.0. */
+fun rateText(tokS: Double): String = when {
+    !tokS.isFinite() || tokS <= 0 -> "-"
+    tokS >= 0.1 -> String.format(Locale.US, "%.1f", tokS)
+    else -> significant(tokS)
+}
+
+private fun significant(v: Double): String = BigDecimal.valueOf(v).round(MathContext(2)).toPlainString()
+
 data class PlanFigures(
     val predictedTokS: Double?,
     val measuredTokS: Double?,
-    /** Measured against predicted, as bmoe-cli prints it: positive when the run beat the plan. */
-    val deltaPct: Double?,
+    /** Measured against predicted, in the server's words; null unless the loaded model runs this plan. */
+    val speedCheck: SpeedCheck?,
     /** The hit rate the cost model credited the cache with, and the one the last turn measured. */
     val creditedHitPct: Double?,
     val measuredHitPct: Double?,
@@ -26,7 +40,7 @@ fun planFigures(p: PlanResult): PlanFigures {
     return PlanFigures(
         predictedTokS = ps?.let { 1 / it },
         measuredTokS = ms?.let { 1 / it },
-        deltaPct = if (ps != null && ms != null) 100 * (ps / ms - 1) else null,
+        speedCheck = p.speedCheck,
         creditedHitPct = p.predictedHitPct.takeIf { it >= 0 },
         measuredHitPct = p.measured?.cacheHitPct?.takeIf { it >= 0 },
         heldBytes = host?.takeIf { it.capBytes > 0 }?.heldBytes,

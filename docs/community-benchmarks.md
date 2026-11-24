@@ -34,10 +34,11 @@ measured. Paste all of it. Done.
 - **No toolchain?** Every release attaches a prebuilt `bmoe-cli` (Linux x86_64 / aarch64, macOS
   arm64, Windows x86_64). Point the script at it: `BMOE_CLI=/path/to/bmoe-cli scripts/bench-report.sh model.gguf`.
 - **A GPU in the box?** `--auto` uses it only if the binary carries its backend. The release
-  archives carry Vulkan on Linux and Windows and Metal on macOS. For CUDA, build it in:
-  `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON && cmake --build build -j`; the
-  CUDA module lands beside `bmoe-cli` and loads like the shipped ones. The plan in the report says
-  which devices it used.
+  archives carry Vulkan on Linux and Windows and Metal on macOS. For an NVIDIA card on x86_64, also
+  download `bmoe-pack-cuda-<tag>-<target>` from the same release and extract it **inside** the
+  archive's folder, next to `bmoe-cli`. Extracted next to that folder, it is not loaded and the run
+  stays on the CPU. A build of your own with `-DGGML_CUDA=ON` puts the module there by itself. The
+  plan in the report says which devices it used.
 - **Binary will not start?** The archives carry one CPU module per instruction-set tier and pick the
   best one this machine runs, so no particular CPU is assumed. The Linux aarch64 archive needs
   glibc 2.38 or newer (Ubuntu 24.04); the x86_64 one runs from Ubuntu 22.04. Drop `BMOE_CLI=` and
@@ -143,17 +144,19 @@ around it:
 
 Any MoE in any quant is valid, and a different quant of the same model is its own row: expert bytes
 per token change with the quant, so the flash column does too. That comparison is one of the things
-the table is for. What the app catalog ships:
+the table is for. What the app catalog ships (`catalog/models.json`), the MoE models only: the
+small dense one beside them has nothing to stream, so it makes no row here.
 
 | Model | Catalog quant | Size | Download | Notes |
 |---|---|---:|---|---|
-| Qwen3.6-35B-A3B | Q4_K_M | 22.3 GB | [bartowski/Qwen_Qwen3.6-35B-A3B-GGUF](https://huggingface.co/bartowski/Qwen_Qwen3.6-35B-A3B-GGUF) | the README's reference row |
-| Qwen3-30B-A3B | Q4_K_M | 18.5 GB | [unsloth/Qwen3-30B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF) | |
-| Gemma-4-26B-A4B-it | Q4_K_M | 17.0 GB | [bartowski/google_gemma-4-26B-A4B-it-GGUF](https://huggingface.co/bartowski/google_gemma-4-26B-A4B-it-GGUF) | |
-| gpt-oss-120b | Q4_K_M | 62.8 GB | [unsloth/gpt-oss-120b-GGUF](https://huggingface.co/unsloth/gpt-oss-120b-GGUF) | thinking stays off (the default); pass the first shard |
-| DeepSeek V4 Flash 0731 | UD-IQ2_M | 90.9 GB | [unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) | pass the first shard |
-| Qwen3.8-Flash-Next | UD-IQ3_XXS | 82.0 GB | [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | needs engine 0.22.0+; pass the first shard |
-| Qwen3.8-Flash-Next | Q2_K | 80.4 GB | [DevQuasar/Qwen.Qwen3.8-Flash-Next-GGUF](https://huggingface.co/DevQuasar/Qwen.Qwen3.8-Flash-Next-GGUF) | dense side at 2-4 bit (2.4 GB pinned); no imatrix; pass the first shard |
+| Gemma-4-26B-A4B-it | Q4_0 | 14.6 GB | [ggml-org/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-26B-A4B-it-GGUF) | |
+| Qwen3.6-35B-A3B | Q4_K_M | 20.4 GB | [ggml-org/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF) | the README's reference row |
+| Ornith-1.5-35B-A3B | Q4_K_M | 21.7 GB | [ornith-ai/Ornith-1.5-35B-A3B-GGUF](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) | |
+| Qwen3.8-Flash-Next | Q2_K | 83.1 GB | [ggml-org/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/ggml-org/Qwen3.8-Flash-Next-GGUF) | pass the first shard |
+| DeepSeek-V4.1-Flash-1017 | Q2_K_S | 298.0 GB | [ggml-org/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/ggml-org/DeepSeek-V4.1-Flash-1017-GGUF) | pass the first shard |
+
+Rows from earlier runs used other builds (Qwen3-30B-A3B, gpt-oss-120b, DeepSeek V4 Flash, the
+Unsloth and DevQuasar quants of Qwen3.8-Flash-Next); they stay valid rows, a quant being its own row.
 
 ### What makes a row comparable
 
@@ -205,6 +208,28 @@ phone and on the Windows laptop with the fixed streaming settings the protocol u
 | Desktop, 31 usable x86 cores, 89 GiB control group, 24 GB discrete GPU | PCIe NVMe (1.0 GB/s direct) | Qwen3.8-Flash-Next 125B GSQ-RCO Q2_0 | 8 | 18225 MiB on the card, experts in RAM | 70.7 | 56.2 | 0.000 | 0 MiB | n/a | 0.37.0 | maintainer (rented card, `--auto`, second load) |
 | Desktop, 31 usable x86 cores, 89 GiB control group, 24 GB discrete GPU | PCIe NVMe (1.0 GB/s direct) | DeepSeek V4 Flash 0731 UD-IQ2_M (85 GB of experts) | 6 | 66034 MiB in RAM + 13020 MiB on the card | 9.3 | 4.5 | 0.000 | 87 MiB | 93.9% | 0.37.1 | maintainer (rented card, `--auto`; llama.cpp `--n-cpu-moe` 18.5 on the same file, #419) |
 | Desktop, 7.7 usable x86 cores, 42.6 GiB control group, 12 GB discrete GPU | PCIe NVMe | Qwen3.8-Flash-Next 125B GSQ-RCO Q2_0 | 8 | resident: 6 GB of experts on the card, the rest in RAM | 15.5 | 30.6 | 0.000 | 0 MiB | n/a | 0.37.1 + #420 | maintainer (rented card, `--auto --device-cache-mb 0`: the plain `--auto` run was killed by the control group, #424) |
+| Desktop, 6-core x86, 120 GiB control group, 12 GB discrete GPU (RTX 3060 class) | NVMe | Qwen3.8-Flash-Next 125B GSQ-RCO IQ3_S (84 GB) | 8 | none: the 0.40.2 archive without its CUDA pack, every expert on the cores | 2.9 | 5.1 (25-token prompt) | n/a | 0 MiB | n/a | 0.40.2 | maintainer (`--auto`; with the pack extracted next to the archive's folder rather than in it, 1.6) |
+| Desktop, 6-core x86, 120 GiB control group, 12 GB discrete GPU (RTX 3060 class) | NVMe | Qwen3.8-Flash-Next 125B GSQ-RCO IQ3_S | 8 | 5.3 GB on the card, experts in RAM | 16.0-17.5 | 19.8-21.1 (25-token prompt) | n/a | 0 MiB | 68% (card) | 0.40.2 + CUDA pack | maintainer (`--auto`; 21.1-21.2 with #519's CPU share of the misses set by hand) |
+| Desktop, 6-core x86, 120 GiB control group, 12 GB discrete GPU (RTX 3060 class) | NVMe | Qwen3.8-Flash-Next 125B GSQ-RCO Q2_0 (66 GB) | 8 | none: a 16384-wide graph took 6.6 GB of the card | 12.9-13.1 | 50-63 (short prompts) | n/a | 0 MiB | n/a | main 9cd9d23 | maintainer (`bmoe-server`; the CLI at a 2048 context: 36.8 with a 6.1 GB cache, 86% hits) |
+| Desktop, 6-core x86, 120 GiB control group, 12 GB discrete GPU (RTX 3060 class) | NVMe | Qwen3.8-Flash-Next 125B GSQ-RCO Q2_0 | 8 | 6.1 GB on the card, experts in RAM | 32.9-36.1 | 82-97 (short prompts) | n/a | 0 MiB | n/a | #523 | maintainer (`bmoe-server`, 16384 context, the graph 2048 wide) |
+| Desktop, 6-core x86, 23 GB RAM, 16 GB discrete GPU (RTX A4000) | NVMe | Qwen3.8-Flash-Next 125B GSQ-RCO Q2_0 (streamed) | 8 | 4.1 GB on the card + 20.8 GB in RAM | 18.0-29.1 | 374-445 (9.7k prompt) | n/a | n/a | n/a | main, #505, #523 | maintainer (`bmoe-server`; #505's cache policy 441-445 prefill against 374, alone or with #523; [bench-data](bench-data/2026-11-09-graph-width/README.md)) |
+| Desktop, 8-core x86, 120 GiB control group, 24 GB discrete GPU (RTX 3090 class) | NVMe | Qwen3.8-Flash-Next 125B GSQ-RCO Q2_0 | 8 | 12.4 GB on the card, experts in RAM | 61-73 | 1560-1734 (9.7k prompt) | n/a | 0 MiB | n/a | main, #523 | maintainer (`bmoe-server`) |
+| Desktop, 8-core x86, 120 GiB control group, 24 GB discrete GPU (RTX 3090 class) | NVMe | Qwen3.6-35B-A3B UD-Q4_K_M | 8 | resident on the card (the graph 8192 wide) | 156.3-156.7 | 5604 (9.7k prompt) | 0.000 | 0 MiB | n/a | #523 | maintainer (`bmoe-server`; main, a 16384-wide graph and a 16.8 GB device cache: 129-139 and 4789) |
+| Desktop, 46 usable x86 cores, 104 GiB control group, 32 GB discrete GPU (RTX 5090 class) | NVMe | Qwen3.8-Flash-Next 125B GSQ-RCO Q2_0 | 8 | 26 GB on the card, experts in RAM | 100.5 (256 tokens), 114.2 (1987 tokens) | n/a | n/a | 0 MiB | 95% (card) | main | maintainer (`--auto`; #519's CPU share priced on, 64-68: why #521) |
+| Workstation, 40-core x86, 180 GiB control group, two 24 GB discrete GPUs over PCIe 3 (RTX 3090 class) | NVMe | GLM-4.7 355B-A32B UD-Q2_K_XL (135 GB) | 8 | 13.5 GB on the cards, experts in RAM | 1.6 | n/a | n/a | 0 MiB | n/a | main | maintainer (`bmoe-server`; the fitter's placement, no device cache: 3.9) |
+| Workstation, 40-core x86, 180 GiB control group, two 24 GB discrete GPUs over PCIe 3 (RTX 3090 class) | NVMe | GLM-4.5-Air 106B-A12B UD-Q4_K_XL (68 GB) | 8 | the fitter's: 18 of 45 layers' experts on the cards | 10.4 | 603-613 (9.5k prompt) | n/a | 0 MiB | n/a | main | maintainer (`bmoe-server`; llama.cpp's own server on the same box 15.7 decode, 104 prefill) |
+| Workstation, 24-core x86, 241 GiB control group, two 24 GB discrete GPUs over PCIe 4 (RTX 3090 class) | NVMe | GLM-4.7 355B-A32B UD-Q2_K_XL | 8 | the fitter's (the device cache measured slower and dropped) | 6.2 | 108-121 (45-token prompt) | n/a | 0 MiB | n/a | #524 | maintainer (`bmoe-server`, third load: the cache was timed at 3.18, the fitter's placement at 6.23; main 3.15) |
+| Workstation, 24-core x86, 241 GiB control group, two 24 GB discrete GPUs over PCIe 4 (RTX 3090 class) | NVMe | GLM-4.5-Air 106B-A12B UD-Q4_K_XL | 8 | 34.9 GB on the cards, the graph 4096 wide | 20.1-20.7 | 132 (45-token prompt) | n/a | 0 MiB | n/a | #525 + #526 | maintainer (`bmoe-server`, fifth load: the device cache and the width each decided by measurement; main 14.2, llama.cpp's server 23.8-24.0; [bench-data](bench-data/2026-11-10-glm-two-cards/README.md)) |
+| Desktop, 6-core x86 (12 threads), 31 GB RAM, 8 GB discrete GPU (RTX 3070 class) | NVMe | Qwen3.6-35B-A3B UD-Q4_K_M | 8 | experts in RAM, a device cache of the ones used most | 36.6 (server), 39.9-43.9 (CLI) | 873 (4.7k prompt) | n/a | 0 MiB | n/a | 0.43.0 | maintainer (`bmoe-server --auto`, rented card, [bench-data](bench-data/2026-11-14-rented-0.43/README.md)) |
+| Desktop, 6-core x86 (12 threads), 31 GB RAM, 8 GB discrete GPU (RTX 3070 class) | NVMe | Qwen3.8-Flash-Next 125B GSQ-RCO Q2_0 (66 GB, streamed) | 8 | RAM cache + device cache | 16.3 | n/a | n/a | n/a | n/a | 0.43.0 | maintainer (`bmoe-server --auto`, rented card) |
+| Desktop, 8-core x86 (16 threads), 60 GB RAM, two 16 GB discrete GPUs (RTX 5060 Ti class) | NVMe | Qwen3.8-Flash-Next 125B GSQ-RCO Q2_0 | 8 | every layer on the cards, 18.5 GB device cache, experts in RAM | 41.4-48.0 | 811 (4.7k prompt) | n/a | 0 MiB | n/a | 0.43.0 | maintainer (`bmoe-server --auto`, rented cards) |
+| Desktop, 8-core x86 (16 threads), 60 GB RAM, two 16 GB discrete GPUs (RTX 5060 Ti class) | NVMe | DeepSeek V4 Flash UD-IQ2_M (91 GB, streamed) | 6 | 50 GB in RAM + 13 GB on the cards | 5.4-5.5 | n/a | n/a | n/a | n/a | 0.43.0 | maintainer (`bmoe-server --auto`, rented cards) |
+| Server, 14-core x86, 43 GB this process may hold, 8 GB discrete GPU (RTX 3060 Ti class) | NVMe | Qwen3.6-35B-A3B UD-Q4_K_M | 8 | experts in RAM, a device cache of the ones used most | 20.1-22.2 | 1212 (4.6k prompt) | n/a | 0 MiB | n/a | 0.45.0 | maintainer (`bmoe-server --auto`, rented card; Strata did not start at a 16384 context, [bench-data](bench-data/2026-11-18-rented-0.45/README.md)) |
+| Server, 14-core x86, 43 GB this process may hold, 8 GB discrete GPU (RTX 3060 Ti class) | NVMe | Qwen3.8-Flash-Next 125B GSQ-RCO Q2_0 (66 GB) | 8 | RAM, a 2.0 GB device cache | 13.4-15.3 | 193 (4.6k prompt) | n/a | 0 MiB | n/a | 0.45.0 | maintainer (`bmoe-server --auto`, rented card; Strata 47.8-50.9 lossless) |
+| Workstation, 6-core x86, 85 GB control group, 12 GB discrete GPU (RTX 3060 class) | NVMe | Qwen3.6-35B-A3B UD-Q4_K_M | 8 | experts in RAM, a device cache of the ones used most | 50.5-54.9 | 1778 (4.6k prompt) | n/a | 0 MiB | n/a | 0.45.0 | maintainer (`bmoe-server --auto`, rented card; UD-Q4_K_XL with `--mtp` 58.9-60.1, Strata on that file 36.5-40.4, [bench-data](bench-data/2026-11-18-rented-0.45/README.md)) |
+| Workstation, 6-core x86, 85 GB control group, 12 GB discrete GPU (RTX 3060 class) | NVMe | Qwen3.8-Flash-Next 125B GSQ-RCO Q2_0 | 8 | RAM, a 3.3 GB device cache, the experts' pinned copy for its misses | 22.0-25.8 | 687 (4.6k prompt) | n/a | 0 MiB | n/a | 0.45.0 + #646 | maintainer (`bmoe-server --auto`; 0.45.0 without the copy 19.5-22.8 and 599; Strata 38.2-43.6 lossless) |
+| Desktop, 6-core x86, 63 GB RAM, 24 GB discrete GPU over PCIe 4 (RTX 3090 class) | NVMe | Qwen3.6-35B-A3B UD-Q4_K_M | 8 | resident on the card (the graph 8192 wide) | 150.8-151.0 | 6615 (4.6k prompt) | 0.000 | 0 MiB | n/a | 0.45.0 + #646 | maintainer (`bmoe-server --auto`; 0.45.0 did not load the model here, #646; UD-Q4_K_XL 147.3, with `--mtp` 196.8-223.6, Strata on that file 120.2-120.7, [bench-data](bench-data/2026-11-18-rented-0.45/README.md)) |
+| Desktop, 6-core x86, 63 GB RAM, 24 GB discrete GPU over PCIe 4 (RTX 3090 class) | NVMe | Qwen3.8-Flash-Next 125B GSQ-RCO Q2_0 | 8 | RAM, a 15.7 GB device cache, the experts' pinned copy for its misses | 66.9-70.1 | 1701 (4.6k prompt) | n/a | 0 MiB | n/a | 0.45.0 + #646 | maintainer (`bmoe-server --auto`; 0.45.0 62.0-68.5 and 1582; Strata 93.3-102.3 lossless) |
 | Laptop, Apple silicon 10 cores, 16 GB unified | NVMe (6358 MiB/s, F_NOCACHE) | Qwen3.6-35B-A3B Q4_K_M | 8 | 4713 MiB | 17.4 | 24.5 | 0.000 | 91 MiB | 81.3% | 0.36.0 | maintainer (`--auto`; prefill on Metal, decode on the cores; the 30-token protocol prompt makes the prefill column mostly load) |
 | Mini-PC, x86 16 threads, 90 GiB usable DDR5, integrated GPU (Vulkan build) | PCIe NVMe (1191 MiB/s) | Qwen3.8-Flash-Next 125B Q2_K (75.4 GiB) | 10 | 43195 MiB | 8.8 | 9.1 | 0.000 | 50 MiB | 90.8% | 0.39.0 | [rustysixslinger](https://github.com/Helldez/BigMoeOnEdge/issues/462) (`--auto`, second load; the integrated GPU measured 0.6x the cores and was left off; the same box then served a coding agent for 24 hours on one prompt at 6-7 tok/s) |
 | Mini-PC, x86 16 threads, 90 GiB usable DDR5 (CPU-only build) | PCIe NVMe (1230 MiB/s) | Qwen3.8-Flash-Next 125B Q2_K (75.4 GiB) | 10 | 42672 MiB | 5.7 | 3.5 | 0.000 | 53 MiB | 90.5% | 0.39.0 | [rustysixslinger](https://github.com/Helldez/BigMoeOnEdge/issues/460) (`--auto`, second load) |
@@ -216,7 +241,10 @@ resident row (the model fit on the cards) has no cache and no flash column: it m
 compute ceiling on that machine, which is the number a streamed row on the same box is short of.
 The maintainer rows predate `--ubatch 512` in the protocol, so their compute-buffer reservation was
 wider than a fresh row's.
-Per-token CSVs for the maintainer rows are under `docs/bench-data/`.
+Per-token CSVs for the maintainer rows are under `docs/bench-data/`. The rows of 2026-11-09/10 were measured on rented cards through
+`bmoe-server` with one client and a 16384 context (the server's default), not `bench-report.sh`. Their
+Engine column names the build: a release, `main`, or the pull request whose change the row measures.
+Where a row names a pull request, the number is that change's and is not on `main` until it lands.
 
 ## Open questions
 

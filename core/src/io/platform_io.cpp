@@ -1,6 +1,8 @@
 #include "platform_io.h"
 
+#include <algorithm>
 #include <atomic>
+#include <filesystem>
 
 // System headers MUST be included at global scope, never inside the namespace below:
 // <cstdlib> etc. do `using ::abs;` and would otherwise be pulled into bmoe::pio, where
@@ -55,6 +57,7 @@
 #include <TargetConditionals.h>
 #include <mach-o/dyld.h> // this executable's own path; see run_self
 #include <mach/mach.h>
+#include <mach/vm_purgable.h> // discardable cache spans; see vm_offer
 #include <sys/sysctl.h>
 #if TARGET_OS_IPHONE
 #include <os/proc.h> // this process's own share of memory; see mem_available_bytes
@@ -65,6 +68,21 @@
 #endif
 
 namespace bmoe::pio {
+
+namespace {
+// What the platform names as this executable can be a link to it: an installer that puts a link on
+// PATH and the files in a folder of their own, a package manager's shim. Everything a release ships
+// sits beside the file itself, so the path that counts is the one with every link resolved. Where
+// it cannot be resolved the name as given is still the best answer there is.
+std::string without_links(const std::string & path) {
+    if (path.empty()) return path;
+    // UTF-8 in and out, as every path here is: read as the system's own narrow encoding, a path
+    // outside it would not resolve, and one inside it would come back in bytes that are not UTF-8.
+    std::error_code ec;
+    const std::filesystem::path real = std::filesystem::canonical(std::filesystem::u8path(path), ec);
+    return ec ? path : real.u8string();
+}
+} // namespace
 
 #if !defined(_WIN32)
 // mincore's vector argument is `unsigned char *` on Linux/Android but `char *` on the BSDs and
@@ -141,12 +159,62 @@ void vm_evict(void * p, size_t sz) {
 void vm_release(void * p, size_t /*sz*/) {
     if (p) VirtualFree(p, 0, MEM_RELEASE);
 }
+namespace {
+// OfferVirtualMemory arrived in Windows 8.1; resolved at run time so the build never depends on it.
+using OfferFn = DWORD(WINAPI *)(PVOID, SIZE_T, DWORD);
+using ReclaimFn = DWORD(WINAPI *)(PVOID, SIZE_T);
+struct OfferApi {
+    OfferFn offer = nullptr;
+    ReclaimFn reclaim = nullptr;
+    OfferApi() {
+        if (HMODULE k = GetModuleHandleW(L"kernel32.dll")) {
+            offer = (OfferFn) (void *) GetProcAddress(k, "OfferVirtualMemory");
+            reclaim = (ReclaimFn) (void *) GetProcAddress(k, "ReclaimVirtualMemory");
+        }
+    }
+};
+const OfferApi & offer_api() {
+    static const OfferApi api;
+    return api;
+}
+} // namespace
+bool vm_discard_supported() {
+    // The API exists, but it does not pay here: OfferVirtualMemory takes the range out of the working
+    // set and makes it PAGE_NOACCESS at once, kept or not, and the offer and the reclaim each cost
+    // microseconds per page (about 1 ms per 1.7 MiB entry, twice that with the decode threads busy),
+    // paid on every reuse of an offered entry. Measured on a 15 GB Windows 11 PC with
+    // Qwen3.6-35B-A3B Q4_K_M: decode 2.2-2.9 tok/s offered against 3.7-4.8 with an ordinary cache, the
+    // same bytes and hits, the whole gap in cache management. Until an offer that keeps its pages
+    // mapped is found, the cache here is ordinary memory, as it was before the discardable cache.
+    return false;
+}
+bool vm_commit_discardable(void * p, size_t sz) {
+    return vm_commit(p, sz);
+}
+bool vm_offer(void * p, size_t sz) {
+    constexpr DWORD offer_priority_low = 2; // VmOfferPriorityLow: taken before ordinary standby pages
+    return sz && vm_discard_supported() && offer_api().offer(p, sz, offer_priority_low) == ERROR_SUCCESS;
+}
+bool vm_reclaim(void * p, size_t sz) {
+    if (!sz || !vm_discard_supported()) return true;
+    // ERROR_BUSY: some pages were discarded. The range is committed again either way.
+    return offer_api().reclaim(p, sz) == ERROR_SUCCESS;
+}
+int vm_offered_held(const void * /*p*/, size_t /*sz*/) {
+    // An offered range leaves the working set and turns PAGE_NOACCESS the moment it is offered, kept
+    // or not, so QueryWorkingSetEx reads every offer as gone. Only ReclaimVirtualMemory tells, and
+    // that takes the range back.
+    return -1;
+}
 void vm_drop_file_pages(void * /*p*/, size_t /*sz*/) {
     // File-backed views cannot be decommitted (MEM_DECOMMIT is only valid for VirtualAlloc'd pages),
     // and the host build never mmaps the model for streaming — so there is nothing to drop.
 }
 void drop_file_cache(const char * /*path*/) {
     // No posix_fadvise; the standby list is the system's to trim.
+}
+void drop_file_cache_range(const char * /*path*/, uint64_t /*offset*/, uint64_t /*size*/) {
+    // As above.
 }
 void vm_drop_anon_pages(void * /*p*/, size_t /*sz*/) {
     // MEM_DECOMMIT would turn the owner's next write into an access violation, and MEM_RESET is only
@@ -348,6 +416,79 @@ void vm_evict(void * p, size_t sz) {
 void vm_release(void * p, size_t sz) {
     if (p) munmap(p, sz);
 }
+#if defined(__APPLE__)
+bool vm_discard_supported() {
+    return true;
+}
+bool vm_commit_discardable(void * p, size_t sz) {
+    // A purgeable object at exactly this span, replacing the zero-fill mapping vm_evict left there.
+    // Measured on a 16 GB machine under 9 GB of pressure: every volatile object emptied, nothing
+    // swapped; a state change costs ~0.5 us where madvise(MADV_FREE_REUSE) costs ~25 us per 1.7 MB.
+    vm_address_t a = (vm_address_t) p;
+    return vm_allocate(mach_task_self(), &a, sz, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE | VM_FLAGS_PURGABLE) ==
+               KERN_SUCCESS &&
+           a == (vm_address_t) p;
+}
+bool vm_offer(void * p, size_t sz) {
+    if (!sz) return false;
+    int state = VM_PURGABLE_VOLATILE;
+    return vm_purgable_control(mach_task_self(), (vm_address_t) p, VM_PURGABLE_SET_STATE, &state) == KERN_SUCCESS;
+}
+bool vm_reclaim(void * p, size_t sz) {
+    if (!sz) return true;
+    int state = VM_PURGABLE_NONVOLATILE;
+    if (vm_purgable_control(mach_task_self(), (vm_address_t) p, VM_PURGABLE_SET_STATE, &state) != KERN_SUCCESS)
+        return false; // not an object we offered: the caller re-reads, which is always safe
+    // The previous state comes back in `state`; an emptied object is zero-fill from here on.
+    return (state & VM_PURGABLE_STATE_MASK) != VM_PURGABLE_EMPTY;
+}
+#elif defined(__linux__) && defined(MADV_FREE) // Linux and Android: "a write cancels the free" is Linux semantics
+bool vm_discard_supported() {
+    return true;
+}
+bool vm_commit_discardable(void * p, size_t sz) {
+    return vm_commit(p, sz);
+}
+bool vm_offer(void * p, size_t sz) {
+    // Refused (EINVAL) on kernels before 4.5 and on locked ranges: the span stays ordinary memory.
+    return sz && madvise(p, sz, MADV_FREE) == 0;
+}
+bool vm_reclaim(void * p, size_t sz) {
+    if (!sz) return true;
+    // A write to a page cancels its pending free; a page already freed comes back as a fresh zero
+    // page whatever is written to it. So: write one word back to itself, THEN look at a different
+    // word. Once written the page can no longer be dropped, so a page that reads non-zero away from
+    // the written word is the one that was offered. The order is what makes it race-free - checking
+    // first would let the kernel drop the page between the check and the use.
+    // A page whose every other word is zero reads as dropped although it may not be: that costs a
+    // read, never a wrong answer, and the scan stops at the first non-zero word on any real weight.
+    const size_t page = vm_page(), words = page / sizeof(uint64_t);
+    bool intact = true;
+    for (char * pg = (char *) p; pg < (char *) p + sz; pg += page) {
+        volatile uint64_t * w = (volatile uint64_t *) pg;
+        w[0] = w[0];
+        if (!intact) continue; // the caller refills the whole span; the writes above still cancel frees
+        size_t i = 1;
+        while (i < words && w[i] == 0)
+            ++i;
+        intact = i < words;
+    }
+    return intact;
+}
+#else
+bool vm_discard_supported() {
+    return false;
+}
+bool vm_commit_discardable(void * p, size_t sz) {
+    return vm_commit(p, sz);
+}
+bool vm_offer(void *, size_t) {
+    return false;
+}
+bool vm_reclaim(void *, size_t) {
+    return true;
+}
+#endif
 void vm_drop_file_pages(void * p, size_t sz) {
     // MADV_DONTNEED on the model's clean, read-only MAP_PRIVATE mapping drops the resident pages; the
     // next access refaults them from the file. The tensor was rebound onto its anon copy, so nothing
@@ -361,6 +502,17 @@ void drop_file_cache(const char * path) {
     const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return;
     posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); // advice only: a failure keeps the pages
+    ::close(fd);
+#endif
+}
+void drop_file_cache_range(const char * path, uint64_t offset, uint64_t size) {
+#if defined(__APPLE__)
+    (void) path, (void) offset, (void) size; // no posix_fadvise on Darwin
+#else
+    if (size == 0) return;
+    const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    posix_fadvise(fd, (off_t) offset, (off_t) size, POSIX_FADV_DONTNEED); // advice only, as above
     ::close(fd);
 #endif
 }
@@ -394,6 +546,13 @@ bool vm_resident_sample(const void * p, size_t sz, size_t * sampled, size_t * re
         a += want * page;
     }
     return true;
+}
+int vm_offered_held(const void * p, size_t sz) {
+    // An offered page stays mapped until the kernel takes it, so residency is the answer. One page
+    // tells for the span: the kernel drops an offered span whole on every platform that reports it.
+    size_t sampled = 0, resident = 0;
+    if (!vm_resident_sample(p, std::min(sz, vm_page()), &sampled, &resident) || sampled == 0) return -1;
+    return resident != 0 ? 1 : 0;
 }
 
 #if defined(__APPLE__)
@@ -628,20 +787,24 @@ uint64_t cgroup_memory_left(const char * fs_root, const char * self) {
         const uint64_t left = limit > held ? limit - held : 1; // over the cap: nothing left, but known
         if (best == 0 || left < best) best = left;
     };
+    // Both file LRU lists are credited, as MemAvailable credits them: a model file read twice by the
+    // last load sits on the active list, clean, and the kernel reclaims it before it would end
+    // anything. Crediting the inactive list alone read a rented box's 30 GiB group as 10.
     auto walk = [&](const std::string & base, const std::string & path, const char * max_f, const char * cur_f,
-                    const char * stat_key, bool v1_units) {
+                    const char * inactive_key, const char * active_key, bool v1_units) {
         cgroup_walk(base, path, [&](const std::string & dir) {
             uint64_t limit = 0, used = 0;
             if (read_cgroup_number(dir + "/" + max_f, &limit) && read_cgroup_number(dir + "/" + cur_f, &used)) {
                 if (v1_units && limit >= k_cgroup_v1_unlimited) limit = 0;
-                consider(limit, used, read_cgroup_stat(dir + "/memory.stat", stat_key));
+                const std::string stat = dir + "/memory.stat";
+                consider(limit, used, read_cgroup_stat(stat, inactive_key) + read_cgroup_stat(stat, active_key));
             }
         });
     };
-    if (place.v2) walk(root, place.v2_path, "memory.max", "memory.current", "inactive_file", false);
+    if (place.v2) walk(root, place.v2_path, "memory.max", "memory.current", "inactive_file", "active_file", false);
     if (place.v1)
         walk(root + "/memory", place.v1_path, "memory.limit_in_bytes", "memory.usage_in_bytes", "total_inactive_file",
-             true);
+             "total_active_file", true);
     return best;
 }
 
@@ -889,11 +1052,33 @@ bool file_mapped_regions(const char * basename, std::vector<MappedRegion> & out)
 // ── A second process, for work that can end one ─────────────────────────────────────────
 #if defined(_WIN32)
 
+namespace {
+// Between UTF-8, which every path here is written in, and what the system's own calls take.
+std::wstring widen(const std::string & s, UINT code_page) {
+    if (s.empty()) return {};
+    const int n = MultiByteToWideChar(code_page, 0, s.data(), (int) s.size(), nullptr, 0);
+    std::wstring w((size_t) (n > 0 ? n : 0), L'\0');
+    if (n > 0) MultiByteToWideChar(code_page, 0, s.data(), (int) s.size(), w.data(), n);
+    return w;
+}
+std::string narrow_utf8(const wchar_t * w, size_t len) {
+    if (len == 0) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w, (int) len, nullptr, 0, nullptr, nullptr);
+    std::string s((size_t) (n > 0 ? n : 0), '\0');
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w, (int) len, s.data(), n, nullptr, nullptr);
+    return s;
+}
+} // namespace
+
+// Asked of the system in its own wide characters and returned as UTF-8. Asked in the narrow form, a
+// folder named in the system's code page came back in that code page's bytes, and the first reader
+// that took them for UTF-8 (the listing of the backends beside the executable) threw: a release
+// unpacked under such a folder ended at start (#677).
 std::string self_path() {
-    char buf[4096];
-    const DWORD n = GetModuleFileNameA(nullptr, buf, (DWORD) sizeof(buf));
-    if (n == 0 || n >= sizeof(buf)) return "";
-    return std::string(buf, n);
+    wchar_t buf[4096];
+    const DWORD n = GetModuleFileNameW(nullptr, buf, (DWORD) (sizeof(buf) / sizeof(buf[0])));
+    if (n == 0 || n >= sizeof(buf) / sizeof(buf[0])) return "";
+    return without_links(narrow_utf8(buf, (size_t) n));
 }
 
 bool can_run_self() {
@@ -959,18 +1144,20 @@ ChildResult run_self(const std::vector<std::string> & args, double timeout_secon
     append_quoted(cmd, path);
     for (const std::string & a : args)
         append_quoted(cmd, a);
-    std::vector<char> cmdline(cmd.begin() + 1, cmd.end()); // without the leading space
-    cmdline.push_back(0);
+    // The arguments are in the encoding this process was given its own in (its code page, UTF-8
+    // where the executable's manifest says so); the executable's path is UTF-8 whatever that is.
+    std::wstring cmdline = widen(cmd.substr(1), CP_ACP); // without the leading space
+    const std::wstring wpath = widen(path, CP_UTF8);
 
-    STARTUPINFOA si{};
+    STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = wr;
     si.hStdError = wr;
     si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     PROCESS_INFORMATION pi{};
-    const BOOL started = CreateProcessA(path.c_str(), cmdline.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
-                                        nullptr, &si, &pi);
+    const BOOL started = CreateProcessW(wpath.c_str(), cmdline.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+                                        nullptr, nullptr, &si, &pi);
     CloseHandle(wr);
     if (!started) {
         CloseHandle(rd);
@@ -1028,13 +1215,13 @@ std::string self_path() {
     char buf[4096];
     uint32_t n = sizeof(buf);
     if (_NSGetExecutablePath(buf, &n) != 0) return "";
-    return buf;
+    return without_links(buf);
 #else
     char buf[4096];
     const ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     if (n <= 0) return "";
     buf[n] = 0;
-    return buf;
+    return without_links(buf);
 #endif
 }
 
@@ -1265,26 +1452,11 @@ LockLimit memlock_limit() {
 
 #if defined(__ANDROID__)
 
-// A dma-buf is charged to no limit this process can read: gralloc publishes no total, so the
-// answer is "unbounded here" and the caller bounds it by what the process may hold. Locking in
-// place is a different store with a different answer - the vendor caps it at a few pages.
-LockLimit lockable_limit() {
-    return {lock_unbounded, true};
-}
-LockLimit lock_in_place_limit() {
-    return memlock_limit();
-}
-
-size_t pinned_max_bytes() {
-    // The lock path uses a signed 32-bit type: AHardwareBuffer_lock returns EINVAL at exactly 2^31
-    // bytes while 2^31 - 1 succeeds, even though allocation reaches the 32-bit width cap of 4 GiB.
-    // Probing this at runtime would cost a multi-GiB allocation at startup to learn a constant, so
-    // it is stated here and verified by `bmoe-membench --probe-max` instead.
-    return 0x7FFFFFFFu;
-}
-
-bool pinned_alloc(size_t sz, PinnedAlloc * out) {
-    if (!out || sz == 0 || sz > pinned_max_bytes()) return false;
+namespace {
+// AHardwareBuffer is API 26. A build whose minimum is older (Termux's toolchain targets 24) binds it
+// weakly (core/CMakeLists.txt), and the attribute makes a use of these two outside the check in
+// ahwb() a build error.
+__attribute__((availability(android, introduced = 26))) bool ahwb_alloc(size_t sz, PinnedAlloc * out) {
     AHardwareBuffer_Desc d{};
     d.width = (uint32_t) sz; // BLOB: width IS the byte count, and height must be 1
     d.height = 1;
@@ -1308,11 +1480,59 @@ bool pinned_alloc(size_t sz, PinnedAlloc * out) {
     return true;
 }
 
-void pinned_free(PinnedAlloc * a) {
-    if (!a || !a->handle) return;
+__attribute__((availability(android, introduced = 26))) void ahwb_release(PinnedAlloc * a) {
     AHardwareBuffer * buf = (AHardwareBuffer *) a->handle;
     AHardwareBuffer_unlock(buf, nullptr);
     AHardwareBuffer_release(buf);
+}
+
+struct Ahwb {
+    bool (*alloc)(size_t, PinnedAlloc *);
+    void (*release)(PinnedAlloc *);
+};
+
+// The one place that asks the device. Below API 26 there is no such store: null, and every function
+// below answers as the last branch does, the same "absent" the plan reads on a platform without
+// one. Where the minimum is 26 or more, the check folds to true.
+const Ahwb * ahwb() {
+    if (__builtin_available(android 26, *)) {
+        static constexpr Ahwb calls{ahwb_alloc, ahwb_release};
+        return &calls;
+    }
+    return nullptr;
+}
+} // namespace
+
+// A dma-buf is charged to no limit this process can read: gralloc publishes no total, so the
+// answer is "unbounded here" and the caller bounds it by what the process may hold. Locking in
+// place is a different store with a different answer - the vendor caps it at a few pages.
+LockLimit lockable_limit() {
+    if (!ahwb()) return {0, true};
+    return {lock_unbounded, true};
+}
+LockLimit lock_in_place_limit() {
+    return memlock_limit();
+}
+
+size_t pinned_max_bytes() {
+    // The lock path uses a signed 32-bit type: AHardwareBuffer_lock returns EINVAL at exactly 2^31
+    // bytes while 2^31 - 1 succeeds, even though allocation reaches the 32-bit width cap of 4 GiB.
+    // Probing this at runtime would cost a multi-GiB allocation at startup to learn a constant, so
+    // it is stated here and verified by `bmoe-membench --probe-max` instead.
+    if (!ahwb()) return 0;
+    return 0x7FFFFFFFu;
+}
+
+bool pinned_alloc(size_t sz, PinnedAlloc * out) {
+    const Ahwb * calls = ahwb();
+    if (!calls || !out || sz == 0 || sz > pinned_max_bytes()) return false;
+    return calls->alloc(sz, out);
+}
+
+void pinned_free(PinnedAlloc * a) {
+    const Ahwb * calls = ahwb();
+    if (!calls || !a || !a->handle) return; // a handle comes only from pinned_alloc
+    calls->release(a);
     a->base = nullptr;
     a->handle = nullptr;
     a->size = 0;
@@ -1400,5 +1620,28 @@ bool pinned_alloc(size_t, PinnedAlloc *) {
 void pinned_free(PinnedAlloc *) {}
 
 #endif
+
+bool read_through_cache(const char * path,
+                        const std::vector<std::pair<uint64_t, uint64_t>> & ranges,
+                        const std::atomic<bool> * stop) {
+    const fd_t fd = open_read(path, /*direct*/ false);
+    if (!fd_ok(fd)) return false;
+    std::vector<char> buf(read_through_piece);
+    bool ok = true;
+    for (const auto & r : ranges) {
+        for (uint64_t at = r.first, end = r.first + r.second; ok && at < end;) {
+            if (stop && stop->load(std::memory_order_relaxed)) {
+                close_fd(fd);
+                return true;
+            }
+            const size_t n = (size_t) (std::min)(end - at, (uint64_t) buf.size());
+            const long long got = pread_at(fd, buf.data(), n, at);
+            if (got <= 0) ok = false;
+            at += got > 0 ? (uint64_t) got : 0;
+        }
+    }
+    close_fd(fd);
+    return ok;
+}
 
 } // namespace bmoe::pio

@@ -24,6 +24,8 @@ data class ChatItem(
     val streaming: Boolean = false,
     /** A notice's weight: info, warn or error. */
     val level: String = "",
+    /** The images a user item carries, as the data URLs they were sent as. */
+    val images: List<String> = emptyList(),
 ) {
     companion object {
         const val KIND_USER = "user"
@@ -37,7 +39,11 @@ data class ChatItem(
             reasoning = o.str("reasoning"),
             streaming = o.optBoolean("streaming", false),
             level = o.str("level"),
+            images = strings(o.optJSONArray("images")),
         )
+
+        private fun strings(a: JSONArray?): List<String> =
+            a?.let { arr -> (0 until arr.length()).mapNotNull { i -> arr.optString(i, "").takeIf { it.isNotEmpty() } } }.orEmpty()
 
         fun list(a: JSONArray?): List<ChatItem> =
             a?.let { arr -> (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.let(::of) } }.orEmpty()
@@ -51,6 +57,8 @@ data class ConversationSummary(
     val state: String = STATE_IDLE,
     /** Milliseconds since the epoch; 0 when the server sent none. */
     val updated: Long = 0,
+    /** The person's own system prompt; "" for none. */
+    val system: String = "",
 ) {
     val busy get() = state == STATE_RUNNING
 
@@ -64,6 +72,7 @@ data class ConversationSummary(
             title = o.str("title"),
             state = o.str("state").ifEmpty { STATE_IDLE },
             updated = timeMs(o.opt("updated")),
+            system = o.str("system"),
         )
 
         fun list(a: JSONArray?): List<ConversationSummary> =

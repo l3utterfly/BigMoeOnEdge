@@ -56,9 +56,11 @@ from options back to every UI.
 
 **Desktop and Windows at parity.** A package per OS now ships beside the archives: `BigMoeOnEdge.app`
 in a `.dmg`, a per-user Windows installer and an AppImage (#385). Owed: the `.dmg` notarised and the
-installer signed, and an app that updates itself. In the engine, what Windows lacks: the device
-probes in a process of their own, the cache lock, the byte-identity gates in its CI job, and one
-documented planner run.
+installer signed, and an app that updates itself. In the engine, Windows probes devices in a
+process of their own, samples residency, runs the byte-identity gates in its CI job, and has one
+documented planner run ([hardware-planning.md](hardware-planning.md#a-planner-run-on-windows)).
+Still open there: the container limit a job object sets, and the process's own memory figures. The cache lock is left out on purpose: `VirtualLock`
+is bounded by a working-set quota that is not the process's to raise.
 
 **The box that stays on.** The first always-on use is in the field: a mini-PC serving a 400B MoE
 to a coding agent for hours on one prompt, built from source and started by hand in a terminal
@@ -109,6 +111,98 @@ client. Researched and specified in [#257](https://github.com/Helldez/BigMoeOnEd
 The server half is built: `GET /api/connect` lists the clients with their settings filled in for
 this server, and writes a client's settings file with a backup ([agent.md](agent.md)); the views
 that show it in each UI are owed.
+
+**Serve on the network, from anywhere.** Using the model on one device from another is what Serve
+on the network already does ([desktop-app.md](desktop-app.md), [screens.md](screens.md)): the
+server listens beyond loopback, every request carries the key, and a phone, a PC or any
+OpenAI-compatible client is a client of it. This entry grows that one feature; it adds no second
+server mode, no second API and no second set of access rules. The model runs whole on the host and
+only the chat crosses the link: this is remote inference, not distributed inference. Today it has
+three limits, and each is a separate piece of work:
+
+- **One key for everyone.** Every client holds the same key, gets every right the network gets,
+  and none can be removed without replacing the key for all.
+- **The local network only.** A device on mobile data or behind another router cannot reach it
+  without a port opened on the host's router.
+- **Unencrypted.** Prompts and answers cross the network in the clear, which the card says.
+
+**Clients of their own.** The first piece, and it holds for every way in, the local network
+included. The host keeps a list of clients, each with its own key and a role: *chat* (its own
+conversations, the models already there, nothing deleted, no setting changed, no agent or tool run)
+or *full* (what the one key allows today, for a coding agent on the person's own PC). The host
+lists them and removes one with a tap, which ends its access and nobody else's. Adding a client is a
+QR code, or a code typed where there is no camera, that hands over its key. The rule lives once, in
+the server's access policy (`server/access.h`): a request that does not come from the machine
+itself is a client, whatever carried it, and gets its client's role. The one key of today becomes
+the first full client, so nothing that works now stops working.
+
+**A way in from outside the local network.** The second piece, beneath the first: a peer-to-peer
+tunnel, so a client reaches the host from anywhere with no port opened and no third party reading
+the conversation. It changes how the bytes arrive, never who is let in, and it is an option of the
+same card. What it has to get right:
+
+- **HyperDHT, as a tunnel beside the engine.** `hyperdht` (MIT) finds a peer by public key, punches
+  through the NAT and encrypts the link with Noise, with no server of ours in the path. It runs
+  under Bare (Apache-2.0), a small runtime for desktop and mobile that goes in each package, and
+  presents the remote server on a loopback port on the client's side, so the apps, `core/` and the
+  server's API do not change. Bare's native addons are pinned to the runtime each package ships.
+  Any device running the server can host and any device with a client can join, whatever its OS or
+  hardware: only what starts the tunnel differs per platform.
+- **Keys per device here too.** The host has its own keypair and each client its own; adding a
+  client exchanges the public keys with a one-time secret that expires in minutes, and the DHT's
+  firewall callback admits only listed clients. Removing a client removes it from both.
+- **A tunnel is not the person at the machine.** Its bytes reach the server from loopback, and the
+  server gives a loopback peer what it keeps from the network (files, commands, keys: "Security
+  model" in [server-api.md](server-api.md)). The tunnel must name the client each connection is
+  from, and the server must give it that client's role, or the tunnel becomes a way around the
+  access rules.
+- **Direct when it can, and an answer for when it cannot.** With no relay, a failed hole punch is a
+  failed connection, and carrier networks are the hard case. The failure rate on real mobile
+  networks gets measured first. A relay, if the numbers want one, carries encrypted bytes only and
+  is something a person can host. The bootstrap nodes are public by default and see which addresses
+  ask for a key; they too can be self-hosted.
+- **A phone sleeps.** A phone asleep drops its sockets, and iOS does not keep a suspended app's
+  connections at all, so the answer keeps running on the host and the app collects it on return. A
+  phone as the host works on Android through a foreground service and on iOS only while the app is
+  open.
+
+**A messaging app as a client.** The third piece, for a person who wants the app they already have,
+or a notice when an answer is done: they write to the model on their machine from Telegram or
+Signal. A channel is one more client of the list above, with the chat role and its own removal; it
+is a connector in the server, written once, with a thin adapter per network, so every platform that
+runs the server gets it and no UI owes a line of it. No ready-made tool was found that is that small
+and reaches the networks: the bridges found are unmaintained, the rest are whole agents.
+
+- **Telegram first, native in the server.** The Bot API takes long polling, which needs no public
+  endpoint, and the server already reaches the network through the system's curl (`http_fetch.h`).
+  Its bot token sits in the request URL, so it must reach curl by a route a process list cannot show.
+  A bot chat is not end-to-end encrypted, so Telegram's servers carry the conversation, and the
+  person is told so.
+- **Signal as an optional companion process.** `signal-cli` links as a secondary device and speaks
+  JSON-RPC, with the keys on the local disk. It is GPLv3 and needs a Java 25 runtime, so it is run
+  beside the server and never linked or shipped in the APK, and its releases go stale in about
+  three months. End-to-end encrypted up to the device, which makes it the private option.
+- **WhatsApp not bundled.** The official Business Platform needs a public webhook and a Meta business
+  account, and has barred general-purpose assistants since January 2026; the EU's interim order of
+  June 2026 restores rivals' access while the antitrust case runs, so that ground can still move.
+  The unofficial libraries that link as a device put the number at risk of a ban, and npm has
+  carried malicious Baileys forks. If it comes, it comes as a documented bring your own bridge, on
+  a dedicated number, with whatsmeow pinned, never as a switch in the app.
+- **Matrix for whoever already runs a homeserver.** One adapter would reach the maintained mautrix
+  bridges (AGPL, separate processes) to all three networks. Its bridge host reads messages in the
+  clear and a homeserver is a heavy thing to ask of a person, so it follows the others.
+
+What a channel adds to the client rules: off by default, and with no allowlist of sender ids it
+refuses to start; the chat role only, since an inbound message is untrusted input and a forwarded
+one can carry instructions; tokens stay out of `GET /api/config` and message text stays out of the
+logs. Its turns wait in the one turn line and its conversation is kept apart from the UI's, since
+two conversations taking turns evict each other's context.
+
+The order: clients of their own on the local network first, on every UI, since everything after
+rests on them. Then a plain HyperDHT tunnel to a server, from a phone on mobile data and from a PC
+on another network, to measure how often it connects, which settles the relay; then the tunnel as
+an option of the card, between any two of Android, macOS, Windows and Linux. Then iOS, the answer
+collected on return, and Telegram.
 
 **The planner, drawn.** One diagram of the whole solution, as logic rather than code: the facts
 the probes measure, the rules that read them, the ledger that keeps memory honest, and the plan
@@ -248,77 +342,36 @@ sizing the prize first: under `pinned` only ~294 MiB of a 3000 MiB budget sits i
 is a fraction of the dense one while the cost — 3 GiB of rigid, LMK-accounted memory, and the loss
 of the reserve/commit/evict elasticity the cache is built on — is far higher.
 
-## Expert cache policy — closed, negatively
+## Expert cache policy — reopened below the token cycle
 
-Whether a smarter eviction policy could raise throughput is **answered, and the answer is no**
-([bench-data/2026-07-20-cache-replay/](bench-data/2026-07-20-cache-replay/)).
-
+The first answer was no ([bench-data/2026-07-20-cache-replay/](bench-data/2026-07-20-cache-replay/)).
 Offline replay of the route traces through Bélády, LRU, LFU, random and a per-layer partition
-(`scripts/route-replay.py`, validated against the recorded hit rates to the decimal) shows the
-offline optimum is 11-23 points above LRU, but **no online policy recovers more than ~5**. The
-best candidate, a per-layer budget partition with frequency eviction, was implemented under the
-tag `experiment/layer-lfu` and measured: it delivers the predicted hit-rate gain
-(+2.0 points, −7 % flash reads) and is **~30 % slower**, because a hard per-layer cap removes the
-cache's ability to self-balance and the resulting `MADV_DONTNEED` churn gets paid for by the
-kernel reclaiming the dense weights (majflt/token 6 → 2370). It is preserved under that tag rather
-than merged — a measured regression does not belong in the engine.
+(`scripts/route-replay.py`, validated against the recorded hit rates to the decimal) put the
+offline optimum 11-23 points above LRU, with no online policy recovering more than ~5. The best
+candidate, a per-layer budget partition with frequency eviction, was implemented under the tag
+`experiment/layer-lfu` and measured: it delivered the predicted hit-rate gain (+2.0 points, −7 %
+flash reads) and was **~30 % slower**, because a hard per-layer cap removes the cache's ability to
+self-balance and the resulting `MADV_DONTNEED` churn was paid for by the kernel reclaiming the dense
+weights (majflt/token 6 → 2370). It stays under that tag.
 
-The transferable lesson: a hit-rate curve is not a throughput argument. Any future policy has to
-be measured on device, however good its simulation.
+What reopened it is the regime those traces did not cover: a cache **below one token's working
+set**, where LRU is a cyclic scan that evicts exactly what the next token needs and hits 0%. A
+global (not per-layer) eviction by decayed frequency, every use counting half as much after 8
+tokens, keeps the experts the recent tokens shared instead. Replayed on Qwen3.6-35B-A3B and OLMoE it
+read 25-36% fewer bytes than LRU below the cycle and 1-11% fewer above it; on a 16 GB Mac a 440 MiB
+cache went from 0% to 27% hits and 6.1 to 8.5 tok/s. It is the default (`cache_freq_half_life` 8,
+[cache-sizing.md](cache-sizing.md)), and the planner's replay uses the same policy.
 
-What was still worth doing here was **not** a policy but a guard, and it has shipped. Global LRU's
-recency order is anti-correlated with the deterministic layer cycle, so below one token cycle it
-evicts precisely what it is about to read and the hit rate goes to **exactly 0 %** — reproduced on
-device at a budget the CLI accepts today. Since the worst-case cycle is computable at init from
-model shape alone, the engine now prices it there, records it as `cache_cycle_mb`, and warns when
-the resolved budget falls under it. It warns rather than refuses: the budget is legal and the run is
-byte-correct, it just cannot hit. See [cache-sizing.md](cache-sizing.md).
-
-## More architectures
-
-Any MoE llama.cpp loads whose experts come in one of the three layouts it builds (split, fused
-`ffn_gate_up_exps`, gate-less) streams with no change here, since which tensors are the routed
-experts is read from the file rather than from a table
-([which-models-stream.md](which-models-stream.md)); each layout has a byte-identity gate. The
-remaining frontier is architectures whose routing node is not the shared `ffn_moe_topk` — custom
-gating, which the capture/stream hook would need to learn.
-
-## Steering the routing toward what is resident — built, measured on the desktop
-
-`--expert-substitute` ([cache-aware-substitution.md](cache-aware-substitution.md)) re-ranks each
-decode routing toward the experts already in the cache, by a margin that is a fraction of the
-token's own score range. It is the mechanism of Skliar et al. (arXiv:2412.00099) with the cache in
-front of flash instead of DRAM, and on the desktop it is the strongest lever measured at its
-quality cost: half the flash bytes per token and +62% decode for a 1 to 4% perplexity increase at
-`0.15`. What it owes is the same device A/B as dropping, and a task-level quality check, since the
-desktop's flash share of a token is larger than the phone's and the throughput column will
-compress.
-
-## Skipping reads the router barely wants — built, unmeasured
-
-`--drop-cold-experts` ([expert-dropping.md](expert-dropping.md)) is the first lever that treats
-quality and I/O as a *joint* budget rather than two separate knobs: an expert already in the cache
-runs however small its weight, and only a routing that would cost a flash read can be dropped. On
-the recorded traces that is worth ~3× the reads of turbo top-k for a comparable weight cost, which
-is the strongest offline case any remaining lever has shown.
-
-What it does **not** have is a device measurement, and the previous entry on this page is the reason
-that matters: `layer-lfu` simulated well and was ~30% slower in reality. The open questions are the
-device A/B against turbo top-k at matched throughput, the quality comparison at that speed, and how
-far the static replay overstated the win once dropping starts changing what the cache holds.
-
-## Expert quantization on the fly
-
-Storing streamed experts at a lower precision than the resident parts to cut read volume, if it
-can stay within an acceptable quality boundary. Most valuable exactly where read bandwidth still
-binds, above.
+The transferable lesson stands: a hit-rate curve is not a throughput argument, and a policy ships
+only once it is measured on a device.
 
 ## Bigger, smarter cache
 
 The cache is capacity-bound, not policy-bound (reuse is broad, not skewed), so the simplest win is
 more budget — which `--cache-mb auto` now takes automatically, capped by `--cache-ceil-mb`
-([cache-sizing.md](cache-sizing.md)). Admission policies and a persistent cross-run cache
-remain unexplored.
+([cache-sizing.md](cache-sizing.md)). Admission on decode was replayed and lost; a prompt's
+misses now enter cold, and a device prefill reads what the cache holds instead of flash
+([npu-prefill.md](npu-prefill.md)). A persistent cross-run cache remains unexplored.
 
 ## The experts a device does not hold, computed beside it
 
@@ -388,7 +441,8 @@ phone, a Windows machine and a discrete card the archives now carry a CUDA modul
   the proposal in [#238](https://github.com/Helldez/BigMoeOnEdge/pull/238), on hold, would read at
   run time.
 - **The graph width, anywhere but where it was measured.** `--auto` now chooses `--ubatch` from
-  the compute buffers a width reserves, projected at the width the session opens with. The rule and
+  the compute buffers a width reserves, projected at the default width and priced past it by
+  extending the measured per-token cost at the run's context. The rule and
   its one policy figure were sized on a single laptop; a phone with an NPU, a machine with no
   accelerator, a discrete GPU and a system that commits what it reserves each owe a run before the
   rule is believed there ([hardware-planning.md](hardware-planning.md#the-widest-graph)).
@@ -433,10 +487,10 @@ interesting lever for long prompts, and it gives up the byte identity the gates 
 Asked in #250 and built on llama.cpp's own projector library (`mtmd`): a model loaded with its
 `mmproj` file reads images on every API, the agent and the CLI, with the KV prefix reused through
 an image ([server-api.md](server-api.md#chat), "Images"; [seam.md](seam.md)). What is still owed:
-a run of a streamed MoE vision model on each platform other than the laptop it ran on, an image on the
-Android and iOS apps' composers (the server side is the same), the agent taking a screenshot of its
-own page for a coding harness, and speculation beside an image (today it is off while a
-conversation holds one).
+a run of a streamed MoE vision model on each platform other than the laptop and the phone it ran
+on, the image encoder beside an armed prefill device (#478), the projector freed between images on
+a phone (#475), the agent taking a screenshot of its own page for a coding harness, and speculation
+beside an image (today it is off while a conversation holds one).
 
 ## Not on this list
 

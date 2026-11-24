@@ -24,8 +24,9 @@ prompt and a project's `AGENTS.md`. A model used to one works with the other.
 - **Conversation.** Held by the server (`<data>/agent/conversations/<id>.json`, written whole to a
   temporary file and renamed, so a crash leaves the previous version), because a run can outlive
   the page that started it: a scheduled task has no page at all, and an approval can wait for a
-  person who closed the tab. A conversation has a title, an optional workspace, a mode, a model
-  route, an agent (`builtin`, or another coding agent: see "Other agents") and a list of items. Plain chat in the web UI is a conversation with no workspace. A
+  person who closed the tab. A conversation has a title, an optional workspace, an optional system prompt of the person's, a mode, a model
+  route, an agent (`builtin`, or another coding agent: see "Other agents") and a list of items. Plain chat in the web UI is a conversation with no workspace, and it is sent as plain chat: the
+  person's messages alone, with no system prompt and no tools (see "The run"). A
   conversation that was running when the server stopped reads `idle` on the next start, with a
   notice saying its run ended there.
 - **Workspace.** A folder a person added (`<data>/agent/workspaces.json`): `id`, `name`, `path`
@@ -65,7 +66,7 @@ prompt and a project's `AGENTS.md`. A model used to one works with the other.
   |---|---|
   | `user` | `text` |
   | `assistant` | `text`, `reasoning`, `streaming`, `tool_calls` (`[{id, name, arguments}]`, when the round called tools) |
-  | `tool` | `tool`, `title` (plain words: "Read src/main.cpp"), `args` (object), `state` (`running`, `waiting`, `done`, `denied`, `error`), `result` (text, capped), `diff` (unified, for edits), `file` (workspace-relative path the tool produced or changed, for the preview), `call_id`, `shortened` (true once the context ran short: the model then reads a few lines of `result`, the person still the whole), `mcp` (the server, for an MCP server's tool) |
+  | `tool` | `tool`, `title` (plain words: "Read src/main.cpp"), `args` (object), `state` (`composing`, `running`, `waiting`, `done`, `denied`, `error`), `bytes` (while composing: how much of the call's arguments the model has written), `result` (text, capped), `diff` (unified, for edits), `file` (workspace-relative path the tool produced or changed, for the preview), `call_id`, `shortened` (true once the context ran short: the model then reads a few lines of `result`, the person still the whole), `mcp` (the server, for an MCP server's tool) |
   | `notice` | `text`, `level` (`info`, `warn`, `error`): why something did not happen, in plain words |
 
 ## The run
@@ -78,14 +79,35 @@ then the items as messages, and only the tools the conversation may use. The pro
 (under 4,000 characters, about 1,000 tokens, the tool definitions apart; `tests/agent_test.cpp`
 prints its size): every token of it is prefilled for every new conversation. When the workspace has
 an `AGENTS.md` at its root, the convention coding agents share for a project's own instructions,
-its first 8 KiB are appended to it. What the model writes streams as `delta` events; its
-tool calls run under the mode, their results are appended, and the next round asks again, until an
+its first 8 KiB are appended to it. What the model writes streams as `delta` events; a call
+it is writing is its tool's card from the first piece of its arguments, in state `composing`,
+its title following the arguments as far as they go ("Write page.html") and `bytes` the size
+written so far, updated with the tokens that grow it as the answer's text is: a call can take a
+local model minutes to write, and the person sees what it is. The arguments themselves stream on
+the card as `delta` events (`arguments`, what each token adds), and the UI shows the newest lines
+of the value being written: a page appears line by line instead of as a growing size. A client
+that joins mid-call sees the arguments from where it joined. The card is the same whatever the
+tool (built-in or MCP) or the route (local model or provider), since it reads only the call. When
+the round ends the same card, by its `id`, runs the call; a card whose call will not run (the run
+stopped, the answer ended first) ends `denied` or `error` with why, live only, since the stored
+conversation keeps what a round decided. Its tool calls run under the mode, their results are appended, and the next round asks again, until an
 answer that calls no tool or the round limit (30 rounds per message; a notice says so, and another
 message lets it go on). The same call failing the same way three times in a row also stops the run,
 with a notice: a small model that repeats a refused call would otherwise spend every round on it.
-Without a workspace the prompt tells the model to ask the person for a folder rather than look for
-files some other way. The system prompt is the same for every round of a message and the
+A conversation that can reach no folder (none chosen, or a request from beyond loopback, which the
+file tools refuse) sends no system prompt and no tools at all, as llama.cpp's own web UI sends none
+until the person adds them: an agent prompt there would only spend prefill and the model's thinking
+on tools it cannot use, and bend every answer into a report of work done. The system prompt is the same for every round of a message and the
 conversation is only appended to, so the engine reuses the prompt its KV cache already holds.
+
+A conversation may also carry the person's own system prompt (`system`, up to 8 KiB), as a
+conversation in llama.cpp's web UI does: set when it is made or with a PATCH, never while it runs (a
+run's rounds share one prompt). Without a folder it is the whole system prompt; with one it follows
+the agent's lines and the workspace's `AGENTS.md`, so it reads as the latest word. A new
+conversation starts without one. Nothing the model reads before the conversation is hidden: `GET
+/api/conversations/<id>/system` answers it exactly as the next message sends it, with the person's
+part apart and what it takes of the context, and every UI shows it beside the field that edits the
+person's part (#625). A client of the chat endpoints sends its own as a `system` message, as before.
 
 When a request no longer fits the context (the engine refuses it with `context_full`), the oldest
 long tool result is marked `shortened` and the round is asked again, one result at a time; a notice
@@ -94,10 +116,17 @@ not fit, the run ends with an error notice that says to start a new conversation
 with a larger context.
 
 A stop raises the run's stop: a waiting approval ends at once as denied, a command's whole process
-group is killed, an MCP call ends its server's program (started again by the next call), a
-provider's stream ends at its next piece, and the engine's turn
-ends at its next token (or gives up its place in the line). `POST .../stop` answers once the run
-has ended (waiting at most 30 s, the longest a prompt's prefill may delay that next token).
+group is killed, an MCP call ends its server's program (started again by the next call), and a
+provider's stream ends at its next piece. For a local-model round, the stop reaches the session
+that owns that turn independently of the token callback: the image encoder and prompt prefill
+can observe cancellation at the engine's cancellation points before the first generated token.
+A round still waiting for the engine withdraws only its own place; stopping it does not cancel
+another client's running turn. The engine borrows the run's atomic flag only for that generation,
+so resetting its own cancel latch cannot lose the stop, and the flag cannot spill into a later turn.
+
+`POST .../stop` requests the stop and waits up to 30 s for the run to finish. Its `stopped` field
+says whether there was a run to stop (`false`: none ran); it is not a completion acknowledgement
+if that wait expires. The conversation's state and events say when the run has actually ended.
 
 No model loaded is not a refused message: the message is kept, and the run ends at once with an
 error notice ("No model is loaded ...") and the conversation in state `error`. Sending it again
@@ -114,8 +143,8 @@ with every path the workspace's:
 | `file_glob_search` | `path`, `include`, `exclude`, `type` (`file`, `dir`, `all`), `max_depth`, `limit` | the entries under a folder that match a glob, relative to it, with the total (at most 100) | workspace |
 | `grep_search` | `path`, `pattern`, `include`, `exclude`, `return_line_numbers`, `literal`, `ignore_case`, `context_lines` | the lines matching a regular expression (or a literal) in a file or under a folder, as `path:line:text` (at most 100; files over 2 MiB are not searched) | workspace |
 | `get_info` | none | `{os, cwd}`: the platform and the workspace as the working directory | workspace |
-| `write_file` | `path`, `content` | create or replace a file, its folders created | workspace, a change |
-| `edit_file` | `path`, `edits: [{old_text, new_text}]` | exact replacements, each `old_text` found once in the original, none overlapping, applied at once | workspace, a change |
+| `write_file` | `path`, `content` | create or replace a file, its folders created; answers with the effect (created or replaced, lines, bytes, and for a replaced file how many lines the changed span had and has), not the content, which the model wrote itself | workspace, a change |
+| `edit_file` | `path`, `edits: [{old_text, new_text}]` | exact replacements, each `old_text` found once in the original, none overlapping, applied at once; answers with the diff, whose surrounding lines show where each edit landed | workspace, a change |
 | `exec_shell_command` | `command`, `timeout` (default 10 s, at most 120), `max_output_size` (at most 12 KiB) | a command in the workspace (`/bin/sh -c`, `cmd /c` on Windows), stdout and stderr together, then `[exit code: N]` | workspace, a change, a platform that may start a process |
 | `use_skill` | `name` | a skill's instructions | a skill that is switched on |
 | `<server>_<tool>` | the server's own | an MCP server's tool ("MCP servers") | workspace, a change |
@@ -291,14 +320,15 @@ All JSON; errors are `{"error", "code"}` as everywhere in the API. Times are Uni
 | `POST /api/workspaces` | `{path, name?}` → the workspace; `400 not_a_folder` |
 | `DELETE /api/workspaces/<id>` | forgets the folder, touches no file |
 | `GET /api/conversations` | `[{id, title, workspace, mode, route, agent, state, created, updated, task}]`, newest first; `state` is `idle`, `running`, `waiting` (an approval) or `error` (the last run ended in one) |
-| `POST /api/conversations` | `{workspace?, mode?, route?, agent?, title?, items?}` → the conversation; another `agent` needs a `workspace`. `items`: `[{kind: "user" \| "assistant", text}]`, a conversation the UI kept before the server did |
+| `POST /api/conversations` | `{workspace?, mode?, route?, agent?, title?, system?, items?}` → the conversation; another `agent` needs a `workspace`. `items`: `[{kind: "user" \| "assistant", text}]`, a conversation the UI kept before the server did |
 | `GET /api/conversations/<id>` | the conversation with its `items` |
-| `PATCH /api/conversations/<id>` | `{title?, mode?, route?, workspace?, agent?}` → the conversation without items; `409 busy` for `workspace` or `route` while it runs, and for `agent` once it has items |
+| `GET /api/conversations/<id>/system` | `{text, own, tokens, external}`: the system prompt the next message sends, exactly as sent, and `own`, the person's part of it (the conversation's `system`) (for a client on the network, the one its own run gets: no workspace). `tokens` is what it takes of the context, counted by the loaded model's tokenizer as `/tokenize` counts; `null` with no model ready or on a provider route. `external`: another agent program writes its own, and `text` is empty. `""` under `--chat-only` |
+| `PATCH /api/conversations/<id>` | `{title?, mode?, route?, workspace?, agent?, system?}` → the conversation without items; `system` is the person's own system prompt (`""` for none, at most 8 KiB); `409 busy` for `workspace`, `route` or `system` while it runs, and for `agent` once it has items |
 | `DELETE /api/conversations/<id>` | `409 busy` while it runs |
 | `POST /api/conversations/<id>/messages` | `{text, think?, images?}` → `202 {item}`; the run goes on in the server and reports on `/api/events`. `409 busy` while one runs. `images`: up to 8 data URLs, kept on the item and shown to the model after the text (`400 no_vision` when the loaded model has no projector, server-api.md "Images") |
 | `POST /api/conversations/<id>/edit` | `{item, text, think?}`: drops `item` (a `user` item) and everything after it, then sends `text` → `202 {item}` |
 | `POST /api/conversations/<id>/approval` | `{item, decision: "approve" \| "deny"}`; `404 not_found` when that item is not waiting |
-| `POST /api/conversations/<id>/stop` | stops the run; answers `{stopped}` once it has stopped (`false`: none ran) |
+| `POST /api/conversations/<id>/stop` | requests a stop and waits up to 30 s; `{stopped}` says whether a run was found (`false`: none ran); state/events report completion |
 | `GET /api/conversations/<id>/file?path=` | a workspace file's bytes for the preview, with its content type (16 MiB at most), sandboxed by its own `Content-Security-Policy` |
 | `GET /api/skills?workspace=<id>` | `[{name, title, description, source: "bundled" \| "user" \| "workspace", enabled, body}]`; the workspace's own with `workspace` |
 | `POST /api/skills`, `PUT /api/skills/<name>` | `{name, description, body, title?}`: a person's own skill (a `PUT` on a bundled one writes the person's version of it); `409 exists` on a `POST` that repeats a name |
@@ -320,7 +350,7 @@ On `/api/events`, beside the existing ones:
 |---|---|
 | `conversation` | `{id, title, state, updated}`, whenever one of those changes |
 | `item` | `{conversation, item}`: an item was added or changed, whole |
-| `delta` | `{conversation, item, text?, reasoning?}`: what a streaming assistant item adds. When the model's parser takes back text it showed (a closing reasoning tag), an `item` event carries the item whole instead |
+| `delta` | `{conversation, item, text?, reasoning?, arguments?}`: what a streaming assistant item adds, or (`arguments`) what a tool call in state `composing` adds to its arguments, a JSON object cut anywhere. When the model's parser takes back text it showed (a closing reasoning tag), an `item` event carries the item whole instead |
 | `task` | the task, after it is saved and after a run starts or ends |
 
 An assistant item appears with its first token: a round that fails before one leaves no empty item.

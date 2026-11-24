@@ -5,13 +5,14 @@
   // whatever the plan holds. The plan itself lives in the server store, which reads it again when
   // a session opens and when a turn ends, so this page only draws it.
   import { onMount } from 'svelte';
+  import CellMeter from '../components/CellMeter.svelte';
   import PlanDecisions from '../components/plan/PlanDecisions.svelte';
   import PlanDevices from '../components/plan/PlanDevices.svelte';
   import PlanMemory from '../components/plan/PlanMemory.svelte';
   import PlanProgress from '../components/plan/PlanProgress.svelte';
   import { api } from '../lib/api';
   import { commandLine, formatBytes, formatNum } from '../lib/format';
-  import { appliedChanges, diagnosticText, planDecisions, speedCheck, type AppliedChange } from '../lib/plan';
+  import { appliedChanges, diagnosticText, planDecisions, rateText, speedCheck, type AppliedChange } from '../lib/plan';
   import { href, settingHref } from '../lib/route';
   import { server } from '../stores/server.svelte';
 
@@ -60,6 +61,9 @@
   });
 
   const plan = $derived(server.plan);
+  // While a model loads, the plan the server holds is the previous session's: this load's comes
+  // when the session opens.
+  const loading = $derived(server.info?.state === 'loading' || server.info?.state === 'planning');
   // The model the page is about: the one the shown plan measured, else the one a load would open.
   const modelPath = $derived(
     (plan?.available ? plan.model : '') || String(server.config?.values?.model ?? '') || server.info?.model?.path || '',
@@ -88,8 +92,14 @@
     }
     setTimeout(() => (diag = diag === 'ok' ? 'idle' : diag), 2000);
   }
+  // A lane names devices by their engine id (MTL0, CUDA0); the plan's device list knows what the
+  // system calls them, which is what a person reads.
+  const deviceName = (id: string) => {
+    const d = avail?.devices?.find((x) => x.name === id);
+    return d?.description && d.description !== id ? d.description : id;
+  };
   const PLANNING_DOC = 'https://github.com/Helldez/BigMoeOnEdge/blob/main/docs/hardware-planning.md';
-  import { t } from '../lib/text';
+  import { t, tp } from '../lib/text';
 </script>
 
 <div class="page-col">
@@ -106,7 +116,7 @@
 {#if shownError}
   <div class="banner error" role="alert">
     <span>{shownError}</span>
-    <button type="button" onclick={measure} disabled={measuring}>{measuring ? 'Measuring...' : 'Measure again'}</button>
+    <button type="button" onclick={measure} disabled={measuring}>{measuring ? t('plan.measuring') : t('plan.measureAgain')}</button>
   </div>
 {/if}
 
@@ -118,9 +128,9 @@
   {#if !shownError && !showProgress}<div class="skel" aria-hidden="true"><span class="skeleton"></span><span class="skeleton"></span></div>{/if}
 {:else if !plan.available}
   <div class="card">
-    <p><strong>The automatic hardware planner is not in this build.</strong></p>
+    <p><strong>{t('plan.unavailable')}</strong></p>
     <p class="muted">{plan.reason}</p>
-    <p>Settings keep their defaults and the values you set yourself. Tune them in <a href="#/settings">Settings</a>.</p>
+    <p>{t('plan.unavailable.help')} <a href="#/settings">{t('nav.settings')}</a>.</p>
   </div>
 {:else}
   <label class="auto">
@@ -132,15 +142,15 @@
       disabled={savingAuto}
       onchange={(e) => setAuto((e.currentTarget as HTMLInputElement).checked)}
     />
-    <span><strong>Plan before every load</strong>, on a quiet machine (the previous model is unloaded first). Values you set yourself are kept.</span>
+    <span><strong>{t('plan.auto')}</strong>{t('plan.auto.help')}</span>
   </label>
 
   {#if plan.none}
     <section class="card summary">
-      <p class="sentence">Not measured yet.</p>
+      <p class="sentence">{t('plan.notMeasured')}</p>
       <p class="muted machine">{t('plan.measureFor', { name: modelName || t('plan.theModel') })}</p>
       <div class="apply">
-        <button type="button" class="primary" onclick={measure} disabled={measuring}>{measuring ? 'Measuring...' : 'Measure'}</button>
+        <button type="button" class="primary" onclick={measure} disabled={measuring}>{measuring ? t('plan.measuring') : t('plan.measure')}</button>
       </div>
     </section>
   {:else if avail && check}
@@ -148,87 +158,88 @@
       <p class="banner warn" role="status">{avail.warning}</p>
     {/if}
 
+    {#if loading}
+      <p class="muted" role="status">{t('plan.loading')}</p>
+    {/if}
     <section class="card summary">
-      {#if avail.from_last_load}
-        <span class="badge ok">The loaded model runs this plan</span>
+      {#if loading}
+        <span class="badge">{t('plan.badge.before')}</span>
+      {:else if avail.from_last_load}
+        <span class="badge ok">{t('plan.badge.runs')}</span>
       {:else if avail.cached}
-        <span class="badge">The last plan measured</span>
+        <span class="badge">{t('plan.badge.last')}</span>
       {/if}
-      <p class="sentence">{avail.summary?.sentence ?? `Regime: ${avail.regime}`}</p>
+      <p class="sentence">{avail.summary?.sentence ?? t('plan.regime', { regime: avail.regime })}</p>
       {#if avail.machine}<p class="muted machine">{avail.machine}</p>{/if}
       {#if avail.summary?.lanes?.length}
         <p class="lanes">
           {#each avail.summary.lanes as lane (lane.phase)}
-            <span><span class="muted">{lane.label ?? lane.phase}</span> <span class="figure">{lane.on.join(' + ')}</span></span>
+            <span><span class="muted">{lane.label ?? lane.phase}</span> <span class="figure">{lane.on.map(deviceName).join(' + ')}</span></span>
           {/each}
         </p>
       {/if}
       {#if avail.not_applicable?.length}
-        <p class="warn-text">Not applicable in this build: {avail.not_applicable.join(', ')}</p>
+        <p class="warn-text">{t('plan.notApplicable')} {avail.not_applicable.join(', ')}</p>
       {/if}
 
       <div class="tiles">
         <div class="tile">
-          <span class="muted k">Tokens</span>
+          <span class="muted k">{t('plan.tile.tokens')}</span>
           {#if check.measuredTokS !== null}
-            <span><span class="figure big">{formatNum(check.measuredTokS)}</span> <span class="figure muted">tok/s measured</span></span>
-            {#if check.predictedTokS !== null && check.deltaPct !== null}
-              {#if avail.from_last_load}
-                <span class="muted k"><span class="badge {check.deltaPct >= 0 ? 'ok' : 'warn'}">{check.deltaPct >= 0 ? '+' : ''}{check.deltaPct.toFixed(0)}%</span> against the {formatNum(check.predictedTokS)} expected</span>
-              {:else}
-                <span class="muted k">{formatNum(check.predictedTokS)} tok/s expected under this plan</span>
-              {/if}
+            <span><span class="figure big">{rateText(check.measuredTokS)}</span> <span class="figure muted">{t('plan.tokMeasured')}</span></span>
+            {#if avail.speed_check}
+              <span class="muted k"><span class="badge {avail.speed_check.tone === 'ok' ? 'ok' : 'warn'}">{avail.speed_check.badge}</span> {avail.speed_check.against}</span>
+            {:else if check.predictedTokS !== null}
+              <span class="muted k">{t('plan.tokExpectedUnder', { rate: rateText(check.predictedTokS) })}</span>
             {/if}
           {:else if check.predictedTokS !== null}
-            <span><span class="figure big">{formatNum(check.predictedTokS)}</span> <span class="figure muted">tok/s expected</span></span>
-            <span class="muted k">{avail.from_last_load ? 'Measured after the first answer' : 'Measured after a load'}</span>
+            <span><span class="figure big">{rateText(check.predictedTokS)}</span> <span class="figure muted">{t('plan.tokExpected')}</span></span>
+            <span class="muted k">{avail.from_last_load ? t('plan.afterAnswer') : t('plan.afterLoad')}</span>
           {:else}
-            <span class="muted">No prediction</span>
+            <span class="muted">{t('plan.noPrediction')}</span>
           {/if}
         </div>
         {#if check.predictedHitPct !== null || check.measuredHitPct !== null}
           <div class="tile">
-            <span class="muted k">Cache hits</span>
+            <span class="muted k">{t('plan.tile.hits')}</span>
             <span>
               <span class="figure big">{formatNum(check.measuredHitPct ?? check.predictedHitPct, 0)}%</span>
-              <span class="figure muted">{check.measuredHitPct !== null ? 'measured' : 'credited'}</span>
+              <span class="figure muted">{check.measuredHitPct !== null ? t('plan.hits.measured') : t('plan.hits.credited')}</span>
             </span>
-            <div class="hits" aria-hidden="true">
-              <span style="width: {Math.min(100, check.measuredHitPct ?? check.predictedHitPct ?? 0)}%"></span>
-              {#if check.measuredHitPct !== null && check.predictedHitPct !== null}
-                <i style="left: {Math.min(100, check.predictedHitPct)}%"></i>
-              {/if}
-            </div>
+            <CellMeter
+              value={check.measuredHitPct ?? check.predictedHitPct ?? 0}
+              mark={check.measuredHitPct !== null ? check.predictedHitPct : null}
+              label={t('plan.tile.hits')}
+              valueText="{formatNum(check.measuredHitPct ?? check.predictedHitPct, 0)}%"
+            />
             {#if check.measuredHitPct !== null && check.predictedHitPct !== null}
-              <span class="muted k">The mark is the {check.predictedHitPct.toFixed(0)}% the plan credited</span>
+              <span class="muted k">{t('plan.hits.mark', { pct: check.predictedHitPct.toFixed(0) })}</span>
             {/if}
           </div>
         {/if}
         {#if host && host.cap_bytes > 0}
           <div class="tile">
-            <span class="muted k">Memory</span>
-            <span><span class="figure big">{formatBytes(host.held_bytes)}</span> <span class="figure muted">held</span></span>
-            <div class="hits" aria-hidden="true">
-              <span style="width: {Math.min(100, (100 * host.held_bytes) / host.cap_bytes)}%"></span>
-            </div>
-            <span class="muted k">Of the {formatBytes(host.cap_bytes)} it may hold</span>
+            <span class="muted k">{t('plan.tile.memory')}</span>
+            <span><span class="figure big">{formatBytes(host.held_bytes)}</span> <span class="figure muted">{t('plan.memory.held')}</span></span>
+            <CellMeter value={(100 * host.held_bytes) / host.cap_bytes} label={t('plan.tile.memory')} valueText={formatBytes(host.held_bytes)} />
+            <span class="muted k">{t('plan.memory.ofCap', { size: formatBytes(host.cap_bytes) })}</span>
           </div>
         {/if}
       </div>
 
       <div class="apply">
-        <button type="button" class="primary" onclick={apply} disabled={applying || measuring}>Apply plan</button>
+        <button type="button" class="primary" onclick={apply} disabled={applying || measuring}>{t('plan.apply')}</button>
         <button type="button" onclick={measure} disabled={measuring}>
-          {measuring ? 'Measuring...' : 'Measure again'}
+          {measuring ? t('plan.measuring') : t('plan.measureAgain')}
         </button>
-        <span class="muted">Values you set yourself are never changed.</span>
+        <span class="muted">{t('plan.apply.help')}</span>
       </div>
       {#if applied}
         <div class="applied" role="status">
           {#if applied.length === 0}
-            <p class="ok-text">Plan applied: every setting already had the plan's value.</p>
+            <p class="ok-text">{t('plan.applied.none')}</p>
           {:else}
-            <p class="ok-text">Plan applied. {applied.length === 1 ? 'One setting changed' : `${applied.length} settings changed`}:</p>
+            <p class="ok-text">{tp('plan.applied', applied.length)}</p>
             <ul>
               {#each applied as c (c.key)}
                 <li><a href={settingHref(c.key)}>{c.label}</a> <span class="muted figure">{c.from}</span> → <span class="figure">{c.to}</span></li>
@@ -238,36 +249,40 @@
         </div>
       {/if}
       {#if server.config?.reload_required && server.ready}
-        <p class="muted">Some applied values need a model reload: use the banner in <a href="#/settings">Settings</a>.</p>
+        <p class="muted">{t('plan.applied.reload')} <a href="#/settings">{t('nav.settings')}</a>.</p>
       {/if}
     </section>
 
     {#if avail.memory?.pools?.length}
-      <h2>Memory</h2>
+      <h2>{t('plan.section.memory')}</h2>
       <section class="card"><PlanMemory pools={avail.memory.pools} /></section>
     {/if}
 
     {#if avail.devices?.length}
-      <h2>Devices</h2>
+      <h2>{t('plan.section.devices')}</h2>
       <section class="card"><PlanDevices devices={avail.devices} none={avail.devices_none_text ?? ''} /></section>
     {/if}
 
-    <h2>Decisions</h2>
-    <PlanDecisions decisions={avail.decisions} />
+    <h2>{t('plan.section.decisions')}</h2>
+    {#if avail.decisions?.length}
+      <PlanDecisions decisions={avail.decisions} />
+    {:else}
+      <p class="muted">{t('plan.decisions.none')}</p>
+    {/if}
 
     {#if avail.args?.length}
-      <h2>Command</h2>
+      <h2>{t('plan.section.command')}</h2>
       <pre>{commandLine(avail.args)}</pre>
     {/if}
     <div class="apply diag">
-      <button type="button" onclick={copyDiagnostic}>Copy diagnostic</button>
-      <span class="muted">The command and the planner's whole account, for a bug report.</span>
-      {#if diag === 'ok'}<span class="ok-text" role="status">Copied.</span>{/if}
-      <a class="doc" href={PLANNING_DOC} target="_blank" rel="noopener noreferrer">How the planner decides</a>
+      <button type="button" onclick={copyDiagnostic}>{t('plan.diagnostic')}</button>
+      <span class="muted">{t('plan.diagnostic.help')}</span>
+      {#if diag === 'ok'}<span class="ok-text" role="status">{t('plan.diagnostic.copied')}</span>{/if}
+      <a class="doc" href={PLANNING_DOC} target="_blank" rel="noopener noreferrer">{t('plan.howItDecides')}</a>
     </div>
     {#if diag === 'failed'}
       <div class="banner warn">
-        <span>The clipboard is not available here. Copy it by hand:</span>
+        <span>{t('plan.clipboard')}</span>
         <pre class="cmd">{diagnosticText(avail.args ?? [], avail.explain ?? '')}</pre>
       </div>
     {/if}
@@ -275,8 +290,8 @@
 {/if}
 
 {#if showCarried}
-  <h2>Decisions from the last applied plan</h2>
-  <p class="muted">What the settings carry now; Measure shows the plan in full.</p>
+  <h2>{t('plan.carried')}</h2>
+  <p class="muted">{t('plan.carried.help')}</p>
   <PlanDecisions decisions={carried} />
 {/if}
 
@@ -318,21 +333,22 @@
     letter-spacing: -0.01em;
     line-height: 1.25;
     max-width: 34ch;
+    text-wrap: balance;
   }
   .machine {
     margin: 0;
   }
+  /* Figures side by side in the summary card, parted by a rule: no box inside the box. */
   .tiles {
     align-self: stretch;
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 0.75rem;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: var(--s4) var(--s5);
+    border-top: var(--edge) solid var(--line);
+    padding-top: var(--s4);
   }
   .tile {
-    background: var(--bg);
-    border: var(--edge) solid var(--line);
-    border-radius: var(--radius);
-    padding: 0.75rem;
+    padding: 0 var(--s3) 0 0;
     display: flex;
     flex-direction: column;
     gap: 0.35rem;
@@ -345,33 +361,16 @@
     font-size: 1.9rem;
     line-height: 1.1;
   }
-  .hits {
-    position: relative;
-    height: 8px;
-    border-radius: var(--pill);
-    background: var(--surface-2);
-  }
-  .hits span {
-    display: block;
-    height: 100%;
-    border-radius: var(--pill);
-    background: var(--accent);
-  }
-  .hits i {
-    position: absolute;
-    top: -5px;
-    bottom: -5px;
-    width: 2px;
-    background: var(--text);
-  }
   .lanes {
     margin: 0;
     display: flex;
     flex-wrap: wrap;
     gap: 0.3rem 1.25rem;
   }
+  /* Facts, not links: the words' colour, weighted, so only links wear the link colour. */
   .lanes .figure {
-    color: var(--accent-ink);
+    color: var(--text);
+    font-weight: 600;
     overflow-wrap: anywhere;
   }
   .doc {

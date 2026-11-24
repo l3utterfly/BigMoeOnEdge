@@ -33,9 +33,12 @@ export interface ConversationSummary {
   updated: WireTime;
   /** The task whose run this conversation is, when it is one. */
   task?: string | null;
+  /** The person's own system prompt ('' for none). */
+  system?: string;
 }
 
-export type ToolState = 'running' | 'waiting' | 'done' | 'denied' | 'error' | (string & {});
+/** `composing`: the model is still writing the call (docs/agent.md, "Items"); it runs once written. */
+export type ToolState = 'composing' | 'running' | 'waiting' | 'done' | 'denied' | 'error' | (string & {});
 export type NoticeLevel = 'info' | 'warn' | 'error' | (string & {});
 
 interface ItemBase {
@@ -64,6 +67,10 @@ export interface ToolItem extends ItemBase {
   file?: string;
   /** The MCP server whose tool this is (`tool` is then `<server>_<tool>`). */
   mcp?: string;
+  /** While composing: how much of the call's arguments the model has written so far, in bytes. */
+  bytes?: number;
+  /** While composing: the arguments as written so far (a JSON object cut anywhere), from `delta`s. */
+  draft?: string;
 }
 export interface NoticeItem extends ItemBase {
   kind: 'notice';
@@ -92,6 +99,8 @@ export interface DeltaEvent {
   item: string;
   text?: string;
   reasoning?: string;
+  /** What a tool call the model is writing adds to its arguments (the card is in state `composing`). */
+  arguments?: string;
 }
 
 export type SkillSource = 'bundled' | 'user' | 'workspace' | (string & {});
@@ -170,9 +179,16 @@ export interface BackendPack {
   applies: boolean;
   installed: boolean;
 }
+/** A local graphics card a registered backend offers, as the device describes itself. */
+export interface GraphicsDevice {
+  backend: string;
+  description: string;
+}
 export interface Backends {
   /** The backends that registered in this server, by name. */
   registered: string[];
+  /** Of their devices, the local graphics cards (discrete or integrated); absent from an older server. */
+  graphics?: GraphicsDevice[];
   packs: BackendPack[];
   /** Why the feed could not be read, when it could not. */
   feed_error?: string;
@@ -181,8 +197,11 @@ export interface Backends {
 export interface UpdateInfo {
   current: string;
   latest: string;
+  /** A newer release is out, whether or not this build can download it. */
   available: boolean;
   notes?: string;
+  /** This build's installer in the feed; null where the release ships none for it. */
+  installer?: { url: string; sha256: string; size: number; file: string } | null;
 }
 export interface UpdateDownloaded {
   /** The checked installer, for `bmoeDesktop.applyUpdate`. */

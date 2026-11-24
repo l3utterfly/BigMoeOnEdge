@@ -5,10 +5,11 @@
 // weights indexed by the declared expert count), the same discovery the streamer runs at load, so
 // there is no table of architectures to fall out of date. A MoE whose layout cannot be read that way
 // gets an error, and the planner declines rather than guessing at a layout. Every other name this
-// file matches (`token_embd`, `output`, `blk.N.attn_*`, `blk.N.ffn_*`) is the gguf naming
-// convention itself, shared by every architecture llama.cpp converts: a property of the FORMAT,
-// not of any model. A name matching nothing lands in Other and is priced as read-whole, which is
-// the conservative direction — an unrecognised tensor can make a plan cautious, never reckless.
+// file matches (the token table, the output head, a block's attention and feed-forward) is the gguf
+// naming convention itself, shared by every architecture llama.cpp converts: a property of the
+// FORMAT, not of any model, and spelled in tensor_names with every other name the engine reads. A
+// name matching nothing lands in Other and is priced as read-whole, which is the conservative
+// direction — an unrecognised tensor can make a plan cautious, never reckless.
 
 #include "bmoe/probe.h"
 
@@ -19,26 +20,12 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <cstring>
 #include <vector>
 #include <map>
 #include <set>
 #include <string>
 
 namespace bmoe {
-
-namespace {
-
-// An embedding table, by the format's own naming. Two tensors qualify and both are gathered by
-// row: `token_embd`, and the per-layer n-gram table some architectures add (gemma4, qwen4exp),
-// which on one released quant is 28.8 GB — 43% of the file. Pricing that as read-whole would put
-// a demand on every token that no token has, and it would dominate every other term in the plan.
-// Matched by the convention rather than by name so a third table needs no new case.
-bool is_embedding_table(const std::string & name) {
-    return name.find("token_embd") != std::string::npos;
-}
-
-} // namespace
 
 GgufHeaderFacts probe_gguf_header(const char * model_path) {
     GgufHeaderFacts h;
@@ -56,7 +43,7 @@ GgufHeaderFacts probe_gguf_header(const char * model_path) {
     return h;
 }
 
-ModelProfile probe_model(const char * model_path) {
+ModelProfile probe_model(const char * model_path, uint32_t engine_layers) {
     ModelProfile m;
     if (!model_path || !*model_path) {
         m.error = "no model path";
@@ -73,6 +60,7 @@ ModelProfile probe_model(const char * model_path) {
     m.n_expert = (uint32_t) std::max(0, meta.info.n_expert);
     m.n_expert_used = (uint32_t) std::max(0, meta.info.n_expert_used);
     m.n_embd = (uint32_t) std::max(0, meta.info.n_embd);
+    m.n_swa = (uint32_t) std::max(0, meta.info.n_swa);
 
     // Which tensors are the routed experts, read off the file's shapes, and the same refusal the
     // streamer makes: a file whose experts cannot be told apart gets no plan, since a plan that
@@ -93,10 +81,11 @@ ModelProfile probe_model(const char * model_path) {
     std::map<int, uint64_t> per_layer_expert_bytes;
     std::map<int, uint64_t> per_file_expert_bytes; // by index into the file's shard list
     std::map<int, uint32_t> projections_per_layer;
-    std::map<int, uint64_t> per_layer_dense_bytes; // a block's non-expert tensors
-    std::map<int, uint64_t> expert_bytes_by_type;  // by ggml type id
-    std::set<int> blocks;                          // every block index the file carries, MTP excluded
-    std::set<int> mtp_layers;                      // blocks that carry a multi-token-prediction head
+    std::map<int, uint64_t> per_layer_dense_bytes;       // a block's non-expert tensors
+    std::map<int, uint64_t> expert_bytes_by_type;        // by ggml type id
+    std::set<int> blocks;                                // every block index the file carries, MTP excluded
+    std::set<int> mtp_layers;                            // blocks that carry a multi-token-prediction head
+    uint64_t block_bytes[(int) WeightGroup::count] = {}; // each group's bytes that sit in a block
 
     bool saw_output_weight = false;
     bool saw_token_embd = false;
@@ -107,7 +96,7 @@ ModelProfile probe_model(const char * model_path) {
     // block at all unless asked, experts AND dense alike, so nothing of it may count toward what
     // the run holds. (Measured: counting its dense tensors overstated the pinned set by ~850 MiB.)
     for (const auto & kv : meta.offsets.size_by_name) {
-        if (kv.first.find("nextn") == std::string::npos) continue;
+        if (!tensor_names::is_mtp_tensor(kv.first.c_str())) continue;
         m.has_mtp = true;
         const int layer = tensor_names::block_layer(kv.first.c_str());
         if (layer >= 0) mtp_layers.insert(layer);
@@ -119,26 +108,30 @@ ModelProfile probe_model(const char * model_path) {
 
         // Classification and the MTP exclusion see every tensor of a block, scales, biases and
         // probs included: those are bytes the file carries either way.
-        const char * rest = "";
-        const int layer = tensor_names::block_layer(name.c_str(), &rest);
+        const int layer = tensor_names::block_layer(name.c_str());
         const bool in_block = layer >= 0;
         if (in_block && mtp_layers.count(layer)) continue; // never loaded
         if (in_block) blocks.insert(layer);
 
         m.file_bytes += size;
 
-        if (name == "output.weight") saw_output_weight = true;
-        if (name == "token_embd.weight") saw_token_embd = true;
+        if (tensor_names::is_output_head(name)) saw_output_weight = true;
+        if (tensor_names::is_token_table(name)) saw_token_embd = true;
 
         // Only the layout's expert weights: a scale, a bias or a probs tensor is not an expert
         // weight however much its name resembles one, and the layout told them apart by rank.
         int elayer = 0;
         const bool is_expert = layout.slot_of(name.c_str(), elayer) >= 0;
 
+        // An embedding table is gathered by row: the token table, and the per-layer n-gram table some
+        // architectures add (gemma4, qwen4exp), which on one released quant is 28.8 GB — 43% of the
+        // file. Pricing that as read-whole would put a demand on every token that no token has, and
+        // it would dominate every other term in the plan.
         WeightGroup g = WeightGroup::Other;
+        const tensor_names::BlockPart part = tensor_names::block_part(name.c_str());
         if (is_expert) {
             g = WeightGroup::Experts;
-        } else if (!in_block && is_embedding_table(name)) {
+        } else if (!in_block && tensor_names::is_embedding_table(name.c_str())) {
             g = WeightGroup::Embedding;
             m.embedding_tensors.push_back(name);
             // A table whose row count the file does not state cannot be turned into a per-token
@@ -148,14 +141,15 @@ ModelProfile probe_model(const char * model_path) {
                 embd_row_bytes += size / r->second;
             else
                 embd_rows_known = false;
-        } else if (name == "output.weight") {
+        } else if (tensor_names::is_output_head(name)) {
             g = WeightGroup::Output;
-        } else if (in_block && std::strncmp(rest, "attn", 4) == 0) {
+        } else if (part == tensor_names::BlockPart::Attention) {
             g = WeightGroup::Attention;
-        } else if (in_block && std::strncmp(rest, "ffn", 3) == 0) {
+        } else if (part == tensor_names::BlockPart::Ffn) {
             g = WeightGroup::DenseFfn;
         }
         m.group(g).bytes += size;
+        if (in_block) block_bytes[(int) g] += size;
 
         if (is_expert) {
             const auto f = meta.offsets.file_by_name.find(name);
@@ -198,8 +192,23 @@ ModelProfile probe_model(const char * model_path) {
         m.expert_bytes += kv.second;
         m.largest_expert_layer_bytes = std::max(m.largest_expert_layer_bytes, kv.second);
     }
-    for (const auto & kv : per_layer_dense_bytes)
+    // The engine's layers against the file's blocks. They differ on a model whose graph runs some
+    // blocks more than once per token: the engine numbers a layer for every run, and the later ones
+    // carry no weights of their own. Which blocks those are is the graph's business and no key of
+    // the format says it, so a block's demand is counted `runs` times as an average over all of
+    // them: exact for the token's total wherever the blocks are alike, which is every model so far.
+    m.n_block = (uint32_t) blocks.size();
+    m.n_layer = std::max(m.n_block, engine_layers);
+    const auto over_runs = [&m](uint64_t bytes) {
+        return m.n_block ? (uint64_t) ((double) bytes * (double) m.n_layer / (double) m.n_block) : bytes;
+    };
+    // By llama.cpp's own layer index: every block the file carries, an MTP block not among them,
+    // and nothing for a layer that runs another block's weights.
+    m.layer_dense_bytes.assign(m.n_layer, 0);
+    for (const auto & kv : per_layer_dense_bytes) {
         m.largest_layer_dense_bytes = std::max(m.largest_layer_dense_bytes, kv.second);
+        if (kv.first >= 0 && (size_t) kv.first < m.n_layer) m.layer_dense_bytes[(size_t) kv.first] = kv.second;
+    }
     for (const auto & kv : per_layer_one_expert) {
         // The granule the streamer issues as a read is one expert of one projection; the LARGEST
         // of them is what should be looked up on the storage rate curve, because that is the
@@ -208,10 +217,10 @@ ModelProfile probe_model(const char * model_path) {
         if (projs) m.expert_slice_bytes = std::max(m.expert_slice_bytes, kv.second / projs);
         m.token_cycle_bytes += kv.second * m.n_expert_used;
     }
+    m.token_cycle_bytes = over_runs(m.token_cycle_bytes);
 
     m.dense_bytes = m.file_bytes > m.expert_bytes ? m.file_bytes - m.expert_bytes : 0;
     m.is_moe = m.expert_bytes > 0 && m.n_expert > 0 && m.n_expert_used > 0;
-    m.n_layer = (uint32_t) blocks.size();                   // llama.cpp's own layer indices
     m.n_moe_layer = (uint32_t) per_layer_one_expert.size(); // the ones that stream
     for (const auto & kv : per_layer_one_expert)
         m.moe_layers.push_back((uint32_t) kv.first);
@@ -227,9 +236,10 @@ ModelProfile probe_model(const char * model_path) {
     m.tied_output_head = saw_token_embd && !saw_output_weight;
 
     // ── demand per token ────────────────────────────────────────────────────────────
-    // Read whole, unless said otherwise below. Nothing here consults a size or an architecture.
+    // Read whole, unless said otherwise below, and a block's part once per run of the block.
+    // Nothing here consults a size or an architecture.
     for (int i = 0; i < (int) WeightGroup::count; ++i)
-        m.groups[i].bytes_per_token = m.groups[i].bytes;
+        m.groups[i].bytes_per_token = m.groups[i].bytes - block_bytes[i] + over_runs(block_bytes[i]);
 
     // The embedding tables are gathered by row — unless the head is tied to one of them, in which
     // case that table is projected against in FULL every token. The presence of a separate output

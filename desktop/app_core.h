@@ -1,12 +1,11 @@
 // The desktop app's own rules, apart from any window or process so they are tested on their own
-// (tests/desktop_test.cpp): its preferences and their bounds, the port it starts the server on, the
-// arguments the server gets, which pages may use the bridge, and which file may be run as an
-// update. docs/desktop-app.md is the contract.
+// (tests/desktop_test.cpp): its preferences and their bounds, the arguments the server gets (the port
+// it prefers among them; the server takes it or the next free one, listen_port.h), which pages may use the bridge, and
+// which file may be run as an update. docs/desktop-app.md is the contract.
 #pragma once
 
 #include <nlohmann/json.hpp>
 
-#include <functional>
 #include <string>
 #include <vector>
 
@@ -20,13 +19,13 @@ inline constexpr int kMinPort = 1024;
 inline constexpr int kMaxPort = 65535;
 inline constexpr double kMinUiScale = 0.9;
 inline constexpr double kMaxUiScale = 1.5;
-// How many ports after the preferred one are tried when it is taken.
-inline constexpr int kPortTries = 20;
 // The file the preferences are kept in, in the server's data folder.
 inline constexpr const char * kPrefsFile = "desktop.json";
 // The key other devices use while the server serves the network, beside the preferences, readable
 // by this user only. A file, so it never appears on a command line.
 inline constexpr const char * kNetworkKeyFile = "network-key";
+// Where the server writes the port it took (--port-file), beside the preferences.
+inline constexpr const char * kServerPortFile = "server.port";
 
 struct DesktopPrefs {
     bool close_to_tray = true; // closing the window keeps the app (and its server) running
@@ -48,16 +47,17 @@ bool merge_prefs(DesktopPrefs & p, const json & patch, std::string & err);
 DesktopPrefs load_prefs(const std::string & path, std::string & warning);
 bool save_prefs(const std::string & path, const DesktopPrefs & p, std::string & err);
 
-// Whether a server can be started on `port`: nothing answers there, and this process can bind it.
-// Leaves nothing bound: a socket left listening would share the port with the server started on it
-// (SO_REUSEPORT), and the connections that land on it would wait forever.
-bool port_is_free(int port);
-
-// The first port from `preferred` on that `is_free` accepts, trying kPortTries; 0 when none is.
-int pick_port(int preferred, const std::function<bool(int)> & is_free);
-
 // "http://127.0.0.1:<port>": the server's origin, which every page the bridge answers is on.
 std::string server_origin(int port);
+
+// How the app learns that the server it started is serving. It asks the one route that needs no
+// key under any access policy (the server's `/health`, check_access): serving on the network puts a
+// key on every other route, and the app asks before it holds one, so asking `/api/info` read a
+// running server as one that never started (#644). Any answer is the server's: the port is the one
+// it wrote in its port file, and the status only says whether a model is loaded yet, which is not
+// what is being asked. `http_status` is 0 where nothing answered.
+inline constexpr const char * kServerReadyPath = "/health";
+bool server_is_serving(int http_status);
 
 // Whether `url` is a page of `origin`: the same scheme, host and port, and nothing more. A prefix
 // match would take "http://127.0.0.1:8765.evil" for the server.
@@ -74,7 +74,9 @@ std::string new_network_key();
 // set. "" with `err` when it could not be written.
 std::string network_key(const std::string & path, bool replace, std::string & err);
 
-// What the server is started with: `server_path` is bmoe-server beside the app; `resources_dir`,
+// What the server is started with: `server_path` is bmoe-server beside the app; `preferred_port` is
+// the port the person chose (0: the server's default), which the server takes or, when it is in use,
+// the next free one after it, and writes the one it took to `port_file`; `resources_dir`,
 // when the app is a bundle whose web UI, catalog and bundled skills sit apart from the code, holds
 // ui/, catalog/ and skills/; `data_dir` is passed on when the app was given one; `parent_pid` is the app's, so the
 // server stops when the app is gone however it ended; `network_key_file`, when not "", serves the
@@ -86,7 +88,8 @@ struct ServerLaunch {
 ServerLaunch server_launch(const std::string & server_path,
                            const std::string & resources_dir,
                            const std::string & data_dir,
-                           int port,
+                           int preferred_port,
+                           const std::string & port_file,
                            long parent_pid,
                            const std::string & network_key_file,
                            const std::vector<std::string> & extra_args);

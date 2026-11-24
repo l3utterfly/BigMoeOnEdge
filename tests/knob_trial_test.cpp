@@ -51,6 +51,7 @@ struct Outcome {
     int settled_at = -1;   // the step the measuring started
     std::vector<int> arms; // the arm each step ran under
     std::vector<double> gains;
+    int apart = 0; // arms given up on one window apart from the incumbent
 };
 
 Outcome run(KnobTrial & k, const Sim & sim, int n_cand) {
@@ -66,6 +67,7 @@ Outcome run(KnobTrial & k, const Sim & sim, int n_cand) {
             k.record(s, 1, 0, 0);
         else
             k.record(s, 1, 100, (uint64_t) std::lround(100.0 * h));
+        o.apart += k.last_abandoned() && k.last_abandoned_apart();
         o.steps = t + 1;
     }
     o.done = k.done();
@@ -158,10 +160,12 @@ int main() {
     {
         KnobTrial k(1, false, pol);
         Sim sim;
-        // The candidate is 25% faster, but one of its windows met a stall elsewhere in the machine.
+        // The candidate is 25% faster, but one of its windows met a stall elsewhere in the machine,
+        // which slowed three of its four tokens. A slowdown of every token of a window past the
+        // incumbent's whole range is judged as the arm's own (the `apart` checks below).
         sim.spt = [](int arm, int t) {
             const double base = arm == 1 ? 0.040 : 0.050;
-            return (t >= 6 && t < 10) ? base * 8.0 : base;
+            return (t >= 7 && t < 11) ? base * 8.0 : base;
         };
         const Outcome o = run(k, sim, 1);
         check(o.done && o.winner == 1, "outlier: one stalled window does not overturn three rounds' median");
@@ -275,18 +279,333 @@ int main() {
               "record: two machines' verdicts read back as written" + (parsed ? "" : " (" + err + ")"));
         check(find_measured_knobs(back, a.hardware, "0.35.1") && !find_measured_knobs(back, a.hardware, "0.36.0"),
               "record: a verdict is this machine's AND this engine's");
+        std::vector<MeasuredKnobs> bad;
         MeasuredKnobs a2 = a;
         a2.threads = 8;
         keep_measured_knobs(back, a2);
         check(back.size() == 2 && find_measured_knobs(back, a.hardware, "0.35.1")->threads == 8,
               "record: keeping a machine's verdict replaces the one it had");
-        std::vector<MeasuredKnobs> bad;
+        // The device tier is measured across loads: each load brings one side, and keeping it must not
+        // lose the other side or the knobs an earlier load measured.
+        MeasuredKnobs on;
+        on.hardware = a.hardware;
+        on.engine = a.engine;
+        on.device_cache_tps = 1.6;
+        keep_measured_knobs(back, on);
+        MeasuredKnobs off = on;
+        off.device_cache_tps = 0.0;
+        off.no_device_cache_tps = 3.94;
+        keep_measured_knobs(back, off);
+        const MeasuredKnobs * kept = find_measured_knobs(back, a.hardware, "0.35.1");
+        check(kept && kept->threads == 8 && kept->overlap == 1 && std::fabs(kept->device_cache_tps - 1.6) < 1e-9 &&
+                  std::fabs(kept->no_device_cache_tps - 3.94) < 1e-9 && kept->verdicts() == 4,
+              "record: each load's side of the device tier is merged, nothing an earlier load measured is lost");
+        std::vector<MeasuredKnobs> again;
+        check(parse_measured_knobs(format_measured_knobs(back), again, err) && again.size() == 2 &&
+                  std::fabs(find_measured_knobs(again, a.hardware, "0.35.1")->no_device_cache_tps - 3.94) < 1e-3,
+              "record: the device tier's rates read back as written");
+        check(!parse_measured_knobs("bmoe-measured-knobs 1\nhardware=a engine=b device_cache_tps=-1\n", bad, err),
+              "record: a negative rate is refused");
+        // The graph width: each side's rates and the usage they are weighed by, merged across loads; a
+        // different narrow width starts the comparison afresh.
+        MeasuredKnobs w1;
+        w1.hardware = a.hardware;
+        w1.engine = a.engine;
+        w1.width_narrow = 512;
+        w1.wide_decode_tps = 14.2;
+        w1.wide_prefill_tps = 610.0;
+        w1.usage_requests = 3;
+        w1.usage_gen_tokens = 480.0;
+        w1.usage_long_prompt_tokens = 9500.0;
+        keep_measured_knobs(back, w1);
+        MeasuredKnobs w2 = w1;
+        w2.wide_decode_tps = w2.wide_prefill_tps = 0.0;
+        w2.narrow_decode_tps = 19.4;
+        w2.narrow_prefill_tps = 104.0;
+        keep_measured_knobs(back, w2);
+        const MeasuredKnobs * kw = find_measured_knobs(back, a.hardware, "0.35.1");
+        check(kw && kw->width_narrow == 512 && std::fabs(kw->wide_decode_tps - 14.2) < 1e-9 &&
+                  std::fabs(kw->narrow_prefill_tps - 104.0) < 1e-9 && kw->usage_requests == 3 &&
+                  std::fabs(kw->device_cache_tps - 1.6) < 1e-9,
+              "record: the width's two sides are merged, with what else was measured");
+        std::vector<MeasuredKnobs> wback;
+        check(parse_measured_knobs(format_measured_knobs(back), wback, err) &&
+                  find_measured_knobs(wback, a.hardware, "0.35.1")->width_narrow == 512 &&
+                  std::fabs(find_measured_knobs(wback, a.hardware, "0.35.1")->usage_long_prompt_tokens - 9500.0) < 1e-3,
+              "record: the width's rates and usage read back as written");
+        // The width in force: kept, read back, and dropped with the comparison it was decided in.
+        MeasuredKnobs wh;
+        wh.hardware = a.hardware;
+        wh.engine = a.engine;
+        wh.width_narrow = 512;
+        wh.width_held = 0;
+        keep_measured_knobs(back, wh);
+        std::vector<MeasuredKnobs> hback;
+        check(find_measured_knobs(back, a.hardware, "0.35.1")->width_held == 0 &&
+                  parse_measured_knobs(format_measured_knobs(back), hback, err) &&
+                  find_measured_knobs(hback, a.hardware, "0.35.1")->width_held == 0 &&
+                  std::fabs(find_measured_knobs(hback, a.hardware, "0.35.1")->wide_decode_tps - 14.2) < 1e-9,
+              "record: the width in force is kept beside the rates and reads back");
+        MeasuredKnobs w3 = w1;
+        w3.width_narrow = 1024;
+        w3.wide_prefill_tps = 0.0;
+        w3.wide_decode_tps = 15.0;
+        keep_measured_knobs(back, w3);
+        kw = find_measured_knobs(back, a.hardware, "0.35.1");
+        check(kw && kw->width_narrow == 1024 && std::fabs(kw->wide_decode_tps - 15.0) < 1e-9 &&
+                  kw->narrow_decode_tps == 0.0 && kw->narrow_prefill_tps == 0.0 && kw->width_held == -1,
+              "record: another narrow width drops what was measured against the old one");
         check(!parse_measured_knobs("bmoe-measured-knobs 1\nthreads=4\n", bad, err),
               "record: a line naming no machine is refused");
         check(!parse_measured_knobs("something else\n", bad, err), "record: another format is refused");
         check(parse_measured_knobs("bmoe-measured-knobs 1\nhardware=a engine=b threads=4 later_key=1\n", bad, err) &&
                   bad.size() == 1 && bad[0].threads == 4,
               "record: a key a later engine added is read past");
+
+        // The decode's own cost: read back as written, merged whole, counted so a front-end keeps it,
+        // and absent from a record an earlier engine wrote.
+        MeasuredKnobs dc;
+        dc.hardware = a.hardware;
+        dc.engine = a.engine;
+        dc.decode_compute_s = 0.064125;
+        dc.decode_threads = 4;
+        dc.decode_hit = 0.8125;
+        dc.decode_cache_mib = 1536.0;
+        dc.decode_gpu_layers = 0;
+        dc.decode_device_cache_mb = 0;
+        check(dc.verdicts() == 2, "record: a measured decode cost counts, so a front-end keeps the grown record");
+        std::vector<MeasuredKnobs> dback;
+        check(parse_measured_knobs(format_measured_knobs({dc}), dback, err) && dback.size() == 1 &&
+                  std::fabs(dback[0].decode_compute_s - 0.064125) < 1e-9 && dback[0].decode_threads == 4 &&
+                  std::fabs(dback[0].decode_hit - 0.8125) < 1e-9 &&
+                  std::fabs(dback[0].decode_cache_mib - 1536.0) < 1e-9,
+              "record: the decode's cost reads back as written");
+        keep_measured_knobs(back, dc);
+        const MeasuredKnobs * kd = find_measured_knobs(back, a.hardware, "0.35.1");
+        check(kd && kd->decode_threads == 4 && std::fabs(kd->decode_hit - 0.8125) < 1e-9 && kd->width_narrow == 1024,
+              "record: the decode's cost is merged beside what else was measured");
+        MeasuredKnobs dc2 = dc;
+        dc2.decode_compute_s = 0.05;
+        dc2.decode_threads = 6;
+        dc2.decode_hit = -1.0;
+        dc2.decode_cache_mib = 0.0;
+        keep_measured_knobs(back, dc2);
+        kd = find_measured_knobs(back, a.hardware, "0.35.1");
+        check(kd && kd->decode_threads == 6 && kd->decode_hit == -1.0 && std::fabs(kd->decode_compute_s - 0.05) < 1e-12,
+              "record: a later load's decode cost replaces the whole measurement, never half of it");
+        std::vector<MeasuredKnobs> old;
+        check(parse_measured_knobs("bmoe-measured-knobs 1\nhardware=a engine=b threads=4 overlap=1 rounds=3\n", old,
+                                   err) &&
+                  old.size() == 1 && old[0].decode_compute_s == 0.0 && old[0].decode_hit == -1.0 &&
+                  old[0].decode_threads == 0 && old[0].verdicts() == 2,
+              "record: one written before the decode's cost was recorded reads as not measured");
+        check(!parse_measured_knobs("bmoe-measured-knobs 1\nhardware=a engine=b decode_hit=1.5\n", bad, err),
+              "record: a hit rate past 1 is refused");
+
+        // Failed opens of a side (MeasuredKnobs::*_unviable): written as a count per side only when there is
+        // one, read back, counted as a verdict, grown by a later failure, cleared by a rate for the side,
+        // reset with another narrow width, and read past by an engine that does not know a side's name.
+        MeasuredKnobs uv;
+        uv.hardware = a.hardware;
+        uv.engine = "0.42.0";
+        check(format_measured_knobs({uv}).find("unviable") == std::string::npos,
+              "record: no side failed, no unviable key");
+        uv.no_device_cache_unviable = 1;
+        uv.width_narrow = 2048;
+        uv.narrow_unviable = 2;
+        std::vector<MeasuredKnobs> uback;
+        check(format_measured_knobs({uv}).find("unviable=no_device_cache:1,narrow:2") != std::string::npos &&
+                  parse_measured_knobs(format_measured_knobs({uv}), uback, err) && uback.size() == 1 &&
+                  uback[0].no_device_cache_unviable == 1 && uback[0].narrow_unviable == 2 &&
+                  uback[0].device_cache_unviable == 0 && uback[0].verdicts() == 2,
+              "record: the failed opens read back, per side, and count as verdicts");
+        check(parse_measured_knobs("bmoe-measured-knobs 1\nhardware=a engine=b unviable=wide,later_side:3\n", uback,
+                                   err) &&
+                  uback.size() == 1 && uback[0].wide_unviable == 1,
+              "record: a bare side is one failure, and a side from a later engine is read past");
+        check(parse_measured_knobs("bmoe-measured-knobs 1\nhardware=a engine=b threads=4 unviable=,wide:0,narrow:x,"
+                                   "device_cache:2\n",
+                                   uback, err) &&
+                  uback.size() == 1 && uback[0].threads == 4 && uback[0].wide_unviable == 0 &&
+                  uback[0].narrow_unviable == 0 && uback[0].device_cache_unviable == 2,
+              "record: a part it cannot read is read past, and the rest of the record holds");
+        // The prefill devices' words: written only when there is one, one per device, read back, merged.
+        check(format_measured_knobs({uv}).find("prefill=") == std::string::npos, "record: no prefill device, no key");
+        MeasuredKnobs pv = uv;
+        pv.set_prefill_word({"HTP0", -1, 0});
+        std::vector<MeasuredKnobs> pback;
+        check(format_measured_knobs({pv}).find("prefill=HTP0:refused") != std::string::npos &&
+                  parse_measured_knobs(format_measured_knobs({pv}), pback, err) && pback.size() == 1 &&
+                  pback[0].prefill.size() == 1 && pback[0].prefill_refused("HTP0") && !pback[0].prefill_refused("GPU0"),
+              "record: a refused prefill device reads back, for that device only");
+        MeasuredKnobs armed;
+        armed.hardware = uv.hardware;
+        armed.engine = uv.engine;
+        armed.set_prefill_word({"HTP0", 0, 1});
+        check(armed.verdicts() == 1 && !armed.prefill_refused("HTP0"),
+              "record: one load that armed a device and never said counts, and the device is tried again");
+        const MeasuredKnobs twice = armed.armed_unconfirmed("HTP0");
+        std::vector<MeasuredKnobs> tback;
+        check(twice.prefill_word("HTP0")->unconfirmed == 2 && twice.prefill_refused("HTP0") &&
+                  format_measured_knobs({twice}).find("prefill=HTP0:unconfirmed-2") != std::string::npos &&
+                  parse_measured_knobs(format_measured_knobs({twice}), tback, err) && tback.size() == 1 &&
+                  tback[0].prefill_word("HTP0")->unconfirmed == 2 && tback[0].prefill_refused("HTP0"),
+              "record: two loads in a row that never said keep the device out, and read back so");
+        check(armed.armed_unconfirmed("GPU0").prefill_word("GPU0")->unconfirmed == 1,
+              "record: another device's count starts afresh");
+        std::vector<MeasuredKnobs> pkept = {armed};
+        MeasuredKnobs opened = armed;
+        opened.set_prefill_word({"HTP0", 1, 0});
+        keep_measured_knobs(pkept, opened);
+        check(pkept[0].prefill_word("HTP0")->verdict == 1 && pkept[0].prefill_word("HTP0")->unconfirmed == 0 &&
+                  !pkept[0].prefill_refused("HTP0"),
+              "record: the session's word replaces the unconfirmed one");
+        // A second device's word leaves the first's: a refused NPU stays refused when the GPU is kept.
+        {
+            std::vector<MeasuredKnobs> two = {pv};
+            MeasuredKnobs gpu = uv;
+            gpu.prefill.clear();
+            gpu.set_prefill_word({"GPU0", 1, 0});
+            keep_measured_knobs(two, gpu);
+            std::vector<MeasuredKnobs> twoback;
+            check(two[0].prefill.size() == 2 && two[0].prefill_refused("HTP0") && !two[0].prefill_refused("GPU0") &&
+                      parse_measured_knobs(format_measured_knobs(two), twoback, err) &&
+                      twoback[0].prefill_refused("HTP0") && twoback[0].prefill_word("GPU0")->verdict == 1,
+                  "record: one word per device, a second device's word does not clear the first's");
+        }
+        // A session that could not open the device is one more load that did not keep it, not a refusal.
+        {
+            std::vector<MeasuredKnobs> v = {armed}; // HTP0 unconfirmed once, written before the open
+            MeasuredKnobs failed_open = armed;
+            failed_open.prefill.clear();
+            failed_open.set_prefill_word({"HTP0", 0, 0});
+            keep_measured_knobs(v, failed_open);
+            check(v[0].prefill_word("HTP0")->verdict == 0 && v[0].prefill_word("HTP0")->unconfirmed == 1 &&
+                      !v[0].prefill_refused("HTP0"),
+                  "record: a device that would not open once is tried again");
+            std::vector<MeasuredKnobs> fresh = {uv};
+            keep_measured_knobs(fresh, failed_open);
+            check(fresh[0].prefill_word("HTP0")->unconfirmed == 1,
+                  "record: an open failure with no earlier mark counts as one");
+        }
+        check(parse_measured_knobs("bmoe-measured-knobs 1\nhardware=a engine=b prefill=HTP0:maybe,GPU0:kept\n", pback,
+                                   err) &&
+                  pback.size() == 1 && !pback[0].prefill_word("HTP0") && pback[0].prefill_word("GPU0"),
+              "record: a prefill word it cannot read is read past, the others hold");
+        // The devices' answer words: written only when there is one, one per device, read back, merged.
+        check(format_measured_knobs({uv}).find("device_answer=") == std::string::npos && uv.device_answer("GPU0") == 0,
+              "record: no device compared, no key, and no word for any");
+        {
+            MeasuredKnobs av = uv;
+            const int before = av.verdicts();
+            av.set_device_answer("GPU0", -1);
+            av.set_device_answer("GPU1", 1);
+            av.set_device_answer("GPU2", 0); // says nothing: not kept
+            av.set_device_answer("", 1);
+            std::vector<MeasuredKnobs> aback;
+            check(av.device_answers.size() == 2 && av.verdicts() == before + 2,
+                  "record: a word per device compared, each one a verdict a front-end keeps");
+            check(format_measured_knobs({av}).find("device_answer=GPU0:differs,GPU1:confirmed") != std::string::npos &&
+                      parse_measured_knobs(format_measured_knobs({av}), aback, err) && aback.size() == 1 &&
+                      aback[0].device_answer("GPU0") == -1 && aback[0].device_answer("GPU1") == 1 &&
+                      aback[0].device_answer("GPU2") == 0,
+                  "record: the answer words read back, each for its own device");
+            // A later load's word replaces that device's and leaves the others; a load that compared
+            // nothing leaves them all.
+            std::vector<MeasuredKnobs> akept = {av};
+            MeasuredKnobs later = uv;
+            later.set_device_answer("GPU0", 1);
+            keep_measured_knobs(akept, later);
+            check(akept[0].device_answer("GPU0") == 1 && akept[0].device_answer("GPU1") == 1 &&
+                      akept[0].device_answers.size() == 2,
+                  "record: a later comparison replaces that device's word only");
+            keep_measured_knobs(akept, uv);
+            check(akept[0].device_answer("GPU0") == 1 && akept[0].device_answer("GPU1") == 1,
+                  "record: a load that compared nothing keeps the words");
+            MeasuredKnobs only;
+            only.hardware = "hw";
+            only.engine = "e";
+            only.set_device_answer("GPU0", -1);
+            check(!only.empty() && only.verdicts() == 1, "record: a word alone is a record worth keeping");
+            check(parse_measured_knobs(
+                      "bmoe-measured-knobs 1\nhardware=a engine=b device_answer=GPU0:perhaps,:confirmed,GPU1:differs\n",
+                      aback, err) &&
+                      aback.size() == 1 && aback[0].device_answer("GPU0") == 0 &&
+                      aback[0].device_answer("GPU1") == -1 && aback[0].device_answers.size() == 1,
+                  "record: an answer word it cannot read is read past, the others hold");
+        }
+        std::vector<MeasuredKnobs> ukept = {uv};
+        MeasuredKnobs again_failed = uv;
+        again_failed.no_device_cache_unviable = 2;
+        keep_measured_knobs(ukept, again_failed);
+        check(ukept[0].no_device_cache_unviable == 2, "record: a later failure grows the count");
+        MeasuredKnobs served_load;
+        served_load.hardware = uv.hardware;
+        served_load.engine = uv.engine;
+        served_load.threads = 4;
+        keep_measured_knobs(ukept, served_load);
+        check(ukept[0].no_device_cache_unviable == 2 && ukept[0].narrow_unviable == 2,
+              "record: a load that measured nothing of the side leaves its count");
+        MeasuredKnobs timed_later = served_load;
+        timed_later.no_device_cache_tps = 8.0;
+        keep_measured_knobs(ukept, timed_later);
+        check(ukept[0].no_device_cache_unviable == 0 && ukept[0].no_device_cache_tps == 8.0 &&
+                  ukept[0].narrow_unviable == 2,
+              "record: a side timed later opened after all; the other failure stays");
+        // A load handing on the side's old rate with a new failure: the failure stands. A new rate
+        // clears it.
+        std::vector<MeasuredKnobs> rated = {served_load};
+        rated[0].device_cache_tps = 12.0;
+        MeasuredKnobs failed_again = rated[0];
+        failed_again.device_cache_unviable = 1;
+        keep_measured_knobs(rated, failed_again);
+        check(rated[0].device_cache_unviable == 1, "record: a failure handed on beside the side's old rate is kept");
+        MeasuredKnobs opened_now = failed_again;
+        opened_now.device_cache_unviable = 0;
+        opened_now.device_cache_tps = 12.5;
+        keep_measured_knobs(rated, opened_now);
+        check(rated[0].device_cache_unviable == 0 && rated[0].device_cache_tps == 12.5,
+              "record: a rate measured since clears it");
+        MeasuredKnobs other_narrow = served_load;
+        other_narrow.width_narrow = 4096;
+        keep_measured_knobs(ukept, other_narrow);
+        check(ukept[0].narrow_unviable == 0 && ukept[0].width_narrow == 4096,
+              "record: a failure at another narrow width answers nothing at the new one");
+
+        // The request mix: recorded on every load, read back as written, counted so a front-end keeps
+        // it as it grows, replaced whole by a later load that served requests, and absent from a record
+        // an earlier engine wrote. The host's prefill rate survives a load whose long prompts all ran
+        // on a device.
+        MeasuredKnobs mx;
+        mx.hardware = a.hardware;
+        mx.engine = a.engine;
+        mx.mix_requests = 4;
+        mx.mix_gen_tokens = 120.5;
+        mx.mix_wide_prompt_tokens = 1054.0;
+        mx.host_prefill_tps = 8.64;
+        check(mx.verdicts() == 5, "record: each request of the mix counts, so a front-end keeps the grown record");
+        std::vector<MeasuredKnobs> mback;
+        check(parse_measured_knobs(format_measured_knobs({mx}), mback, err) && mback.size() == 1 &&
+                  mback[0].mix_requests == 4 && std::fabs(mback[0].mix_gen_tokens - 120.5) < 1e-9 &&
+                  std::fabs(mback[0].mix_wide_prompt_tokens - 1054.0) < 1e-9 &&
+                  std::fabs(mback[0].host_prefill_tps - 8.64) < 1e-9,
+              "record: the request mix reads back as written");
+        keep_measured_knobs(back, mx);
+        MeasuredKnobs mx2 = mx;
+        mx2.mix_requests = 1;
+        mx2.mix_gen_tokens = 2000.0;
+        mx2.mix_wide_prompt_tokens = 0.0;
+        mx2.host_prefill_tps = 0.0; // every long prompt of this load ran on the device, or there was none
+        keep_measured_knobs(back, mx2);
+        const MeasuredKnobs * km = find_measured_knobs(back, a.hardware, "0.35.1");
+        check(km && km->mix_requests == 1 && km->mix_gen_tokens == 2000.0 && km->mix_wide_prompt_tokens == 0.0 &&
+                  std::fabs(km->host_prefill_tps - 8.64) < 1e-9 && km->decode_threads == 6,
+              "record: a later load's mix replaces the mix whole, and keeps the host's prefill rate it did not "
+              "measure");
+        check(old[0].mix_requests == 0 && old[0].host_prefill_tps == 0.0,
+              "record: one written before the mix was recorded reads as not recorded");
+        check(!parse_measured_knobs("bmoe-measured-knobs 1\nhardware=a engine=b mix_requests=-1\n", bad, err),
+              "record: a negative request count is refused");
     }
     {
         HardwareProfile hw;
@@ -314,6 +633,227 @@ int main() {
         fewer.n_cores = 8;
         check(hardware_fingerprint(other) != fp && hardware_fingerprint(fewer) != fp,
               "fingerprint: another device or another processor is another machine");
+    }
+
+    // ── settled: a candidate that can no longer win stops being measured ──
+    // Three rounds of eight tokens at ten times the pace tripled a phone's first answer; with three
+    // rounds, two losing ones settle the median, and the third would only repeat them. The brake
+    // must not read those windows either (the session's concern). An ordinary loss, 20% under 15%
+    // noise per token, whose windows overlap the incumbent's: the median settles it, not one window.
+    {
+        KnobTrial k(1, false, pol);
+        Sim sim;
+        sim.spt = [](int arm, int) { return arm == 1 ? 0.060 : 0.050; };
+        sim.noise = 0.15;
+        const Outcome o = run(k, sim, 1);
+        int cand_steps = 0;
+        for (int a : o.arms)
+            cand_steps += a == 1;
+        check(o.done && o.winner == 0, "settled: 20% slower holds the incumbent");
+        check(k.abandoned(1) && k.rounds(1) == 2 && o.apart == 0,
+              "settled: the candidate stopped on the median, with two rounds on record (" +
+                  std::to_string(k.rounds(1)) + ")");
+        check(cand_steps == 2 * (pol.window_tokens + pol.warm_tokens),
+              "settled: the candidate ran two windows and their warm-ups only (" + std::to_string(cand_steps) +
+                  " steps)");
+        // Incumbent, candidate, incumbent, candidate, incumbent: five windows, each after a warm-up.
+        check(o.steps <= 5 * (pol.window_tokens + pol.warm_tokens),
+              "settled: the trial ended after the bracketing window (" + std::to_string(o.steps) + " steps)");
+    }
+    // ── apart: a window slower in every token than the incumbent's whole range ends the candidate ──
+    // On a phone, eight decode threads against four ran each token about twenty times slower, and the
+    // median's second losing window was another 18 s of stutter. One window decides that: its fastest
+    // token is past the incumbent's slowest by more than the incumbent's spread and the margin.
+    {
+        KnobTrial k(1, false, pol);
+        Sim sim;
+        sim.spt = [](int arm, int) { return arm == 1 ? 1.000 : 0.050; };
+        sim.noise = 0.10;
+        const Outcome o = run(k, sim, 1);
+        int cand_steps = 0;
+        for (int a : o.arms)
+            cand_steps += a == 1;
+        check(o.done && o.winner == 0 && k.abandoned(1) && k.rounds(1) == 1 && o.apart == 1,
+              "apart: twenty times slower stops after one round (" + std::to_string(k.rounds(1)) + ")");
+        // Cut inside its window: once more than half of its tokens are past the bar, and with them
+        // the seconds the whole window may spend.
+        check(cand_steps == pol.warm_tokens + pol.window_tokens / 2 + 1,
+              "apart: the candidate's window is cut after more than half of it (" + std::to_string(cand_steps) +
+                  " steps)");
+        check(o.steps <= 3 * (pol.window_tokens + pol.warm_tokens),
+              "apart: the trial ended after the bracketing window (" + std::to_string(o.steps) + " steps)");
+        check(k.gain(1) > 0.0 && k.gain(1) < 0.1, "apart: the round it ran stays on record as the loss it measured");
+    }
+    // ── apart beside another candidate: the slow one leaves the schedule, the other is measured through ──
+    // The phone's trial: {2, 8} against 4, eight the collapse. Its later windows are skipped, the
+    // other candidate keeps its rounds.
+    {
+        KnobTrial k(2, false, pol);
+        Sim sim;
+        sim.spt = [](int arm, int) { return arm == 2 ? 1.000 : arm == 1 ? 0.040 : 0.050; };
+        sim.noise = 0.05;
+        const Outcome o = run(k, sim, 2);
+        int slow_steps = 0;
+        for (int a : o.arms)
+            slow_steps += a == 2;
+        check(o.done && o.winner == 1 && k.abandoned(2) && !k.abandoned(1) && k.rounds(2) == 1 &&
+                  k.rounds(1) == pol.rounds,
+              "apart: the collapsing candidate stops after one round, the 25% faster one keeps its rounds and wins");
+        check(slow_steps == pol.warm_tokens + pol.window_tokens / 2 + 1,
+              "apart: the schedule skips the collapsing candidate's later windows (" + std::to_string(slow_steps) +
+                  " steps)");
+        bool bracketed = true;
+        const std::vector<int> & s = k.schedule();
+        for (size_t j = 0; j < s.size(); ++j)
+            if (s[j] != 0 && (j == 0 || j + 1 >= s.size() || s[j - 1] != 0 || s[j + 1] != 0)) bracketed = false;
+        check(bracketed && s.front() == 0 && s.back() == 0,
+              "apart: the schedule left keeps every candidate window between two incumbent windows");
+    }
+    // ── settled beside a real win: the slow candidate stops, the fast one is measured through and wins ──
+    {
+        KnobTrial k(2, false, pol);
+        Sim sim;
+        sim.spt = [](int arm, int) { return arm == 1 ? 0.500 : arm == 2 ? 0.040 : 0.050; };
+        sim.noise = 0.05;
+        const Outcome o = run(k, sim, 2);
+        check(o.done && o.winner == 2 && k.abandoned(1) && !k.abandoned(2) && k.rounds(2) == pol.rounds,
+              "settled: the slow candidate stops, the 25% faster one keeps its rounds and wins");
+    }
+    // ── a few percent slower in one window settles nothing: inside the margin, not apart ──
+    {
+        KnobTrial k(1, false, pol);
+        Sim sim;
+        sim.spt = [](int arm, int) { return arm == 1 ? 0.0525 : 0.050; };
+        const Outcome o = run(k, sim, 1);
+        check(o.done && o.winner == 0 && o.apart == 0 && k.rounds(1) == 2,
+              "apart: 5% slower in every token is not ended by one window; the median settles it after two");
+    }
+    // ── one losing round settles nothing: a 25% faster candidate whose first window stalled ──
+    // A stall slows some tokens of a window: the window's average is past the incumbent's by far, its
+    // fastest token is not, and the median decides as before.
+    {
+        KnobTrial k(1, false, pol);
+        Sim sim;
+        sim.spt = [](int arm, int t) {
+            if (arm != 1) return 0.050;
+            return (t >= 6 && t < 8) ? 0.400 : 0.040; // half of its first window
+        };
+        const Outcome o = run(k, sim, 1);
+        check(o.done && o.winner == 1 && !k.abandoned(1) && k.rounds(1) == pol.rounds,
+              "settled: one stalled round is measured through, and the candidate still wins");
+    }
+    // ── the incumbent's own spread raises the bar: a loss inside it is not ended by one window ──
+    // Its tokens alternate 50 and 100 ms (a range of two); a candidate at 150 ms a token, twice the
+    // incumbent's mean, is still inside what that range allows, and the median decides it. The same
+    // candidate against a steady incumbent at the same mean is apart, and ends after one window.
+    {
+        KnobTrial k(1, false, pol);
+        Sim sim;
+        sim.spt = [](int arm, int t) { return arm == 1 ? 0.150 : (t % 2 ? 0.100 : 0.050); };
+        const Outcome o = run(k, sim, 1);
+        check(o.done && o.winner == 0 && o.apart == 0 && k.rounds(1) == 2,
+              "spread: a loss within the incumbent's own range is settled by the median, not one window");
+        KnobTrial steady(1, false, pol);
+        Sim flat;
+        flat.spt = [](int arm, int) { return arm == 1 ? 0.150 : 0.075; };
+        const Outcome f = run(steady, flat, 1);
+        check(f.done && f.winner == 0 && f.apart == 1 && steady.rounds(1) == 1,
+              "spread: the same loss against a steady incumbent is apart after one window");
+    }
+    // ── the phone's collapse at the session's own window: cut after more than half of it ──
+    // Four threads near 0.11 s a token, eight at 2.4-3.0 s: the window #539 left ran nine steps of
+    // stutter, where five past the bar (and the seconds the whole window may spend) decide it.
+    {
+        KnobTrialPolicy session_pol; // the session's window
+        KnobTrial k(1, false, session_pol);
+        Sim sim;
+        sim.spt = [](int arm, int) { return arm == 1 ? 2.6 : 0.11; };
+        sim.noise = 0.15;
+        const Outcome o = run(k, sim, 1);
+        int cand_steps = 0;
+        for (int a : o.arms)
+            cand_steps += a == 1;
+        check(o.done && o.winner == 0 && o.apart == 1 && k.rounds(1) == 1 &&
+                  cand_steps == session_pol.warm_tokens + session_pol.window_tokens / 2 + 1,
+              "cut: a collapse at the session's window costs its warm-up and five tokens, not nine (" +
+                  std::to_string(cand_steps) + " steps)");
+    }
+    // ── a stall over half of a window cuts nothing: the faster candidate is measured through and wins ──
+    {
+        KnobTrialPolicy session_pol;
+        KnobTrial k(1, false, session_pol);
+        Sim sim;
+        const int first_cand = session_pol.warm_tokens + session_pol.window_tokens + session_pol.warm_tokens;
+        sim.spt = [first_cand, &session_pol](int arm, int t) {
+            if (arm != 1) return 0.050;
+            return (t >= first_cand && t < first_cand + session_pol.window_tokens / 2) ? 0.800 : 0.040;
+        };
+        const Outcome o = run(k, sim, 1);
+        check(o.done && o.winner == 1 && !k.abandoned(1) && o.apart == 0,
+              "cut: a stall over half of the candidate's window is not a collapse; it still wins");
+    }
+    // ── a tie inside the margin is settled too: measured for two rounds, not three ──
+    {
+        KnobTrial k(1, false, pol);
+        Sim sim;
+        sim.spt = [](int arm, int) { return arm == 1 ? 0.050 / 1.05 : 0.050; };
+        const Outcome o = run(k, sim, 1);
+        check(o.done && o.winner == 0 && k.abandoned(1) && k.rounds(1) == 2,
+              "settled: 5% faster cannot reach the margin after two rounds and stops there");
+    }
+
+    // ── the rate probe: one side of the device tier, timed ──
+    {
+        KnobTrialPolicy rp;
+        rp.window_tokens = 4;
+        // A cache in view settles as the trial does, then times 2 * rounds + 1 windows and gives their median.
+        RateProbe r(/*settle*/ true, /*hits_visible*/ true, rp);
+        // One step a window (the first is the warm-up), one stalled window in five.
+        for (int w = 0; w < 1000 && !r.done(); ++w) {
+            const double spt = w % 5 == 3 ? 0.5 : 0.1;
+            r.record(spt * rp.window_tokens, rp.window_tokens, 100, 90);
+        }
+        check(r.done() && r.windows() == r.windows_wanted() && r.windows_wanted() == 2 * rp.rounds + 1 &&
+                  std::fabs(r.tokens_per_second() - 10.0) < 1e-6,
+              "rate probe: the median of 2 * rounds + 1 windows, a stalled window does not move it");
+        check(std::fabs(r.hit_rate() - 0.9) < 1e-12, "rate probe: the hit rate of the timed windows");
+        check(RateProbe(false, true, rp).hit_rate() == -1.0, "rate probe: no lookups, no hit rate");
+        // A device cache out of view: the longest settle the trial makes, whatever the counters say.
+        RateProbe blind(true, /*hits_visible*/ false, rp);
+        int steps = 0;
+        while (blind.settling() && steps < 10000) {
+            blind.record(0.1, 1, 0, 0);
+            ++steps;
+        }
+        check(steps == rp.settle_windows_max * rp.window_tokens + rp.warm_tokens,
+              "rate probe: a cache out of view waits settle_windows_max windows");
+        RateProbe now(/*settle*/ false, true, rp);
+        check(!now.settling() && now.tokens_per_second() == 0.0, "rate probe: no settle, no rate before it is done");
+        now.record(0.1, 2, 0, 0);
+        now.interrupt();
+        now.record(0.1, 1, 0, 0); // the warm-up after an interruption is not timed
+        check(now.windows() == 0, "rate probe: an interruption drops the window in progress");
+    }
+
+    // ── the bar a candidate is judged apart by ──
+    {
+        // The bar is the reference's slowest step times its range or the margin, whichever is wider.
+        check(std::fabs(apart_bar(0.10, 0.11, 0.05) - 0.11 * 1.1) < 1e-12, "apart bar: a noisy reference, its range");
+        check(std::fabs(apart_bar(0.10, 0.10, 0.05) - 0.10 * 1.05) < 1e-12, "apart bar: a steady one, the margin");
+        check(apart_bar(0.0, 0.1, 0.05) == 0.0, "apart bar: no reference, no bar");
+    }
+    // ── a cache out of view: the rate probe waits the longest settle ──
+    {
+        KnobTrialPolicy rp;
+        rp.window_tokens = 4;
+        RateProbe blind(/*settle*/ true, /*hits_visible*/ false, rp);
+        for (int i = 0; i < rp.warm_tokens; ++i)
+            blind.record(1.0, 1, 0, 0); // the warm-up after the prefill, not timed
+        int w = 0;
+        for (; w < 100 && blind.settling(); ++w)
+            for (int i = 0; i < rp.window_tokens; ++i)
+                blind.record(0.1, 1, 0, 0);
+        check(w == rp.settle_windows_max, "rate settle: a cache out of view waits the longest");
     }
 
     if (failures) {

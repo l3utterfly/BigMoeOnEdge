@@ -16,25 +16,31 @@
 
 运行比设备内存更大的混合专家（Mixture-of-Experts）模型。模型需要专家时，从闪存读取。
 支持 Android、iOS、macOS、Windows 和 Linux，基于 llama.cpp 构建。
+统一的流式加载框架：从手机、笔记本到消费级和数据中心 GPU，支持任何硬件、任何操作系统、任何模型、任何量化。
+自动资源调度，为优化 tok/s 量身定制。
 
 <table align="center">
 <tr>
-<td align="center" width="50%"><img src="docs/assets/screens/android.gif" width="220" alt="Qwen3.6-35B-A3B 在 12 GB Android 手机上实时生成回答。"></td>
-<td align="center" width="50%"><img src="docs/assets/screens/iphone.gif" width="220" alt="Qwen3.6-35B-A3B 在 12 GB iPhone 上实时生成回答。"></td>
+<td align="center" width="50%"><img src="https://github.com/user-attachments/assets/7967bed2-6094-489f-bd60-05b0b1980102" width="220" alt="Qwen3.6-35B-A3B 在 12 GB Android 手机上实时生成回答。"></td>
+<td align="center" width="50%"><img src="https://github.com/user-attachments/assets/26760326-2ef5-4b4a-950d-581c99e58206" width="220" alt="12 GB iPhone 上已加载 Qwen3.6-35B-A3B 的 iPhone 应用：关于一张图片的对话、规划、模型和设置，实时录制。"></td>
 </tr>
 <tr>
-<td align="center">12 GB Android 手机</td>
-<td align="center">12 GB iPhone</td>
+<td align="center">12 GB Android 手机<br>Qwen3.6-35B-A3B · 5-6 tok/s</td>
+<td align="center">12 GB iPhone<br>Qwen3.6-35B-A3B · 6 tok/s</td>
 </tr>
 <tr>
-<td align="center" colspan="2"><img src="docs/assets/screens/desktop.gif" width="620" alt="Qwen3.6-35B-A3B 在 16 GB Apple silicon 笔记本的桌面应用中实时生成回答，速度为 20 tok/s。"></td>
+<td align="center" colspan="2"><img src="https://github.com/user-attachments/assets/0e1fd1d2-4976-4ecf-a56f-fee60f5dff74" width="620" alt="Qwen3.6-35B-A3B 在 16 GB Apple silicon 笔记本的桌面应用中实时生成回答，速度为 21 tok/s。"></td>
 </tr>
 <tr>
-<td align="center" colspan="2">16 GB Apple silicon 笔记本</td>
+<td align="center" colspan="2">16 GB Apple silicon 笔记本<br>Qwen3.6-35B-A3B · 18-24 tok/s</td>
 </tr>
 </table>
 
-Qwen3.6-35B-A3B（21 GB）在各设备上实时运行。该模型大于每台设备的内存。
+Qwen3.6-35B-A3B 大于每台设备的内存；任何 GGUF 格式的 MoE 模型、任何量化都可以运行。解码速度取自[性能](#性能)表。
+
+**2021 年的笔记本，没有 GPU 的智能体**：把流行的体素宝塔提示词交给内置智能体，运行在 16 GB 内存、仅用 CPU 的 ThinkPad 上，模型为 Qwen3.6-35B-A3B Q4_K_M。以 2.3 tok/s 写出 988 行，然后在应用的预览中打开页面；加速的部分已在画面上标出。
+
+<p align="center"><img src="https://github.com/user-attachments/assets/1da744d4-dd98-4d14-a76e-50bdf0d9aec4" width="640" alt="内置智能体在一台 15 GB 内存、没有独立显卡的 2021 年 ThinkPad 上，把体素宝塔花园写成一个 HTML 文件，然后页面在应用的预览中旋转。"></p>
 
 ## 功能
 
@@ -43,6 +49,7 @@ Qwen3.6-35B-A3B（21 GB）在各设备上实时运行。该模型大于每台设
 - **任意 MoE GGUF。** llama.cpp 能加载的都可以，任意量化格式。没有针对单个模型的代码。
 - **所有后端。** CPU、Metal、CUDA、HIP、Vulkan、OpenCL 和 Hexagon NPU。在显卡上，最常用的专家保留在 VRAM 中。
 - **应用与服务器。** 桌面应用、手机应用，以及面向编程智能体的 OpenAI 和 Anthropic 兼容服务器。
+- **识别图像。** 把模型的投影器文件（`mmproj`）放在模型旁边，服务器在每个 API 上都能读取图像；CLI 使用 `--mmproj` 和 `--image`。llama.cpp 投影器库支持的任意视觉模型，任意量化格式，所有后端。
 
 ## 性能
 
@@ -50,14 +57,23 @@ Qwen3.6-35B-A3B（21 GB）在各设备上实时运行。该模型大于每台设
 |---|---|---|---:|---|---:|
 | **Android 手机** | 12 GB | DeepSeek V4 Flash 284B | 91 GB | 闪存 | 1 |
 |  |  | Qwen3.8-Flash-Next 125B | 80 GB | 闪存 | 2-4 |
-|  |  | Qwen3.6-35B-A3B | 21 GB | 闪存 | 5 |
-| **iPhone** | 12 GB | Qwen3.6-35B-A3B | 21 GB | 闪存 | 3 |
+|  |  | Qwen3.6-35B-A3B | 21 GB | 闪存 | 5-6 |
+| **iPhone** | 12 GB | Qwen3.6-35B-A3B | 21 GB | 闪存 | 6 |
 | **Apple silicon 笔记本** | 16 GB | Qwen3.8-Flash-Next 125B | 76 GB | 闪存 | 7-9 |
 |  |  | Qwen3.6-35B-A3B | 21 GB | 闪存 | 18-24 |
 | **Windows 笔记本** | 16 GB | Qwen3.6-35B-A3B | 21 GB | 闪存 | 5 |
+| **桌面 GPU**（NVIDIA） | 12 GB + 128 GB RAM | Qwen3.8-Flash-Next 125B | 84 GB | RAM，GPU 缓存 | 16-17 |
 | **桌面 GPU**（NVIDIA） | 16 GB + 32 GB RAM | Qwen3.8-Flash-Next 125B | 66 GB | 闪存，GPU 缓存 | 19-21 |
 | **桌面 GPU**（NVIDIA） | 24 GB + 96 GB RAM | Qwen3.8-Flash-Next 125B | 66 GB | RAM，GPU 缓存 | 70 |
 |  |  | Qwen3.6-35B-A3B | 21 GB | GPU | 217 |
+| **桌面 GPU**（NVIDIA） | 24 GB + 62 GB RAM | Qwen3.6-35B-A3B | 21 GB | GPU | 154 |
+|  | 其中 12 GB 空闲 | Qwen3.6-35B-A3B | 21 GB | RAM，GPU 缓存 | 59-67 |
+|  |  | Gemma 4 26B-A4B | 17 GB | GPU | 114 |
+|  |  | Laguna XS 2.1 33B | 20 GB | GPU | 93-94 |
+| **桌面 GPU**（NVIDIA） | 8 GB + 31 GB RAM | Qwen3.8-Flash-Next 125B | 66 GB | 闪存，GPU 缓存 | 16 |
+|  |  | Qwen3.6-35B-A3B | 21 GB | RAM，GPU 缓存 | 37-44 |
+| **两块桌面 GPU**（NVIDIA） | 2 × 16 GB + 60 GB RAM | Qwen3.8-Flash-Next 125B | 66 GB | RAM，GPU 缓存 | 41-48 |
+|  |  | DeepSeek V4 Flash 284B | 91 GB | 闪存，GPU 缓存 | 5 |
 | **数据中心 GPU**（AMD，ROCm） | 192 GB | Qwen3.8-Flash-Next 125B | 66 GB | GPU | 53 |
 
 范围表示多次运行之间的差异。方法与每次运行：
@@ -113,6 +129,21 @@ print(reply.choices[0].message.content)
 **编程智能体**需要较大的上下文：约为其首个请求的几倍。opencode 用 32768 足够，Claude Code 用 65536
 （[为客户端设定上下文大小](docs/server-api.md#sizing-the-context-for-a-client)）。
 
+```jsonc
+// opencode, ~/.config/opencode/opencode.json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "bmoe": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8765/v1", "apiKey": "local" },
+      "models": { "<model id from /v1/models>": { "limit": { "context": 32768, "output": 8192 } } }
+    }
+  },
+  "model": "bmoe/<model id from /v1/models>"
+}
+```
+
 ```bash
 # Claude Code
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8765
@@ -135,8 +166,7 @@ wire_api = "responses"
 env_key = "BMOE_API_KEY"   # export BMOE_API_KEY=local
 ```
 
-对于 opencode，将该服务器添加为 OpenAI 兼容的提供方，地址为 `http://127.0.0.1:8765/v1`。在
-**Connect apps** 中，应用会写入 Codex CLI 和 opencode 的设置，并显示 Claude Code 所需的设置。
+在 **Connect apps** 中，应用会写入 opencode 和 Codex CLI 的设置，并显示 Claude Code 所需的设置。
 
 **智能体。** 桌面应用有自己的智能体：它在你选择的文件夹中工作，读取和编辑文件、运行命令；除非你允许，否则在做任何更改前都会先询问。
 对话也可以交给 OpenCode、Claude Code、Codex 或 Pi 运行。参见 [docs/agent.md](docs/agent.md)。
@@ -160,12 +190,16 @@ RAM，因此只有两个层级。能装进显卡的模型会完整地在显卡�
 ## 规划器
 
 <p align="center">
-  <img src="docs/assets/screens/plan-mac.png" width="820" alt="16 GB Apple silicon 笔记本上运行 Qwen3.6-35B-A3B Q4_K_M 的 Plan 界面：专家从闪存读取，配有 6.6 GiB 缓存，提示词在 GPU 上处理，token 在 CPU 上生成，实测 23.9 tok/s，缓存命中率 94%，以及内存的去向。">
+  <img src="https://github.com/user-attachments/assets/98e6de3e-e27d-482d-bff1-26fc66074af4" width="820" alt="16 GB Apple silicon 笔记本上运行 Qwen3.6-35B-A3B Q4_K_M 的 Plan 界面：专家从闪存读取，配有 6.6 GiB 缓存，提示词在 GPU 上处理，token 在 CPU 上生成，实测 23.9 tok/s，缓存命中率 94%，以及内存的去向。">
 </p>
 
 规划器读取模型的文件头并测量机器：内存、存储速度、每个 CPU、GPU 和 NPU。其规则不指定任何设备或平台，
 因此同一份代码会为手机和台式机给出不同的方案。你自己设定的值会被保留。参见
 [docs/hardware-planning.md](docs/hardware-planning.md)。
+
+<p align="center">
+  <img src="docs/assets/diagrams/plan-zh.png" width="820" alt="规划器：机器和模型输入方案；方案决定每个权重放在哪里（VRAM、RAM 或闪存）、哪个设备处理提示词、哪个生成 token，以及缓存大小和线程数；测量第一个回答，更快的设置保存供下次加载使用。">
+</p>
 
 ## 平台
 
@@ -191,8 +225,7 @@ RAM，因此只有两个层级。能装进显卡的模型会完整地在显卡�
 | 任意 GGUF 格式的 MoE 模型 | ✅ | 少数模型 | 少数模型 | 自有格式 | 少数模型 |
 | 自动配置 | ✅ `--auto` | 按内存选择模型 | 专家缓存预算 | `coli tune` | ❌ |
 
-当模型能放进游戏 GPU 加 RAM 时，Strata 快二到四倍。当模型需要从闪存流式读取时，所有引擎都低于每秒十个 token，
-速度由硬盘决定。速度及出处：[docs/comparison.md](docs/comparison.md)。
+速度及出处：[docs/comparison.md](docs/comparison.md)。
 
 ## 从源码构建
 

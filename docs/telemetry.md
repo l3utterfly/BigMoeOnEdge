@@ -294,8 +294,10 @@ parser that compares runs across that release reads both as the same mode. Field
   names its build after the checkout has moved on. `unknown` if the build did not define it. It sits
   on its own line so the `model=` line keeps starting with `model=`, which is how the app's CSV
   reader finds a run's name.
-- `n_ubatch` sets the compute-buffer reservation, so it moves the very memory columns below;
-  `0` means it follows `n_batch`.
+- `n_ubatch` sets the compute-buffer reservation, so it moves the very memory columns below. It
+  is the width the context was opened with, whatever set it: `--ubatch`, the plan, or the default
+  (as wide as the context up to 8192 tokens, `RunConfig::graph_width`). Files from earlier
+  releases record `0` for that default.
 - `cache_cycle_mb` is one token's **worst-case** routed bytes for this model at this `n_expert_used`,
   priced at load from tensor shapes. It is here so a budget can be judged without a second run: a
   `cache_mb` under it cannot hold a token cycle, so the hit rate is near zero however legal the
@@ -371,12 +373,14 @@ units as the `BMOE_DONE` keys of those names (see the protocol notes above), app
 existing readers ignore them. A recorded run can now answer "what did the prompt cost, and in
 what" without the protocol line.
 
-With `--prefill-device`, four more: `prefill_dev_tokens=<int>` (prompt tokens whose graph ran on the
+With `--prefill-device`, five more: `prefill_dev_tokens=<int>` (prompt tokens whose graph ran on the
 device), `prefill_dev_nodes=<int>` (graph nodes the device actually computed, i.e. whose output
 landed in a device buffer: the proof it ran, where the token count only says the weights were moved),
-`prefill_dev_read_mib=<f>` (experts the device arena read from flash) and `prefill_dev_stall_s=<s>`
-(wall time the device graph waited at a layer for the arena). All zero when the device is off; the
-last two also without streaming, where there is no arena. Same names in `BMOE_DONE`.
+`prefill_dev_read_mib=<f>` (experts the device arena read from flash), `prefill_dev_stall_s=<s>`
+(wall time the device graph waited at a layer for the arena) and `prefill_dev_cache_mib=<f>`
+(experts the arena copied from the expert cache instead of reading them, `--prefill-from-cache`).
+All zero when the device is off; the last three also without streaming, where there is no arena.
+Same names in `BMOE_DONE`.
 
 The trailing block is the memory picture, added so a run can be diagnosed from its own file:
 
@@ -552,8 +556,8 @@ Not a trace and not opt-in: a streamed session keeps the experts each MoE layer 
 during its first tokens (`--routing-record N`, default 256 decoded tokens and the last 256 of the
 prompt; `0` is off), for the planner to read the model's hit curve from
 ([hardware-planning.md](hardware-planning.md#the-cache-priced-on-the-models-own-routing)). It asks
-the graph for nothing, so a run with it is a benchmark run. `bmoe-cli --routing-dir DIR` and
-`bmoe-server` (under `routing/` in its data folder) keep it as one text file per model,
+the graph for nothing, so a run with it is a benchmark run. Every front-end keeps it in the per-user
+data folder under `routing/` (`bmoe-cli --routing-dir DIR` names another, `""` none), as one text file per model,
 `<fingerprint>.routing`:
 
 ```
@@ -582,6 +586,7 @@ answer's decode alternates the knob between timed windows, and the engine logs w
 bmoe: knob trial: the cache has settled; measuring the decode thread count
 bmoe: knob trial: <n> decode threads (against <n>): decoded <pct>% faster in the median of <r> rounds
 bmoe: knob trial: <n> decode threads (against <n>): held: the best candidate was <+pct>% in the median of <r> rounds, inside the 10% margin
+bmoe: knob trial: <n> decode threads settled as no win after <r> round[s][, every token past the incumbent's range]: <ms> ms/token against <ms>
 bmoe: knob trial: overlap <on|off> (against <on|off>): ...
 ```
 
@@ -595,11 +600,56 @@ machine and engine:
 ```
 bmoe-measured-knobs 1
 hardware=<16 hex> engine=<version> threads=<n> threads_tried=<incumbent,candidates> threads_gain=<f>
-  overlap=<-1|0|1> overlap_incumbent=<-1|0|1> overlap_gain=<f> rounds=<n>      (one line)
+  overlap=<-1|0|1> overlap_incumbent=<-1|0|1> overlap_gain=<f> rounds=<n>
+  device_cache_tps=<f> no_device_cache_tps=<f> width_narrow=<n> wide_decode_tps=<f>
+  narrow_decode_tps=<f> wide_prefill_tps=<f> narrow_prefill_tps=<f> usage_gen_tokens=<f>
+  usage_long_prompt_tokens=<f> usage_requests=<n> ... [unviable=<side:n,...>]
+  [prefill=<device>:<kept|refused|unconfirmed[-n]>[,...]]
+  [device_answer=<device>:<confirmed|differs>[,...]]  (one line)
 ```
 
-`threads=0` and `overlap=-1` mean not measured. A key the reader does not know is skipped, so a later
-engine may add one.
+`threads=0` and `overlap=-1` mean not measured, and so does a rate of 0. `prefill=` is what came of
+each prefill device a load armed for this model, one word per device ([measured-planning.md](measured-planning.md#a-prefill-device-that-did-not-hold-up-for-a-model)). The two rates are the device
+tier's sides, each timed by a load that serves it (`--trial-device-cache`), with these lines:
+
+```
+bmoe: knob trial: timing the decode <with|without> a device expert cache
+bmoe: knob trial: <f> tok/s <with|without> a device expert cache, the median of <n> windows
+```
+
+The graph width's sides likewise (`--trial-width`): `width_narrow` is the narrow width compared, the
+prefill rates are over prompts longer than it, and `usage_*` is what the load's requests asked, per
+request, recorded on a load that times a side and on one whose width was decided before any request
+was seen (`--trial-width-narrow` alone). Their decode is timed with these lines:
+
+```
+bmoe: knob trial: timing the decode with the graph <at the plan's width|narrowed> (<n> tokens wide)
+bmoe: knob trial: <f> tok/s with the graph <...> (<n> tokens wide), the median of <n> windows
+```
+
+`unviable` counts the failed opens of each side: a load whose side would not open and that opened the
+plan's other side instead (`device_cache`, `no_device_cache`, `wide`, `narrow`; the width's at
+`width_narrow`), as `side:n`, written only when there is one. After one failure the plan may name the
+side once more; from two on it is the losing side in every plan. A rate measured since clears it. A name the reader does
+not know, or a part it cannot read, is skipped.
+
+`device_answer=` is whether this model's answers on a device matched the cores', one word per device
+compared, written only when there is one: the load a plan moved the whole model onto a device with
+compares them before it serves (`--trial-device-answer`,
+[hardware-planning.md](hardware-planning.md#a-model-held-in-memory-on-a-device-that-shares-it)), with
+one of these lines, the second and third as warnings:
+
+```
+bmoe: device answer: <device> against the CPU on <n> tokens in <n> graphs from 1 to <n> wide, <n> rows compared, top token agrees <p>%, logit NMSE <f>, KL mean <f> max <f>, device <f> s, CPU reference <f> s, <f> s in all - confirmed
+bmoe: device answer: <device> against the CPU on ... - it does not compute this model: the model is reopened on the CPU
+bmoe: device answer: <device>'s answers for this model were not compared with the CPU's (<why>); the model is reopened on the CPU
+```
+
+A load that reopened on the CPU reports the time of both opens as its load time.
+
+Keeping a record merges it into the one already kept for that machine and engine: each measurement it
+carries replaces that one, and the rest stay, so a load that measured one side does not lose the other.
+A key the reader does not know is skipped, so a later engine may add one.
 
 ## Session mode
 
@@ -641,7 +691,7 @@ BMOE_DONE  {"id":<int>,"cancelled":<bool>,"tokens":<int>,"tok_s":<float>,
             "prefill_cpu_s":<float>,"prefill_read_mib":<float>,"prefill_io_s":<float>,
             "prefill_stall_s":<float>,"prefill_mgmt_s":<float>,
             "prefill_dev_tokens":<int>,"prefill_dev_nodes":<int>,"prefill_dev_read_mib":<float>,
-            "prefill_dev_stall_s":<float>,
+            "prefill_dev_stall_s":<float>,"prefill_dev_cache_mib":<float>,
             "token_demand_mib":<float>,"mtp_drafted":<int>,"mtp_accepted":<int>,"mtp_decodes":<int>,
             "mtp_draft_s_tok":<float>,"drafted_steps":<int>,"loop_overhead_s_tok":<float>,
             "reasoning":"<string>","text":"<string>"}
@@ -650,7 +700,7 @@ BMOE_DECIDE {"id":<int>,"cancelled":<bool>,"best":<int>,"choice_logp":[<float|nu
              "store_s":<float>,"prefill_s":<float>,"prefill_cpu_s":<float>,"prefill_read_mib":<float>,
              "prefill_io_s":<float>,"prefill_stall_s":<float>,"prefill_mgmt_s":<float>,
              "prefill_dev_tokens":<int>,"prefill_dev_read_mib":<float>,"prefill_dev_stall_s":<float>,
-             "prefill_dev_routed":<int>,"prefill_dev_demand":<int>,"prefix_state_mib":<float>}
+             "prefill_dev_cache_mib":<float>,"prefill_dev_routed":<int>,"prefill_dev_demand":<int>,"prefix_state_mib":<float>}
 BMOE_ERROR {"id":<int>,"fatal":<bool>,"code":"<string>","msg":"<string>"}
 ```
 
@@ -671,7 +721,8 @@ is minus infinity. `best` is the index of the highest. `n_reused` tokens were re
 prefix state and `n_prefilled` were prefilled; the `prefill_*` keys read exactly as `BMOE_DONE`'s.
 `prefill_dev_tokens` is how many of the prefilled tokens ran on the prefill device (`0` without
 `--prefill-device`); `prefill_dev_read_mib` and `prefill_dev_stall_s` are its expert arena's reads and
-the time the graph waited on them, as in `BMOE_DONE` and apart from the streamer's `prefill_read_mib`.
+the time the graph waited on them, and `prefill_dev_cache_mib` what it copied from the expert cache
+instead, as in `BMOE_DONE` and apart from the streamer's `prefill_read_mib`.
 In routed mode (the default), `prefill_dev_routed` counts the (layer, expert) pairs the prefill routed to
 and `prefill_dev_demand` those the prediction missed and the arena read at the routing node (both `0`
 with `--no-prefill-routed`). `prefix_state_mib` is the memory the kept state holds after the call. There is
@@ -732,6 +783,8 @@ prefilled **this turn** (the suffix after any reused KV prefix), and `n_past` is
 length after the turn — so a multi-turn UI can show both per-turn prefill cost and how full the
 context is. `prefill_tps` is the prompt prefill rate; `compute_s_tok`/`io_s_tok` are the per-token
 AVERAGES over the run (so a UI can show an average compute-vs-I/O split, not just the last token).
+With streaming off the flash and cache terms are `0` and `compute_s_tok` is the whole token, as each
+token line's `compute_ms` is its `wall_ms`; the speeds (`tok_s`, `prefill_tps`) are reported either way.
 `cache_resident_mib`/`cache_budget_mib` track the fixed cache, `read_mib` is the
 total flash streamed this generation, and `stall_s_tok`/`mgmt_s_tok` the per-token overlap stall and
 cache-management cost. `flash_wait_s_tok` is the flash term that adds to wall time, already chosen

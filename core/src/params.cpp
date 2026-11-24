@@ -161,7 +161,7 @@ ParamDesc row(const char * key, const char * label, ParamGroup group, ParamLevel
     d.label = label;
     d.group = group;
     d.level = level;
-    d.form = level == ParamLevel::Basic;
+    d.form = level == ParamLevel::Basic || (level == ParamLevel::Advanced && param_group_shapes_answer(group));
     d.help = std::move(help);
     d.flag = std::string("--") + key;
     return d;
@@ -190,8 +190,8 @@ ParamDesc & typical(ParamDesc & d, double lo, double hi) {
     return d;
 }
 
-ParamDesc & special(ParamDesc & d, std::string value, const char * label) {
-    d.specials.push_back({std::move(value), label});
+ParamDesc & special(ParamDesc & d, std::string value, std::string label) {
+    d.specials.push_back({std::move(value), std::move(label)});
     return d;
 }
 
@@ -253,6 +253,19 @@ std::vector<ParamDesc> build() {
         d.details = "A vision model ships this as a separate file beside its weights (its name usually starts with "
                     "mmproj). The server pairs it with the model on its own when both are in the same folder; "
                     "set it here to choose another. Any quantization of either file works.";
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("image-max-tokens", "Image tokens", G::Model, L::Advanced,
+                          "Most tokens one image may take, for a projector whose count follows the image's size. "
+                          "0 = the projector's own cap.");
+        d.value_hint = "N";
+        bounds(d, 0, RunConfig::tokens_max, "tokens");
+        bind_int(d, [](RunConfig & c) -> int & { return c.image_max_tokens; });
+        d.details = "Every image token is prefilled like a prompt token, and a photo takes thousands at a projector's "
+                    "own cap: on a phone, where image tokens are prefilled on the CPU, that is minutes. A few hundred "
+                    "reads a scene or a page; the projector sizes the image down to fit. A projector with a fixed "
+                    "token count ignores this.";
         t.push_back(d);
     }
 
@@ -417,6 +430,9 @@ std::vector<ParamDesc> build() {
         ParamDesc d = row("seed", "Seed", G::Sampling, L::Advanced,
                           "RNG seed for sampling. " + std::to_string(SamplingConfig::seed_random) +
                               " draws a random seed per run.");
+        // Picks which answer of the same distribution comes out, not how good it is: a value to
+        // replay a run with, typed on a command line, not a choice a form asks a person to make.
+        d.form = false;
         d.value_hint = "N";
         at_least(d, 0);
         special(d, std::to_string(SamplingConfig::seed_random), "random per run");
@@ -469,6 +485,20 @@ std::vector<ParamDesc> build() {
         t.push_back(d);
     }
     {
+        ParamDesc d = row("device-cache-cpu-share", "Device cache misses on the CPU", G::Cache, L::Experimental,
+                          "EXPERIMENTAL: With a device expert cache, the share of its misses the CPU computes from the "
+                          "host's copy instead of uploading them to the device, once the cache is full. 0 uploads "
+                          "every miss; below 1 the cache keeps learning which experts are hot.");
+        d.type = ParamType::Float;
+        d.value_hint = "F";
+        bounds(d, 0.0, MoeStreamConfig::device_cache_cpu_share_max);
+        special(d, "0", "off");
+        bind_float(d, [](RunConfig & c) -> float & { return c.moe.device_cache_cpu_share; });
+        d.details = "Experimental: with a graphics card's expert cache, lets the processor compute part of the "
+                    "experts the card does not hold, instead of sending them over. 0 is off.";
+        t.push_back(d);
+    }
+    {
         ParamDesc d = row("io-threads", "Read lanes", G::Streaming, L::Advanced,
                           "Parallel expert-read lanes, including the calling thread. 1 is the serial baseline.");
         d.value_hint = "N";
@@ -495,10 +525,11 @@ std::vector<ParamDesc> build() {
                           "Output is byte-identical. Needs the fork's expert-ready hook in this build.");
         d.type = ParamType::Bool;
         d.flag.clear();
-        d.switches = {{"--overlap", "true"}};
+        d.switches = {{"--overlap", "true"}, {"--no-overlap", "false"}};
         bind_bool(d, [](RunConfig & c) -> bool & { return c.moe.overlap; });
         d.details = "Reads the next experts while the current ones are computed. Same answer, often faster; the plan "
-                    "keeps it only where it measures faster.";
+                    "keeps it only where it measures faster, and turns it off where layers sit on a device without "
+                    "an expert cache there, since it keeps prompts on the cores.";
         t.push_back(d);
     }
     {
@@ -520,6 +551,81 @@ std::vector<ParamDesc> build() {
         d.flag.clear();
         d.switches = {{"--trial-overlap", "true"}};
         bind_bool(d, [](RunConfig & c) -> bool & { return c.trial.overlap; });
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("trial-device-cache", "Measure the device tier", G::Cache, L::Experimental,
+                          "Time the decode of this load's side of the device tier, to be compared across loads: 1 "
+                          "with a device expert cache, 0 without one. -1 times neither. Changes no output; the plan "
+                          "sets it on a load that serves a side not yet measured on this machine.");
+        d.value_hint = "N";
+        bounds(d, -1, 1, "side");
+        special(d, "-1", "off");
+        bind_int(d, [](RunConfig & c) -> int & { return c.trial.device_tier; });
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("trial-shared-device", "Measure the shared-memory device", G::Memory, L::Experimental,
+                          "Time the decode of this load's side of where a model held in memory runs, on a machine "
+                          "whose device reads the host's own memory, to be compared across loads: 1 with every "
+                          "layer on the device (--gpu-layers and --device-split), 0 on the cores. -1 times neither. "
+                          "Changes no output; the plan sets it on a load that serves a side not yet measured on "
+                          "this machine.");
+        d.value_hint = "N";
+        bounds(d, -1, 1, "side");
+        special(d, "-1", "off");
+        bind_int(d, [](RunConfig & c) -> int & { return c.trial.shared_device_side; });
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("trial-device-answer", "Check the device's answers", G::Memory, L::Experimental,
+                          "Before serving, compare this model's answers on the device its layers are on with the "
+                          "cores': a short fixed sequence decoded on both, and where the device does not pick the "
+                          "cores' next tokens the model is reopened on the cores. NAME is the device, the name the "
+                          "verdict is kept under for this model, machine and engine. Needs --gpu-layers above 0 and "
+                          "a model held in memory; the plan sets it on a load that moves a whole model onto a "
+                          "device whose answers for it were never compared here.");
+        d.type = ParamType::Text;
+        d.value_hint = "NAME";
+        bind_string(d, [](RunConfig & c) -> std::string & { return c.trial.answer_device; });
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("trial-answer-mix", "Keep the faster side of the check", G::Memory, L::Experimental,
+                          "With --trial-device-answer: also time the two sides the check decodes, and serve from "
+                          "the one a request is shorter on, reopening on the cores where they are faster by the "
+                          "trial's margin. F is the prompt tokens a request brings per decoded token, which weighs "
+                          "a prompt-wide graph's time against a single token's. Below 0 nothing is weighed and a "
+                          "device whose answers match keeps the model. The plan sets it where no load has "
+                          "measured both sides on this machine.");
+        d.type = ParamType::Float;
+        d.value_hint = "F";
+        bounds(d, -1.0, KnobTrialConfig::answer_prompt_per_token_max);
+        special(d, "-1", "off");
+        bind_float(d, [](RunConfig & c) -> float & { return c.trial.answer_prompt_per_token; });
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("trial-width", "Measure the graph width", G::Prefill, L::Experimental,
+                          "Time this load's side of the graph width, to be compared across loads: 1 the plan's own "
+                          "width, 0 the narrower --trial-width-narrow. Times the decode, and the prefill of prompts "
+                          "longer than the narrow width. -1 times neither. Changes no output; the plan sets it.");
+        d.value_hint = "N";
+        bounds(d, -1, 1, "side");
+        special(d, "-1", "off");
+        bind_int(d, [](RunConfig & c) -> int & { return c.trial.width_side; });
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("trial-width-narrow", "Narrow graph width compared", G::Prefill, L::Experimental,
+                          "The narrower graph width --trial-width compares with the plan's own, in tokens. Prompts "
+                          "longer than it are the ones whose prefill is timed. Set alone, it records the requests a "
+                          "load serves against it, timing nothing: the plan does so where it chose the width before "
+                          "any request was seen. 0 is none.");
+        d.value_hint = "N";
+        bounds(d, 0, RunConfig::tokens_max, "tokens");
+        special(d, "0", "none");
+        bind_int(d, [](RunConfig & c) -> int & { return c.trial.width_narrow; });
         t.push_back(d);
     }
     {
@@ -635,13 +741,15 @@ std::vector<ParamDesc> build() {
     }
     {
         ParamDesc d = row("ubatch", "Batch width", G::Memory, L::Advanced,
-                          "Widest graph computed at once (0 = as wide as the context). Compute buffers are "
-                          "reserved for it, so a smaller value hands RAM back to the expert cache at the cost "
-                          "of prefill speed; decode is unaffected.");
+                          "Widest graph computed at once (0 = as wide as the context, up to " +
+                              std::to_string(RunConfig::ubatch_auto_max) +
+                              "; with --auto the plan chooses it from this machine's memory). Compute buffers are "
+                              "reserved for it, so a smaller value hands RAM back to the expert cache at the cost "
+                              "of prefill speed; decode is unaffected.");
         d.value_hint = "N";
         bounds(d, 0, RunConfig::tokens_max, "tokens");
         typical(d, usual::ubatch_lo, usual::ubatch_hi);
-        special(d, "0", "as wide as the context");
+        special(d, "0", "as wide as the context, up to " + std::to_string(RunConfig::ubatch_auto_max));
         bind_int(d, [](RunConfig & c) -> int & { return c.n_ubatch; });
         d.details = "Wider computes a long prompt faster but reserves memory taken from the expert cache. It does not "
                     "change how fast the answer is written.";
@@ -663,8 +771,9 @@ std::vector<ParamDesc> build() {
     }
     {
         ParamDesc d = row("checkpoint-min-step", "Checkpoint spacing", G::Memory, L::Debug,
-                          "Least distance between two context checkpoints inside one prompt prefilled in "
-                          "pieces. The end of every prompt gets one regardless. 0 = no minimum.");
+                          "Least distance between two context checkpoints at the start of user messages, or "
+                          "inside a prompt whose template names no messages. The last user message and the "
+                          "end of every prompt get one regardless. 0 = no minimum.");
         d.value_hint = "N";
         bounds(d, 0, RunConfig::tokens_max, "tokens");
         typical(d, usual::checkpoint_step_lo, usual::checkpoint_step_hi);
@@ -703,16 +812,6 @@ std::vector<ParamDesc> build() {
         bind_int(d, [](RunConfig & c) -> int & { return c.n_gpu_layers; });
         d.details = "Layers held and computed on a device with its own memory, such as a graphics card: much faster "
                     "than streaming. The plan fills the device as far as it fits.";
-        t.push_back(d);
-    }
-    {
-        ParamDesc d = row("dense-on-device", "Dense weights on device", G::Memory, L::Experimental,
-                          "Put the dense weights on an accelerator that shares this host's memory, leaving the "
-                          "experts to the streamer. Measured to lose on a phone GPU; kept as a named lever.");
-        d.type = ParamType::Bool;
-        d.flag.clear();
-        d.switches = {{"--dense-on-device", "true"}};
-        bind_bool(d, [](RunConfig & c) -> bool & { return c.dense_on_device; });
         t.push_back(d);
     }
     {
@@ -831,8 +930,9 @@ std::vector<ParamDesc> build() {
         ParamDesc d = row("devices", "Compute devices", G::Memory, L::Advanced,
                           "Which compute devices llama.cpp may use. auto gives it all of them when a layer is "
                           "placed on one and the CPU alone otherwise: a device left registered but unused "
-                          "still takes graph nodes, each one a boundary crossing. The prefill device is "
-                          "named separately and is not affected.");
+                          "still takes graph nodes, each one a boundary crossing (with streaming and nothing "
+                          "placed, none: the experts' ops stay on the CPU). The prefill device is named "
+                          "separately and is not affected.");
         d.form = true;
         d.type = ParamType::Choice;
         d.value_hint = "auto|all|cpu";
@@ -927,6 +1027,17 @@ std::vector<ParamDesc> build() {
         d.flag.clear();
         d.switches = {{"--prefill-routed", "true"}, {"--no-prefill-routed", "false"}};
         bind_bool(d, [](RunConfig & c) -> bool & { return c.prefill.routed; });
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("prefill-from-cache", "Prefill reads the cache", G::Prefill, L::Advanced,
+                          "With a prefill device and streaming: copy the experts the expert cache already "
+                          "holds from RAM instead of reading them from flash again. Output is identical "
+                          "either way.");
+        d.type = ParamType::Bool;
+        d.flag.clear();
+        d.switches = {{"--prefill-from-cache", "true"}, {"--no-prefill-from-cache", "false"}};
+        bind_bool(d, [](RunConfig & c) -> bool & { return c.prefill.from_cache; });
         t.push_back(d);
     }
     {
@@ -1099,7 +1210,6 @@ std::vector<ParamDesc> build() {
             d.short_flag = short_flag;
             d.value_hint = "TYPE";
             d.lossy = true;
-            d.form = true;
             d.details = details;
             bind_choice<KvCacheType>(d, field, kv_types);
             t.push_back(d);
@@ -1124,7 +1234,6 @@ std::vector<ParamDesc> build() {
         ParamDesc d = row("n-expert-used", "Active experts", G::Lossy, L::Advanced,
                           "Override the experts routed per token (top-k). Lower is faster but changes the "
                           "output. 0 = the model's own value.");
-        d.form = true;
         d.value_hint = "N";
         d.lossy = true;
         bounds(d, 0, RunConfig::n_expert_used_max, "experts");
@@ -1144,6 +1253,8 @@ std::vector<ParamDesc> build() {
         bounds(d, 0.0, MoeStreamConfig::drop_cold_frac_max);
         special(d, "0", "off");
         bind_float(d, [](RunConfig & c) -> float & { return c.moe.drop_cold_frac; });
+        d.details = "Skips a little-used expert that is not in RAM instead of waiting for storage: faster on a slow "
+                    "drive, but the answers change and a rerun may differ. 0 keeps every expert.";
         t.push_back(d);
     }
     {
@@ -1247,6 +1358,29 @@ std::vector<ParamDesc> build() {
         t.push_back(d);
     }
     {
+        ParamDesc d = row("cache-discard", "Drop, never swap", G::Cache, L::Advanced,
+                          "Let the system drop cached experts under memory pressure instead of swapping them "
+                          "or anything else to the drive. A dropped expert is read again from the model file.");
+        d.type = ParamType::Bool;
+        d.flag.clear();
+        d.switches = {{"--no-cache-discard", "false"}};
+        bind_bool(d, [](RunConfig & c) -> bool & { return c.moe.cache_discard; });
+        d.details = "Experts not used in the last token are handed to the system, which takes them back first "
+                    "when memory runs short: no swap writes, which wear flash, and no other app pushed out by a "
+                    "locked cache. Replaces pinning where the platform supports it.";
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("cache-discard-drop", "Drop at once", G::Diagnostics, L::Debug,
+                          "Drop an offered expert just before a lookup takes it back, as if pressure took it, "
+                          "so each such lookup pays the re-read. For the byte-identity gate.");
+        d.type = ParamType::Bool;
+        d.flag.clear();
+        d.switches = {{"--cache-discard-drop", "true"}};
+        bind_bool(d, [](RunConfig & c) -> bool & { return c.moe.cache_discard_drop; });
+        t.push_back(d);
+    }
+    {
         ParamDesc d = row("cache-brake", "Brake under pressure", G::Cache, L::Advanced,
                           "Halve the expert cache when the system starts taking it back mid-run: a stalled "
                           "token, confirmed by cache pages no longer in RAM. It only shrinks, never under "
@@ -1255,6 +1389,26 @@ std::vector<ParamDesc> build() {
         d.flag.clear();
         d.switches = {{"--no-cache-brake", "false"}};
         bind_bool(d, [](RunConfig & c) -> bool & { return c.moe.cache_brake; });
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("cache-half-life", "Cache eviction half-life", G::Cache, L::Advanced,
+                          "Which cached expert to drop: 0 drops the least recently used; above 0 the least "
+                          "used recently, each use counting half after this many tokens.");
+        d.value_hint = "TOKENS";
+        bounds(d, 0, MoeStreamConfig::cache_freq_half_life_max, "tokens");
+        special(d, "0", "least recently used");
+        bind_int(d, [](RunConfig & c) -> int & { return c.moe.cache_freq_half_life; });
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("cache-prefill-cold", "Prefill admits cold", G::Cache, L::Advanced,
+                          "Experts a long prompt reads on the CPU enter the cache as the first to drop, so the "
+                          "prompt does not flush what the cache already holds. Output is identical either way.");
+        d.type = ParamType::Bool;
+        d.flag.clear();
+        d.switches = {{"--cache-prefill-cold", "true"}, {"--no-cache-prefill-cold", "false"}};
+        bind_bool(d, [](RunConfig & c) -> bool & { return c.moe.cache_prefill_cold; });
         t.push_back(d);
     }
     {
@@ -1461,6 +1615,10 @@ const char * param_group_help(ParamGroup g) {
         return "Tests, probes and A/B baselines; never a speed setting.";
     }
     return "";
+}
+
+bool param_group_shapes_answer(ParamGroup g) {
+    return g == ParamGroup::Sampling || g == ParamGroup::Lossy;
 }
 
 bool param_group_read_only(ParamGroup g) {

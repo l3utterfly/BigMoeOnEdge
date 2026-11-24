@@ -20,10 +20,13 @@ we do not fork llama.cpp. See `docs/architecture.md` and `docs/seam.md`.
   file's shapes), `expert_stream_source`, `router_hook`, `gate_gemv` (route-ahead's gate GEMV, float
   and int8, and the timing that picks one);
   `dense_weights` (the non-expert weight policy: mmap / warm / anon, plus the residency sensor);
-  `tensor_names` (the one place llama.cpp's tensor and node names are parsed: no ad-hoc sscanf or regex).
+  `tensor_names` (the one place llama.cpp's tensor and node names are parsed: no ad-hoc sscanf or regex);
+  `discardable_entries` (which cached experts are offered to the kernel to drop instead of swap: pure
+  policy over a port, `platform_io` implements it).
 - `core/src/engine/` — `session.cpp`, the composition root: one `Session` loads the model, binds
   the streamer and runs every generation; `runtime.cpp` is the one-shot wrapper over it. Beside it:
-  the prefill device and path, the chat template and parsers, and `decide/` (`docs/decide.md`).
+  the prefill device and path, the whole-model check of a device's answers (`device_answer`), the chat
+  template and parsers, and `decide/` (`docs/decide.md`).
 - `core/src/plan/` — the hardware planner behind `--auto` (`docs/hardware-planning.md`). The rules
   (`planner`, `allocate`, `plan`) are pure functions over `hardware_profile.h` / `model_profile.h`
   and name no platform, vendor, device or architecture; the `*_probe` adapters are the only files
@@ -31,26 +34,35 @@ we do not fork llama.cpp. See `docs/architecture.md` and `docs/seam.md`.
   `auto_plan` (`probe_and_plan`) runs the probes in their order and then the rules; every front-end
   plans through it rather than calling the probes itself. `routing` is the model's own routing
   record as a value (the LRU replay behind its hit curve, `docs/measured-planning.md`), and
-  `measured_knobs` the verdicts the first answer measured for the lossless knobs; the front-ends
-  decide where both are kept, keyed by `model_fingerprint` (and a verdict by `hardware_fingerprint`).
+  `measured_knobs` the verdicts the first answer measured for the lossless knobs; `model_records`
+  keeps both on disk, keyed by `model_fingerprint` (and a verdict by `hardware_fingerprint`), in the
+  folder the front-end names. Every front-end names the same one (`frontend/user_dirs`), so `--auto`
+  is one behaviour on the CLI, the server and the apps.
+- `core/src/metrics/` — the metrics sinks (per-token CSV, routing and decode traces) and
+  `memory_snapshot` (the process's memory per token; `docs/telemetry.md`).
 - `core/include/bmoe/params.h` + `core/src/params.cpp` — the parameter table: every tunable of a
   `RunConfig`, described once. The CLI parses and documents its flags from it; front-ends render
   their settings from its JSON (`bmoe-cli --describe-params`).
+- `frontend/`: what every front-end does the same way: `user_dirs` (the per-user data folder) and
+  `backend_env` (the one table of what the compute backends read from their environment, set before
+  any loads; `docs/backends.md`). A backend default is an entry there, measured, never an ad-hoc `setenv`.
 - `cli/main.cpp`: `bmoe-cli`; the ONLY place engine environment overrides are read.
 - `server/`: `bmoe-server`, the engine behind the desktop web UI (`docs/server-api.md`). A
   front-end like the CLI: HTTP, files and the platform live here, never in `core/`. Its only env
   reads are the per-user data, config and home folders and `PATH` (to find the coding agents it may
-  start, and the init system's tool) on POSIX, and its only env writes are the two tuning entries
-  the Hexagon backend documents it reads, set before the backend loads (`server/platform.cpp`).
+  start, and the init system's tool) on POSIX, and its only env writes are the backend defaults of
+  `frontend/backend_env`, which the CLI applies too. The programs it starts (coding agents, MCP
+  servers) inherit its environment as a whole, with the entries their configuration adds; that is
+  passed through, never read.
   The init systems are the one other adapter (`service_manager.cpp`): which one answers is asked of
   the machine, and what it is handed is rendered by a pure function (`service_spec.cpp`). The agent (`docs/agent.md`) is the server's too: `agent*.{h,cpp}`,
   `provider_protocol`, `connect`; its bundled skills are `skills/`.
 - `ui/`: the web UI (Svelte + TypeScript). Settings are rendered from `GET /api/params`: never
   name an engine parameter in the UI. `catalog/models.json`: the model catalog, as data;
   `catalog/clients.json`: the apps the server can connect, as data.
-- `third_party/llama.cpp` — the pinned submodule: upstream plus one commit, the expert-ready hook
-  `--overlap` needs (the fork branch hard rule 1 describes; `docs/seam.md`). Everything else builds
-  against stock upstream.
+- `third_party/llama.cpp` — the pinned submodule: upstream plus two commits on the fork branch hard
+  rule 1 describes (`docs/seam.md`): the expert-ready hook `--overlap` needs, and the Hexagon backend's
+  weight writes the NPU prefill's streamed slots need. Everything else builds against stock upstream.
 - `tests/` — byte-identity gates. `examples/android/` — the Android app, a client of `bmoe-server`
   (shipped in the APK, run as a child process; no engine logic in Kotlin). `examples/ios/` — the iOS
   app (`app/`: `bmoe_server` run on a thread, since an app there may not start a process, and
@@ -75,8 +87,8 @@ Android CLI: `pwsh scripts/build-android.ps1` (needs the NDK), then build the AP
 
 1. **Never patch llama.cpp in-tree.** Everything goes through the public eval-callback and
    public gguf/model APIs. If a change seems to need a llama.cpp edit, stop and discuss —
-   the fallback is a *separate* 1-commit fork branch on `Helldez/llama.cpp`, never an
-   in-tree diff, and only after agreement. Upgrading llama.cpp must stay a submodule bump.
+   the fallback is a commit on the fork branch on `Helldez/llama.cpp`, one per agreed change
+   (`docs/seam.md` lists them), never an in-tree diff, and only after agreement. Upgrading llama.cpp must stay a submodule bump.
 2. **Repack stays off.** The engine loads memory-mapped (`load_mode = LLAMA_LOAD_MODE_MMAP`) with
    `use_extra_bufts=false`. The streamer rebinds `tensor->data` to the native gguf layout;
    repacking breaks it. This is load-bearing, not a tunable.

@@ -7,6 +7,7 @@ import {
   isConfig,
   isDecideResult,
   isHfAdded,
+  isCatalogCheck,
   isHfFacts,
   isHfModelsResponse,
   isHfSearchResponse,
@@ -16,6 +17,7 @@ import {
   isPlan,
 } from './guards';
 import type {
+  CatalogCheck,
   ChatChunk,
   ChatMessage,
   Config,
@@ -118,6 +120,9 @@ export const api = {
   unload: () => request<unknown>('POST', 'api/session/unload'),
   cancel: () => request<unknown>('POST', 'api/cancel'),
   models: () => request<ModelsResponse>('GET', 'api/models', undefined, isModelsResponse),
+  /** Where models are kept: `models_dir` "" for the default. Local clients only (the server writes there). */
+  setModelFolders: (folders: { models_dir?: string; scan_dirs?: string[] }) =>
+    request<ModelsResponse>('PUT', 'api/models/folders', folders, isModelsResponse),
   download: (id: string) => request<unknown>('POST', 'api/models/download', { id }),
   cancelDownload: (id: string) => request<unknown>('DELETE', `api/models/download/${encodeURIComponent(id)}`),
   /** Delete the partial files a stopped download left; by catalog id, never by path. */
@@ -131,6 +136,8 @@ export const api = {
   /** One model's header against this machine, before any download. */
   hfInspect: (repo: string, name: string, token?: string) =>
     request<HfFacts>('POST', 'api/hf/inspect', token ? { repo, name, token } : { repo, name }, isHfFacts),
+  /** A catalog entry's header against this machine, before its download. */
+  inspectEntry: (id: string) => request<CatalogCheck>('POST', 'api/models/inspect', { id }, isCatalogCheck),
   /** The model as a catalog entry; the download is then `download(id)`. */
   hfAdd: (repo: string, name: string, token?: string) =>
     request<HfAdded>('POST', 'api/hf/add', token ? { repo, name, token } : { repo, name }, isHfAdded),

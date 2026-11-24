@@ -119,6 +119,88 @@ int main() {
     }
     expect_ok("streaming, cache off", ok_moe());
     {
+        // The share of a device cache's misses computed on the host: a share, of a cache that exists.
+        RunConfig c = ok_base();
+        c.moe.device_cache_cpu_share = 0.5f;
+        expect_fail("device_cache_cpu_share without a device cache", c);
+        c.moe.device_cache_mb = 1024;
+        expect_ok("device_cache_cpu_share with a device cache", c);
+        RunConfig streamed = c;
+        streamed.moe.enabled = true;
+        expect_fail("device_cache_cpu_share over streamed experts (not gated)", streamed);
+        c.moe.device_cache_cpu_share = MoeStreamConfig::device_cache_cpu_share_max + 0.5f;
+        expect_fail("device_cache_cpu_share above 1", c);
+        c.moe.device_cache_cpu_share = -0.1f;
+        expect_fail("device_cache_cpu_share negative", c);
+        c.moe.device_cache_cpu_share = std::numeric_limits<float>::quiet_NaN();
+        expect_fail("device_cache_cpu_share NaN", c);
+    }
+    {
+        // The shared-memory device's side: one decision a load, and side 1 with layers on the device.
+        RunConfig t = ok_base();
+        t.trial.shared_device_side = 0;
+        expect_ok("trial shared device, the cores", t);
+        t.trial.shared_device_side = 1;
+        expect_fail("trial shared device 1 with no layer on a device", t);
+        t.n_gpu_layers = 49;
+        t.device_split = {{"accel", 49}};
+        expect_ok("trial shared device 1, every layer on the device", t);
+        RunConfig two = t;
+        two.trial.device_tier = 0;
+        expect_fail("trial shared device beside the device tier's", two);
+        t.trial.shared_device_side = 2;
+        expect_fail("trial shared device out of range", t);
+    }
+    {
+        // The answer check: a model held whole in memory, with layers on a device to compare.
+        RunConfig t = ok_base();
+        t.trial.answer_device = "accel";
+        expect_fail("trial device answer with no layer on a device", t);
+        t.n_gpu_layers = 49;
+        t.device_split = {{"accel", 49}};
+        expect_ok("trial device answer, every layer on the device", t);
+        RunConfig timed = t;
+        timed.trial.shared_device_side = 1;
+        expect_ok("trial device answer on a load that times the device's side", timed);
+        RunConfig weighed = timed;
+        weighed.trial.answer_prompt_per_token = 13.65f;
+        expect_ok("trial device answer that also weighs the two sides it decodes", weighed);
+        weighed.trial.answer_prompt_per_token = 0.0f;
+        expect_ok("trial device answer weighed on the decode alone", weighed);
+        weighed.trial.answer_prompt_per_token = KnobTrialConfig::answer_prompt_per_token_max * 2.0f;
+        expect_fail("trial answer mix past its bound", weighed);
+        RunConfig unnamed = ok_base();
+        unnamed.trial.answer_prompt_per_token = 1.0f;
+        expect_fail("trial answer mix with no device to compare", unnamed);
+        // The plan's other part (RunConfig::fallback): what the load reopens with where the device
+        // does not keep the model. A configuration of its own, of the same model, with none behind it.
+        RunConfig two = t;
+        two.fallback = std::make_shared<const RunConfig>(ok_moe());
+        expect_ok("a fallback configuration behind a device whose answers are compared", two);
+        RunConfig no_device = ok_base();
+        no_device.fallback = std::make_shared<const RunConfig>(ok_moe());
+        expect_fail("a fallback configuration with no device to fall back from", no_device);
+        RunConfig other_model = ok_moe();
+        other_model.model_path = "another.gguf";
+        two.fallback = std::make_shared<const RunConfig>(other_model);
+        expect_fail("a fallback configuration of another model", two);
+        RunConfig nested = ok_moe();
+        nested.fallback = std::make_shared<const RunConfig>(ok_moe());
+        two.fallback = std::make_shared<const RunConfig>(nested);
+        expect_fail("a fallback configuration with a fallback of its own", two);
+        RunConfig invalid = ok_moe();
+        invalid.n_ctx = 0;
+        two.fallback = std::make_shared<const RunConfig>(invalid);
+        expect_fail("a fallback configuration that is not valid by itself", two);
+        RunConfig cached = t;
+        cached.moe.device_cache_mb = 2048;
+        expect_fail("trial device answer beside a device expert cache", cached);
+        RunConfig streamed = ok_moe();
+        streamed.n_gpu_layers = 49;
+        streamed.trial.answer_device = "accel";
+        expect_fail("trial device answer on a streamed model", streamed);
+    }
+    {
         RunConfig c = ok_moe();
         c.moe.io_threads = MoeStreamConfig::io_threads_max + 1;
         expect_fail("io_threads out of range", c);
@@ -293,6 +375,55 @@ int main() {
         expect_fail("an n_ubatch above n_ctx is rejected", c);
         c.n_ubatch = -1;
         expect_fail("a negative n_ubatch is rejected", c);
+    }
+
+    // graph_width: the one place 0 becomes a width (#566). As wide as the context up to
+    // ubatch_auto_max; a set n_ubatch is the caller's, never widened past the context.
+    {
+        auto width_is = [](const char * name, int n_ctx, int n_ubatch, int want) {
+            RunConfig c = ok_base();
+            c.n_ctx = n_ctx;
+            c.n_ubatch = n_ubatch;
+            if (c.graph_width() == want) {
+                std::printf("[PASS] %s\n", name);
+            } else {
+                std::printf("[FAIL] %s\n  expected %d, got %d\n", name, want, c.graph_width());
+                ++failures;
+            }
+        };
+        const int cap = RunConfig::ubatch_auto_max;
+        width_is("0 under the bound follows the context", 4096, 0, 4096);
+        width_is("0 at the bound follows the context", cap, 0, cap);
+        width_is("0 past the bound stops at it", 32768, 0, cap);
+        width_is("a set width is kept", 32768, 512, 512);
+        width_is("a set width past the bound is the caller's", 32768, 16384, 16384);
+        width_is("a set width is never wider than the context", 2048, 4096, 2048);
+
+        // An image whose tokens must go in one pass: the default width is never under the most one
+        // image takes (graph_width_floor), and only where a projector is configured with a cap.
+        auto image_width_is = [](const char * name, const char * mmproj, int image_max, int n_ctx, int n_ubatch,
+                                 int want_floor, int want) {
+            RunConfig c = ok_base();
+            c.mmproj = mmproj;
+            c.image_max_tokens = image_max;
+            c.n_ctx = n_ctx;
+            c.n_ubatch = n_ubatch;
+            if (c.graph_width_floor() == want_floor && c.graph_width() == want) {
+                std::printf("[PASS] %s\n", name);
+            } else {
+                std::printf("[FAIL] %s\n  expected floor %d width %d, got %d %d\n", name, want_floor, want,
+                            c.graph_width_floor(), c.graph_width());
+                ++failures;
+            }
+        };
+        image_width_is("no projector: no image floor", "", 16384, 32768, 0, 0, cap);
+        image_width_is("a projector without a cap: no image floor", "p.gguf", 0, 32768, 0, 0, cap);
+        image_width_is("an image cap under the default width changes nothing", "p.gguf", 4096, 32768, 0, 4096, cap);
+        image_width_is("an image cap past the default width widens the default", "p.gguf", 12000, 32768, 0, 12000,
+                       12000);
+        image_width_is("the image floor never passes the context", "p.gguf", 20000, 16384, 0, 16384, 16384);
+        image_width_is("a set width stays the caller's under the image floor", "p.gguf", 12000, 32768, 1024, 12000,
+                       1024);
     }
 
     // Speculation: lossless only under greedy, and the draft width is bounded on both sides.

@@ -1,6 +1,6 @@
 # Measured planning: pricing the plan on the model itself
 
-> **Partly built.** This page describes where `--auto` goes next and in what order. Steps 1 to 4 are
+> **Partly built.** This page describes where `--auto` goes next and in what order. Steps 1 to 5 are
 > built and await their on-device judgement (their status is below each). Each step names what it
 > removes, what it must not break, and how it is judged. The planner as it stands is
 > [hardware-planning.md](hardware-planning.md).
@@ -24,8 +24,9 @@ model's own tensors rather than on stand-ins.
 | `--overlap` | measured on the first answer against the other setting, and kept (Step 2); without a place to keep it, never armed (#294) | with a verdict, yes |
 
 At the end of a run the plan prints its prediction against the measurement
-(`predicted 0.048 s/token, measured 0.055`) and the credited hit rate against the measured one. Then
-the comparison is thrown away: the next load plans from zero.
+(`predicted 0.048 s/token, measured 0.055`) and the credited hit rate against the measured one. The
+load also keeps what its decode cost, and the next plan of the same configuration prices decode with
+it (Step 5).
 
 The gaps are where the model was replaced by something simpler. A synthetic GEMV has the right quant
 format and none of the rest of the graph: no attention, no crossings between host and device, and
@@ -98,20 +99,28 @@ cache size moves, and the cache is lossless.
 
 **Status: built, judgement owed.** What landed, and how it was checked off the device:
 
-- The replay is `replay_lru` in `core/src/plan/routing.cpp` (`bmoe/routing.h`). On the three archived
-  phone traces it matches `scripts/route-replay.py`'s LRU row to the third decimal at five budgets each,
+- The replay is `replay_cache` in `core/src/plan/routing.cpp` (`bmoe/routing.h`), under the eviction
+  policy the run's cache uses (`cache_freq_half_life`; `replay_lru` is the same replay at half-life 0).
+  On the three archived phone traces the LRU replay matches `scripts/route-replay.py`'s LRU row to the third decimal at five budgets each,
   and at each run's own budget reproduces the hit rate the run recorded (74.9, 76.8, 32.4%); a test
   (`routing`) holds both. In the gates (`G2r`), the record a real streamed session kept replays to the
   hit rate that session's cache measured, prompt included and decode alone.
 - The record is kept by the session itself (`--routing-record`, default 256 decoded tokens and the
   prompt's last 256), from the ids the hook gathers for the cache anyway: no extra graph nodes, unlike
   `--route-trace`. It is one line per cache request, so a chunked prompt replays as the engine served
-  it rather than as one batch.
-- The front-ends keep it: `bmoe-cli --routing-dir DIR`, `bmoe-server` under `routing/` in its data
-  folder, one file per model named by a content fingerprint of the file (`model_fingerprint`). The
+  it rather than as one batch. Every MoE layer is sized from the file (`expert_bytes_per_layer`: each
+  expert tensor's size over its expert count), never from where the plan put it: the hook records
+  every layer's routing, and a record sized by the streamer named no bytes for the layers whose
+  experts sat on a device, which the reader refuses whole, so the next load planned with no curve.
+- The front-ends keep it the same way (`ModelRecords`, `bmoe/model_records.h`): in the per-user data
+  folder under `routing/` (`frontend::records_dir`), which `bmoe-cli --routing-dir DIR` can move or
+  `""` turn off, one file per model named by a content fingerprint of the file (`model_fingerprint`). The
   next plan of the file hands it back (`AutoPlanOptions::routing`) and `attach_routing` turns it into
   `ModelProfile::hit_curve`: `hit_share(bytes)`, monotone, over the whole expert set, absent unless
-  the record is this model at this top-k with enough decoded tokens.
+  the record is this model at this top-k with enough decoded tokens. The curve is 64 replays of the
+  record, paid on every plan of the file: 15-139 ms on a desktop core for the archived records of
+  64-128 decoded tokens, growing with the record. It stops replaying at the first size nothing was
+  evicted at, since every larger budget replays the same.
 - The cache then enters the ranking as pieces of the curve's concave hull, and is credited the curve
   at the size it gets, tagged `[measured on this model]`. The predicted-against-measured line sets
   that credit against the decode's own measured hit rate, the figure it prices.
@@ -122,12 +131,14 @@ cache size moves, and the cache is lossless.
   RAM and Qwen3.8-Flash-Next, the plan's 15.7 GB cache held 83% of the routed experts over 1024
   tokens and decoded 11.6 tok/s, where 22 GB held 96% and decoded 20.7 (27.5 over the last 256
   tokens).
-- **Not removed:** `cache_hit_optimism` and the linear credit stay as what a first load, with no
-  record yet, is priced with, and a plan without a record is byte for byte the plan before this step
-  (asserted in `planner`). They go when every front-end ships with a record for every model it
-  plans, which is not yet true on a first download.
-- The same record ranks the hottest (block, expert) pairs by use (`hottest_experts`), for Step 4's
-  device tier to warm from at start. Nothing reads it yet.
+- **A first load is priced on a prior, not the linear credit** (`prior_hit_curve`, `bmoe/routing.h`).
+  The replayed curves of five records agree once the cache is counted in token cycles (the bytes one
+  token routes through), so a model with no record is credited `0.92 x (1 - exp(-cycles / 2.25))`,
+  never under the share of the set it holds: within 0.04 on average of the decode hits thirteen first
+  loads measured, one model left out of the fit at a time, where the linear credit was off by 0.45.
+  The prior is a curve like a record's and takes the same path through the ranking and the price; the
+  plan says its hit rate is a prior (`cache-hits`) until a record replaces it. `cache_hit_optimism`
+  and the linear credit remain only for a model whose token cycle is unknown.
 
 Owed: the on-device runs this step is judged by (the reference machines and #321's desktop), each a
 first load to record and a second to plan from the record, with the predicted-against-measured line
@@ -164,11 +175,24 @@ output with the gates (`bmoe_moe_gates`), since every knob here is lossless.
   of `--trial-window` tokens (8) each, the first token after a switch untimed. A candidate's ratio in
   a round is its seconds per token over the mean of the two incumbent windows around it, so a drift
   that is linear over three windows cancels exactly; the verdict is the median of the ratios, and a
-  candidate wins only past `min_backend_win` (the same field the device rule reads). The `knob_trial`
+  candidate wins only past `min_backend_win` (the same field the device rule reads). A candidate
+  stops being measured once the rounds left cannot make it a winner: the median of three ratios is
+  past the margin as soon as two are, so two losing rounds settle it and the third leaves the
+  schedule, whatever the hardware (eight threads on a phone with four fast cores ran every window
+  at ten times the seconds per token, and three such rounds tripled the first answer); one stalled
+  round settles nothing, as before. One window settles a candidate that ran apart from the
+  incumbent: its fastest token slower than the incumbent's slowest token in the trial by more than
+  the incumbent's own range (slowest over fastest) and the margin. The bound is the noise the trial
+  measured, not a constant: a stall elsewhere slows some tokens of a window, not every one, and a
+  gap wider than any swing the incumbent has shown is the arm's own (on a 12 GB phone, eight threads
+  against four ran about 2 s a token against 0.1 s, and the median's second losing window was 18 s
+  of stutter). The cache brake does not read a token decoded under a candidate
+  ([pressure.md](pressure.md)). The `knob_trial`
   test holds it on synthetic timings: equal arms under 10% noise never win over 50 seeds, a 25% win
   always does, 5% is a tie, 12% wins, a run that slows to twice the time per token measures a 20%
   win as 20%, one stalled window does not overturn the median, a window cut by the end of a request
-  is dropped.
+  is dropped, a candidate twenty times slower stops after one window and leaves the schedule, a 5%
+  loss does not, and a loss inside the incumbent's own spread is left to the median.
 - **Which knobs switch live.** `--threads` through `llama_set_n_threads` (decode only; prefill keeps
   its count). `--overlap` too, by a change to the streamer rather than a reload: serial and overlapped
   reads differ only in whether the first read lane is the eval thread or a worker of its own, so the
@@ -185,9 +209,9 @@ output with the gates (`bmoe_moe_gates`), since every knob here is lossless.
   `Session::measured_knobs()` as each knob's verdict comes in. The front-ends keep it beside the
   model's routing record, one `.knobs` file per model fingerprint with a line per machine
   (`hardware_fingerprint`: cores, core classes, total memory, each device's name and own memory) and
-  engine version. `bmoe-cli --routing-dir DIR` arms the trial on its `--auto` plans and writes the
-  verdict; `bmoe-server` always does, under `routing/` in its data folder. `core/` gained no file
-  access and no environment read.
+  engine version. Every front-end arms the trial on its `--auto` plans and writes the verdict
+  (`ModelRecords`, in the folder the front-end names: the per-user data folder by default). `core/`
+  reads no environment.
 - **Read back.** `probe_and_plan` matches the record to this machine and engine
   (`AutoPlanOptions::knobs` into `ModelProfile::knobs`); the plan applies it, says
   `measured on this model` with the gain and the margin, and arms no trial. A plan with the feature
@@ -242,11 +266,26 @@ unchanged plan.
   every pass ends with a read of its result (a backend that queues work is timed on doing it, not on
   accepting it), and everything is freed on every path. It runs in the isolated child with the other
   device probes; the facts line is `v=2` and carries `expert=` and `dense=`.
-- **Correctness first.** Every backend computes the same bytes on the same inputs; a device whose
-  result at one token disagrees with the host's (llama.cpp's own NMSE bound) is refused for good
-  (`identity_ok = No`), and at 128 tokens it is not armed for the prefill. A node a device has no
-  kernel for is left out of its graph and priced at the host's rate for that half, where the
-  scheduler would run it.
+- **Correctness first.** Every backend computes the same bytes on the same inputs, and a device too
+  far from the right result at one token is refused for good (`identity_ok = No`); at 128 tokens it
+  is not armed for the prefill. The right result is computed: the compared nodes (the first decode
+  group, and the first four tokens at width) in double precision from the dequantized weights. A
+  device passes within twice llama.cpp's per-op NMSE bound of it (`k_max_nmse_device`, 1e-3) at one
+  token, and within 1e-2 at 128 tokens (`k_max_nmse_device_wide`, a bound that leans towards the
+  device): a backend runs the wide matmul with another kernel, whichever reference it is judged by
+  (the exact result, the host, or the synthetic matmul of a model with no readable layer). Metal on an
+  Apple M5 measured 2.4e-3 on OLMoE Q4_K_M's attention at width, a model whose prompt computed there lost what the models inside 1e-3 lost (KL 0.004 against the host,
+  perplexity 60.85 against 61.00), so that bound refused rounding. A prefill device is still
+  confirmed on the whole model at load.
+  Upstream's 5e-4 compares a backend with the CPU on random data, and upstream relaxes it where a
+  backend quantizes the activations its own way. RTX 3090 cards on GLM-4.5-Air's Q5_0/Q5_1 experts
+  measured 5.3e-4 from the exact result (the host 1.1e-5, every other layout 6e-6 or less), where a
+  wrong kernel is off by 1e-1 to 1. Judging a device by the host instead refused those cards for
+  rounding differently from the host. The host is the reference only where the exact result cannot be
+  computed (a type with no conversion to float), or where the host is not within `k_max_nmse` of it.
+  The plan's log line `real layer: <device> on the <half>: <e> from the exact result, the host <e>`
+  gives both distances. A node a device has no kernel for is left out of its graph and priced at the
+  host's rate for that half, where the scheduler would run it.
 - **The facts.** `expert_gibs` and `dense_gibs` per device and the host's `host_expert_gibs` and
   `host_dense_gibs`; `wide_matmul_gibs` is now the whole layer at 128 tokens. A rule comparing a host
   with a device reads both figures from the same experiment (`RatePair`): the real layer's where both
@@ -361,8 +400,21 @@ without a device of their own, an unchanged plan.
   layers' experts, so it inherited the fitter's granularity: the memory under one more whole layer was
   never used, and a card whose dense part fit with no whole layer beside it got no cache at all. The
   cache now takes those bytes plus what the fitter left free past its margin, per card, read in the
-  placement probe off the same free figure the fitter planned against; on several cards, the largest
-  budget whose share (llama.cpp splits it by layers) fits every card. Its floor is one token cycle,
+  placement probe off the same free figure the fitter planned against. On several cards the layers'
+  split and the budget are one decision (`device_tier_split`): llama.cpp hands each card a share of
+  the budget by the layers the split gives it, so the plan gives each card layers in proportion to its
+  room under the cache (what it had free, the experts the fitter put on it, its layers' dense part and
+  context), and the budget is what the tightest card takes its share of; from there one layer at a
+  time moves between cards while the budget grows. The fitter's split is kept where it gives the
+  larger budget. The split is contiguous, so it names the layers each card takes on and gives up, and
+  each is charged or credited its own dense bytes from the file (`ModelProfile::layer_dense_bytes`;
+  GLM-4.5-Air's layer 0 is twice the average) and the average context per layer. Where the per-layer
+  bytes are not known, a layer a card takes on is charged the file's largest dense layer, since it is
+  loaded before any cache is made and a load past a card's memory has nothing to fall back on, and a
+  layer it gives up is credited the average, since a cache past a card's memory is made smaller by
+  the session. The context is uniform per layer here, which a sliding-window or hybrid model's is not. Left as the fitter made it, the split followed whole layers: on two
+  rented 16 GB cards with DeepSeek-V4-Flash, 6 layers on the first card (all its whole layers) and 38
+  on the second, the first card was handed 6/44 of the budget and 10 GB of it stayed empty. Its floor is one token cycle,
   the RAM cache's floor for the same reason; under it, the fitter's placement stands. llama.cpp's
   cache is an SLRU and the replayed hit curve an LRU's, so the plan's share for it is an estimate.
 - **Why not a price.** The first version priced the two per token (the split's host layers at the
@@ -373,6 +425,42 @@ without a device of their own, an unchanged plan.
   price that can be wrong by half on the one comparison it exists for is a coefficient, not a fact.
   A layer split by capacity waits for the host on every token wherever the device is the faster
   processor; that part needs no price.
+- **Priced, then kept by what the loads measure.** The rule is necessary and not sufficient: every
+  miss of the cache crosses the link before the device computes it. On two 24 GB cards over PCIe 3
+  with GLM-4.7 (355B, 32B active), the cache held a tenth of the experts, misses went up at 4.5 GB/s,
+  and decode was 1.6 tok/s where the fitter's placement did 3.9. A device cache is fixed when a
+  context is created, so the two sides cannot alternate inside one answer as the knob trial's do. So
+  both are priced from the rates this machine probed: the cache as every other byte a token reads at
+  the device's dense rate, its hits at the device's expert rate and each miss uploaded and then
+  computed, at the hit share a cache that size reaches (`device_cache_decode_seconds`); the fitter's
+  placement from its ceiling, the experts it left on the host at the host's rate and everything else
+  on the devices, with no miss to pay (`fitter_decode_ceiling`), at the part of it such a placement
+  was measured to reach (`fitter_ceiling_realized`, a half: six loads that ran the placement after
+  its ceiling was computed decoded at 0.17 to 0.81 of it, and at the whole ceiling a 32 GB card's
+  second load left a cache measured at 102 tok/s for a placement that decoded at 46). The load serves the side priced
+  faster and times its own decode as it serves (`KnobTrialConfig::device_tier`, a `RateProbe` after
+  the knobs' trials: the median of `2 * rounds + 1` windows, after the longest settle the trial
+  makes, since a device cache fills out of the session's counters). A side measured stands at its
+  measurement (`MeasuredKnobs::device_cache_tps`, `no_device_cache_tps`), and the other takes over
+  only where its price, or its own measurement, is past that by `min_backend_win`; the cache holds
+  inside it.
+- **The one side decided inside its first load**: where a model held in memory can run on a device
+  that reads the host's memory, the load that opens it there already decodes it on the device and on
+  the cores to compare their answers, so it times both and keeps the faster
+  ([hardware-planning.md](hardware-planning.md#a-model-held-in-memory-on-a-device-that-shares-it)).
+  Measured on a 16 GB unified-memory laptop, a 4.3 GiB model: 3.4 s for the comparison and the
+  timing, 37.6 tok/s on the GPU against 23.9 on the cores at the plan's thread count, and the rate
+  the check read for the side that served was the rate the answer then decoded at (37.6).
+- **No load is opened to try a side.** A side tried on a served load cost that session its rate: on
+  a 12 GB card with Qwen3.6-35B the cache decoded at 73.5 tok/s, and the second load then decoded a
+  whole session at 37.8 to time a placement whose ceiling was 55. Timing both sides as short loads
+  before the first answer instead cost the first load minutes
+  ([below](#decisions-fixed-at-load-priced-served-then-measured)). So a side is served only where
+  the figures say it wins: there the fitter's ceiling is under the cache's measured rate, and the
+  cache stays. On GLM-4.7 over PCIe 3 (cache 1.6 tok/s, ceiling above it) the next load serves the
+  fitter's placement, which won. The front-end merges each load's side into the record it keeps for
+  the model and machine. Gate G25e runs both sides on the loopback device, byte-identical, with a
+  rate in the record.
 - **Not done.** The double reads stay, measured rather than removed: on a model that fits the host,
   the experts are resident and nothing is read. Pipeline parallelism on several devices is not
   weighed. A warm start of the device cache from the record's hottest experts is not built: the first
@@ -385,6 +473,195 @@ without a device of their own, an unchanged plan.
   prefill there: 650 tok/s on a 1516-token prompt against 1134 for the whole layers, which the plan
   does not price yet. The rule above, which arms the cache from the first load, is not yet run on a
   card.
+
+## Step 5: the decode's own cost, the coefficient a run's counters correct
+
+- **What it removes:** a decode price that never learns. The ledger prices a token's compute from a
+  probed matmul rate (`seconds_at_gibs(bytes_per_token, host rate)` per group) and the cache's hits
+  from the routing replay or the prior, and a one-token decode pays what neither sees:
+  per-op and thread-synchronisation costs, and a cache that serves less than the replay of a few
+  hundred tokens did. Measured on a 12 GB phone with Ling-3.0-tiny Q8_0, `--auto` through
+  `bmoe-server`: predicted 0.037 s/token at a 95% credited hit rate, measured 0.107 at 77-85%, the
+  per-token CSV's `compute_ms` alone ~64 ms; after the run the prediction was still 0.037. A 16 GB
+  Mac predicted 0.073 against 0.054 measured, a Windows PC 0.18 against 0.21: the error has no sign a
+  rule could fix.
+- **What is recorded.** Every load times its decode with a `RateProbe`, the trial's own windows
+  (`--trial-window` tokens, `2 * rounds + 1` of them, their median), once the cache has settled and
+  after any knob trial, so no switch is in its windows; it switches nothing, so it runs on loads that
+  arm no trial too. It keeps, in `MeasuredKnobs`: `decode_compute_s`, the median window's compute
+  per token (the wall less the flash waits and the cache's management, the CSV's `compute_ms`);
+  `decode_threads`, the count it ran at; `decode_hit`, the cache's hits over the same windows, at
+  `decode_cache_mib`, the host cache's budget then; and the placement, `decode_gpu_layers` and
+  `decode_device_cache_mb`. They are keys of the same `bmoe-measured-knobs 1` line, which an older
+  engine reads past and which, missing, read as not measured. A later load's figure replaces the
+  whole measurement, never half of it, and it counts in `verdicts()`, so the front-end keeps it.
+- **How the plan uses it** (`planner.cpp`, `calibrate_decode_cost`). Only for the configuration it
+  was measured under: the plan's decode thread count (the one `choose_threads` will settle on) and the
+  same placement on the devices; otherwise a `decode-cost` decision says the decode is priced from
+  the probes and why. Compute: the ratio between the measured compute and what the cost model prices
+  the same placement at (`host_compute_seconds`) scales every group's compute term alike
+  (`AllocationInputs::compute_scale`), so the predicted token moves to the measurement, the groups
+  keep their prices relative to each other, and the ranking, whose savings are reads, decides what it
+  decided. Hits: the ratio between the hits measured at that budget and the credit there scales the
+  credit at every size (`AllocationInputs::hit_scale`): the curve, lowered toward the measurement and
+  never raised past what the replay justified; the prior, which is no measurement of this model,
+  either way. A cache whose hits are worth less may then be sized differently, which is the ranking's
+  legitimate answer to a changed price. A `decode-cost` decision, `[measured]`, states both figures
+  against the predicted ones. With no record, or one that measured no decode, the plan is byte for
+  byte the one before this existed.
+- **Checked:** planner checks (a compute three times the model's adds twice the model's compute to
+  the token and is reported as measured; another thread count or placement is not used; hits scale
+  the prior and the curve, never above the replay; an empty record leaves the plan as it is);
+  record round-trip checks in the `knob_trial` test; gate G24d, a streamed decode with no trial whose
+  answer is the resident one and whose record carries the decode's cost.
+- **Not done.** The read rate is not calibrated: the expert lane's price stays the storage probe's,
+  so where the flash waits are what the plan got wrong this does not correct it. A load that runs the
+  plan `bmoe-server` holds keeps that plan on `GET /api/plan` until the next measurement or load.
+- **Status:** built, host-checked; the phone run that judges it is owed.
+
+**The request mix.** The same record also keeps how the machine is used, on every load and whatever
+the plan armed: per request, over the requests of the last load that served any, `mix_gen_tokens`
+decoded and `mix_wide_prompt_tokens` prefilled (after reuse) in prompts at least as wide as the
+narrowest graph a device is handed (`--prefill-min-tokens`), the part a prefill device would take;
+`mix_requests` counts them, and `host_prefill_tps` is the host's rate over those prompts where the
+host ran them. A later load that served requests replaces the mix whole (a front-end hands on a
+load's record each time it grows, so its figures are already that load's means), and keeps the host
+rate an earlier load measured where its own long prompts all ran on a device. They are later keys of
+the same line: a record written before reads as nothing recorded. The plan prices one trade by them,
+a prefill device whose room takes the expert cache away ([hardware-planning.md](hardware-planning.md),
+the prefill plan); with nothing recorded it decides as it did before. Checked: record round-trip and
+merge checks in the `knob_trial` test, planner checks for both outcomes and for the unpriced one,
+and gate G24e (a load's record carries its one request).
+
+## Decisions fixed at load: priced, served, then measured
+
+Some decisions are fixed when the model or its context is created, so one load cannot try both
+sides: the device tier (a cache of experts on the card, or the capacity fitter's whole layers:
+`MeasuredKnobs::device_cache_tps`, `no_device_cache_tps`), the graph width where even a graph held
+to the device bound (`ubatch_max_device`) takes more of the card's memory than its share, memory the
+experts would use (`width_narrow` and its rates,
+[hardware-planning.md](hardware-planning.md#the-widest-graph)), and where a model held in memory runs
+on a machine whose device reads that same memory, on the cores or every layer on the device
+(`shared_device_tps`, `no_shared_device_tps`,
+[hardware-planning.md](hardware-planning.md#a-model-held-in-memory-on-a-device-that-shares-it)).
+
+That last move also carries a word that is not a rate: whether the model's answers on the device
+matched the cores' (`MeasuredKnobs::device_answers`, `device_answer=<device>:<confirmed|differs>`, one
+word per device). The load that moves the model compares them before it serves and reopens on the
+cores where they differ; a plan made on the record keeps the model off a device that differed and
+does not ask a confirmed one to be compared again. A new engine starts a new record and compares
+again.
+
+Two ways of settling them by timing were built and withdrawn:
+
+- **Timed across served loads**, one side a load. Each side cost a whole session of a person's use
+  at whatever rate it decoded: on rented cards a model's second load decoded at 37 tok/s instead of
+  68 on a 12 GB card, and at 35 instead of 84 on a 32 GB one.
+- **Timed before the first answer**, each side opened as a short candidate load of its own and the
+  winner served (a load-time calibration). Each candidate reopened the model, which on a model
+  larger than memory is most of a load: Qwen3.8-Flash-Next Q2_0 on two 16 GB cards was ready after
+  609 s against 126 s without it (four candidates of ~140 s: ~62 s evening the file cache, ~70 s
+  opening, 3-8 s timing), DeepSeek-V4 UD-IQ2_M after 1094 s against 252 s. It also mislabelled a
+  candidate that named two decisions at once (a narrow graph with a CPU share, filed as the narrow
+  width), after which a 12 GB card served a 2048-token graph on a claim that the full width had
+  failed, and lost 28% of a 4.6k-token prompt's prefill.
+
+**What the plan does instead.** It decides by calculation from the facts the load already probed,
+serves the side it prices faster, and lets the served load time that side:
+
+- **Each side has a price.** The device tier's are in Step 4. The graph width's is a request's time
+  at each width: its decoded tokens at the decode each width leaves (the narrower buffers' room goes
+  to the device cache, or to the experts the fitter places on the card), and its prompt at the
+  device's prompt-wide rate plus, per pass, the upload of the experts that are not on the device
+  (`prompt_gather_seconds`), which a narrower graph pays once per pass. The shared-memory device's is
+  the same request at the rates each processor probed on a real layer of the model, one token wide
+  and as wide as a prompt.
+- **A request is this machine's own, weighed with a default.** The prompt tokens prefilled and the
+  tokens decoded per request are recorded on every load that answers one (`MeasuredKnobs::mix_*`),
+  and weighed with `PlannerPolicy::mix_prompt_tokens_default` against `mix_gen_tokens_default` (4096
+  and 300) counted as `mix_prior_requests` requests (16), which is all a first load has
+  (`request_mix`). A record is the last session's alone: on two 16 GB cards four requests, one of
+  them 4.6k tokens long, read alone as 1181 prompt tokens and the next load's three short ones as
+  34, and the graph went narrow. A request's passes at a width are counted from its long prompts'
+  tokens (`usage_long_prompt_tokens`), a prompt of l tokens taking about l / w + 1/2 of them, since
+  the mean prompt hides them: 1181 tokens fit one pass, the 4.6k-token prompt behind that mean
+  takes three. On the decode alone, as the width was decided before, a narrow graph won wherever it
+  decoded faster: +40% decode and -40% on a 4.6k-token prompt on an 8 GB card, -28% on a 12 GB one,
+  -47% on two 16 GB cards with a 284B model.
+- **A side that streams pays for flash in its price.** Both sides' prices above are compute. Where
+  the experts a placement leaves on the host do not fit its memory, a token also reads from flash
+  the routed bytes neither the host's RAM cache nor a device cache serves, at the rate this storage
+  measured at the model's slice size (`host_expert_flash_seconds`), and that is added to the side it
+  belongs to. Priced without it, an 8 GB card with a model twice the host's memory served the
+  fitter's placement for a load at 3.5 tok/s where its price said 11.
+- **A served load measures.** The plan names the side it serves (`KnobTrialConfig::device_tier`,
+  `width_side`, `shared_device_side`) where that side has no decode rate yet, and the session times
+  it once the knob trials have their verdicts and files it with one mapping (`record_side_rate`).
+  The probe's windows are a few dozen tokens early in the first answer, so the figure kept is then
+  replaced, at the end of every turn, by what the load decoded at over all its turns. The windows
+  alone compared a side timed after a knob trial with one timed from the first token on a cold
+  cache: on two 16 GB cards with a 284B model the fitter's placement was timed at 2.27 tok/s on a
+  load whose answers decoded at 4.1 and 6.5, against a device cache timed at 3.17 on a load that
+  decoded at 2.8 and 3.6, and the plan kept the slower side (as 0.42 did on the same machine).
+  One decision's rate a load, the device tier's first. A measured side stands at its measurement; a
+  width measured on one side scales both widths' prices by how far that side ran from it, so the
+  ratio between them stays the price's until both are measured.
+- **The side in force holds inside the margin.** The other side takes over only where it is faster
+  by `min_backend_win`, on its price or its measurement, so the same figures weighed again do not
+  swing a decision from one load to the next (`width_held` records the width a load ran).
+- **A side that cannot be opened.** A load whose side fails to open opens the plan's other side in
+  its place (`EngineHost::OpenFallback`) and the failure is counted against the side
+  (`MeasuredKnobs::*_unviable`). One failure may be the machine's moment (another program holding
+  the card's memory, a driver's hiccup): the plan may name the side once more, the other still
+  behind it. At `MeasuredKnobs::unviable_max` (two) the side loses in every plan made on the record.
+  A rate measured for the side clears the count, and a new engine version starts a new record.
+- **The device cache's CPU share is a person's setting.** It is fixed when the context is created,
+  and no price of it held: where the cache never fills, llama.cpp computes no miss on the host and
+  every MoE layer's host half is pure cost (114 to 68 tok/s on a 32 GB card at a share priced 0.89,
+  18.5 to 21.2 on a 12 GB card at 0.77). Deciding it took a load of its own for each side, so the
+  plan uploads every miss and names the flag.
+
+What can be switched inside a load is still tried on the served answer: the decode thread count and
+overlap (Step 2).
+
+**Limits.** A price can be wrong, and a side it wrongly puts ahead by the margin is served for one
+load before its measurement corrects it. The prompt's price takes every pass to gather every expert
+that is off the device, which is what three rented cards measured on 2048-token passes; a much
+narrower pass routes fewer. Owed: a run on a card of each class with the first load's time to ready,
+the second load's decode against the first's, and a long prompt's prefill at the width served.
+
+### A prefill device that did not hold up for a model
+
+The plan arms a prefill device on a probe graph and a matmul of the model's own format; the session
+then checks it on the model itself (`PrefillDeviceConfig::verify`, a short prefill on the host and
+on the device, compared row by row) and hands it back where the two disagree. Measured on a 12 GB
+phone: an NPU that passed the probe picked the host's next token in only 25 of 31 positions on
+Gemma 4 26B-A4B, and, with that backend's host buffer on, never returned from the model's first
+layer, so the load never finished; on Qwen3.6 the same NPU agreed in every position and prefilled
+1906 tokens at 139 tok/s against the cores' 12. The cause is the backend's: its expert matmul is exact
+until a value passes the fp16 range and returns infinities past it, and Gemma's activations are known
+to reach that far in a few channels (ggml-org/llama.cpp#32198). The check's line gives the KL divergence
+of the device's next-token distributions from the host's beside the agreement: 0.004 mean for Qwen3.6,
+rounding, against 0.60 for Gemma with one row at 13.5. So what came of the device is kept in the model's
+record, one word per device, scoped like every other measurement to this machine and engine
+(`prefill=<device>:<word>[,...]`), so a second device's word never clears the first's:
+
+- `kept`: the session opened with it. The next plan arms it as before.
+- `refused`: its check on this model refused it. No plan arms it again for the model; another
+  device that measures faster than the host still can.
+- `unconfirmed` (`unconfirmed-<n>` past one): a front-end writes it before opening a session that
+  arms the device, and the session's word replaces it once open, so only a load that never got that
+  far leaves it; a session that could not open the device (an allocation, which another program
+  holding the card's memory for a moment can fail) counts as one more such load, not as a refusal.
+  One may be a person closing the app mid-load, so the device is tried again; after
+  `MeasuredKnobs::prefill_unconfirmed_max` (two) in a row it is kept out like a refused one.
+
+The server and the CLI (a one-shot run too, through `RunOutputs::on_open`) write the word as soon as
+the session has opened, not after the first answer. A new engine version starts a new record, and tries the device again. Tested by
+`knob_trial_test` (the record) and `planner_test` (a device not kept is not armed; one kept is; a word
+about another device leaves this one alone); on a 16 GB Apple-silicon laptop, two loads killed while
+opening left `MTL0:unconfirmed` 1 then 2, the plan armed Metal after the first and not after the
+second, and a load that finished wrote `MTL0:kept`.
 
 ## What the planner looks like afterwards
 

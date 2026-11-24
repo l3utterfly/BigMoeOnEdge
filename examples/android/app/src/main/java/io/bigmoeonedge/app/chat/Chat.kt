@@ -31,7 +31,14 @@ data class ChatUi(
     val errorCode: String = "",
     /** The server answered the conversation routes with 404: a build without them. */
     val unsupported: Boolean = false,
+    /** How each finished answer ran, by its item id: the engine's `done` summary, held while the app runs. */
+    val figures: Map<String, TurnSummary> = emptyMap(),
+    /** A new chat's system prompt, sent when its first message makes the conversation. */
+    val draftSystem: String = "",
 ) {
+    /** The system prompt the person set: the open conversation's, else the new chat's. */
+    val system get() = open?.system ?: draftSystem
+
     /** An answer is being written in the open conversation: Stop instead of Send. */
     val running get() = open?.busy == true || items.any { it.streaming }
 }
@@ -83,6 +90,19 @@ object Chat {
         }
     }
 
+    /**
+     * A turn ended (the engine's `done` event, with the context the model has): its figures belong
+     * to the open conversation's newest answer. A choice among options runs outside the conversation
+     * and keeps its own figures.
+     */
+    fun onTurnDone(summary: JSONObject, nCtx: Int, choosing: Boolean) {
+        if (choosing) return
+        _state.update { s ->
+            val answer = s.items.lastOrNull { it.kind == ChatItem.KIND_ASSISTANT }
+            if (s.open == null || answer == null) s else s.copy(figures = s.figures + (answer.id to TurnSummary(summary, nCtx)))
+        }
+    }
+
     // ── conversations ──
 
     suspend fun refreshConversations() = withContext(Dispatchers.IO) {
@@ -104,13 +124,43 @@ object Chat {
             migrated = true
             return
         }
-        val r = Migration.run(StoreConversations(ConversationStore(dir)), Engine.api())
+        // A stop between the server coming up and this leaves no client: tried again on the next start.
+        val api = runCatching { Engine.api() }.getOrNull() ?: return
+        val r = Migration.run(StoreConversations(ConversationStore(dir)), api)
         if (r.error == null) migrated = true
         if (r.kept == 0 && r.error == null) dir.listFiles()?.isEmpty()?.let { empty -> if (empty) dir.delete() }
     }
 
     fun newConversation() {
-        _state.update { it.copy(open = null, items = emptyList(), error = null, errorCode = "") }
+        // A system prompt is the conversation's own: a new chat starts without one, as llama.cpp's web UI does.
+        _state.update { it.copy(open = null, items = emptyList(), error = null, errorCode = "", draftSystem = "") }
+    }
+
+    /**
+     * The person's own system prompt for the open conversation, or for the new chat until its first
+     * message. [onDone] hears whether it was kept (the error card says why when it was not).
+     */
+    fun setSystem(text: String, onDone: (Boolean) -> Unit = {}) {
+        val id = _state.value.open?.id
+        if (id == null) {
+            _state.update { it.copy(draftSystem = text) }
+            onDone(true)
+            return
+        }
+        scope.launch {
+            catching { ConversationSummary.of(Engine.api().patchConversation(id, JSONObject().put("system", text))) }.onSuccess { c ->
+                _state.update { s ->
+                    s.copy(
+                        open = if (s.open?.id == id) c else s.open,
+                        conversations = s.conversations.map { if (it.id == id) c else it },
+                    )
+                }
+                onDone(true)
+            }.onFailure {
+                fail(it)
+                onDone(false)
+            }
+        }
     }
 
     fun open(id: String) {
@@ -168,44 +218,59 @@ object Chat {
         return false
     }
 
-    /** Send [text] to the open conversation, making it first when this is a new chat. */
-    fun send(text: String) {
+    /**
+     * Send [text], with [images] (data URLs) when there are any, to the open conversation, making it
+     * first when this is a new chat. [onDone] hears whether the server took it, so the composer can
+     * put back what it was asked to send when it did not (the error card says why).
+     */
+    fun send(text: String, images: List<String> = emptyList(), onDone: (Boolean) -> Unit = {}) {
         val prompt = text.trim()
         val s = _state.value
-        if (prompt.isEmpty() || s.sending || s.running || !canSend()) return
+        if ((prompt.isEmpty() && images.isEmpty()) || s.sending || s.running || !canSend()) {
+            onDone(false)
+            return
+        }
         _state.update { it.copy(sending = true, error = null, errorCode = "") }
         scope.launch {
             try {
                 val api = Engine.api()
                 var open = _state.value.open
                 if (open == null) {
-                    open = ConversationSummary.of(api.createConversation(JSONObject().put("title", Conversation.titleFor(prompt))))
+                    val body = JSONObject().put("title", Conversation.titleFor(prompt))
+                    if (_state.value.draftSystem.isNotEmpty()) body.put("system", _state.value.draftSystem)
+                    open = ConversationSummary.of(api.createConversation(body))
                     val made = open
-                    _state.update { it.copy(open = made, items = emptyList(), conversations = listOf(made) + it.conversations.filter { c -> c.id != made.id }) }
+                    _state.update { it.copy(open = made, items = emptyList(), draftSystem = "", conversations = listOf(made) + it.conversations.filter { c -> c.id != made.id }) }
                 }
-                val r = api.sendMessage(open.id, prompt)
+                val r = api.sendMessage(open.id, prompt, images)
                 r.optJSONObject("item")?.let { o -> _state.update { it.copy(items = ItemReducer.upsert(it.items, ChatItem.of(o))) } }
                 _state.update { it.copy(sending = false) }
+                onDone(true)
             } catch (t: Throwable) {
                 fail(t)
                 _state.update { it.copy(sending = false) }
+                onDone(false)
             }
         }
     }
 
-    /** Drop [item] (the person's message) and everything after it, then send [text] in its place. */
-    fun editAndResend(item: String, text: String) {
+    /**
+     * Drop [item] (the person's message) and everything after it, then send [text] in its place,
+     * with [images]: the ones it carried, unchanged, since an edit changes what was asked and not
+     * what was shown.
+     */
+    fun editAndResend(item: String, text: String, images: List<String> = emptyList()) {
         val open = _state.value.open ?: return
-        val t = text.trim().ifEmpty { return }
-        if (_state.value.running || !canSend()) return
+        val t = text.trim()
+        if ((t.isEmpty() && images.isEmpty()) || _state.value.running || !canSend()) return
         _state.update { s -> s.copy(items = ItemReducer.before(s.items, item), error = null, errorCode = "") }
-        scope.launch { catching { Engine.api().editMessage(open.id, item, t) }.onFailure { fail(it); reopen(open.id) } }
+        scope.launch { catching { Engine.api().editMessage(open.id, item, t, images) }.onFailure { fail(it); reopen(open.id) } }
     }
 
-    /** Answer again: the last question, resent as it was, as the web UI does. */
+    /** Answer again: the last question, resent as it was, images included, as the web UI does. */
     fun answerAgain() {
         val last = ItemReducer.lastUser(_state.value.items) ?: return
-        editAndResend(last.id, last.text)
+        editAndResend(last.id, last.text, last.images)
     }
 
     fun stop() {

@@ -480,6 +480,9 @@ predicts 2.9 tok/s. Two chat turns measured **3.0 and 2.6 tok/s** (147 and 211 t
 12 GB Android phone because of the per-app memory limit: with a smaller cache, more experts are
 read from flash on each token.
 
+The same contributor's `--auto` harness run on 0.42.0, on the same iPhone and model, measured
+**5.56 tok/s** (#574): the README's iPhone row.
+
 ### Desktop
 
 Measured on fewer machines than the phone. The Windows table below is a configuration set by hand
@@ -505,6 +508,14 @@ On a 16 GB Apple-silicon laptop, the same model at a 16384 context with `--auto`
 22.4 tok/s, and a 10850-token prompt prefilled in 31.8 s. One machine. Qwen3-Coder-30B-A3B (18.6 GB)
 on the same laptop: 23 tok/s, and 7-9 inside opencode.
 
+A whole agent session on that laptop, from the released 0.40.1 archive: opencode, one prompt (a
+voxel pagoda garden as one HTML page), Qwen3.6-35B-A3B streamed with `bmoe-server -c 65536` and no
+other flag. 23 min 46 s from prompt to the last answer, with no human input: one 11k-token prefill
+at 325 tok/s, then turns that re-sent only 21-23 new tokens, and a 10 400-token file write decoded
+at 8.6 tok/s with an 86 % cache hit. That run differs from the 22.4 tok/s above in a 64k context, in
+answers 11-22k tokens deep, and in 10 GB free at load
+([bench-data/2026-11-07-agent-pagoda](bench-data/2026-11-07-agent-pagoda/README.md)).
+
 If the model fits in RAM, just run it resident.
 
 #### A discrete GPU
@@ -519,6 +530,41 @@ greedy tokens ([bench-data/2026-10-26-rented-gpu](bench-data/2026-10-26-rented-g
 | Qwen3.8-Flash-Next 125B Q2_0 (66 GB, 32 GB of experts) | experts in RAM, the 18 GB used most cached on the card | **70** |
 | DeepSeek V4 Flash 0731 UD-IQ2_M (85 GB of experts) | streamed from the drive: 66 GB cache in RAM, 13 GB on the card, 94% hits | **9.3** |
 
+On a rented 24 GB card of the generation before (RTX 3090 class, 20 cores, 94 GB of RAM), on
+2026-11-10, the 0.41.0 release candidate with `--auto` and `--ctx-size 40960`
+([bench-data/2026-11-10-same-card-lucebox](bench-data/2026-11-10-same-card-lucebox/README.md)):
+Qwen3.6-35B-A3B decoded at **135** tok/s with the whole model on the card, and a 28.6k-token prompt
+reached its first token in 5.3 s (5,435 tok/s), then decoded at 109. With 12 GiB of the card left
+free, the size of a 12 GB card, it decoded at **75-81**, every layer on the card and a 5.2 GiB cache
+of the experts used most, once #531 narrows the graph there (before it: 0 layers on the card, 12.5
+tok/s). Gemma 4 26B-A4B decoded at **107-115**. The same runs put Lucebox on the same card and files:
+see [comparison.md](comparison.md#same-machine-same-file).
+
+On another rented 24 GB card of that generation (an 8-core desktop CPU, 62 GB of RAM), on
+2026-11-11, the 0.41.2 release with `--auto` and `--ctx-size 40960`, second load
+([bench-data/2026-11-11-same-card-lucebox](bench-data/2026-11-11-same-card-lucebox/README.md)):
+- Qwen3.6-35B-A3B decoded at **154** tok/s with the whole model on the card, and a 28.6k-token
+  prompt reached its first token in 4.7 s (6,025 tok/s);
+- Laguna XS 2.1 33B Q4_K_M decoded at **93**.
+
+On 2026-11-13 a rented 12 GB card (RTX 3060 class, a 15-core quota of a Zen 2 server CPU, 47 GB of
+RAM) ran the 0.42.0 release with `--auto` on Qwen3.6-35B-A3B UD-Q4_K_XL (Unsloth, with its MTP head):
+**40-44** tok/s over four loads, **57-65** with `--mtp`; Strata on the same box and file decoded at
+28-36 ([comparison.md](comparison.md#same-machine-same-file),
+[bench-data/2026-11-13-same-card-strata-12gb](bench-data/2026-11-13-same-card-strata-12gb/README.md)).
+
+On 2026-11-14 the 0.43.0 release ran with `--auto` and a 16384 context on two more rented machines
+([bench-data/2026-11-14-rented-0.43](bench-data/2026-11-14-rented-0.43/README.md)):
+- an 8 GB card (RTX 3070 class, a 6-core desktop CPU, 31 GB of RAM):
+  - Qwen3.6-35B-A3B decoded at **37** tok/s through the server and **40-44** through the CLI. Its
+    experts were in RAM, with the ones used most cached on the card. A 4.7k-token prompt reached its
+    first token in 5.3 s (873 tok/s).
+  - Qwen3.8-Flash-Next Q2_0 (66 GB, twice the RAM) streamed from the drive at **16**.
+- two 16 GB cards (RTX 5060 Ti class, an 8-core desktop CPU, 60 GB of RAM):
+  - Qwen3.8-Flash-Next Q2_0 decoded at **41-48**, every layer on the cards with an 18.5 GB device
+    cache.
+  - DeepSeek V4 Flash UD-IQ2_M (91 GB) streamed at **5**.
+
 And on a rented 12 GB card (RTX 3060 class, 7.7 usable cores, a 42.6 GiB control group), the class
 most people own, Qwen3.8-Flash-Next Q2_0: `--auto` armed a 6 GB device cache and the run was killed
 by the control group at 43 GB (the tier's host-side memory is not in the ledger, #424); with the
@@ -526,6 +572,24 @@ tier pinned off the fitter put 6 GB of experts on the card and the rest resident
 **15.5 tok/s**, and the MTP head drafting on those cores cost more than it saved (9.9 effective).
 Strata quotes 94 tok/s on this class with its experts and its drafting on the card: that gap is the
 work in front of the planner, not a ceiling of the card.
+
+On 2026-11-09 the server's own plan (16384 context) was measured on three rented cards
+([bench-data/2026-11-09-graph-width](bench-data/2026-11-09-graph-width/README.md)). On a 12 GB card
+(RTX 3060 class) a graph as wide as the context took 6.6 GB of the card and left no room for the
+device cache: Qwen3.8-Flash-Next Q2_0 decoded at **13 tok/s**, and at **33-36** once the width was
+priced against the card. On a 24 GB card (RTX 3090 class) the fix leaves Flash-Next as it was (61-73
+tok/s, 1560-1734 tok/s of prefill on a 9.7k prompt), and fits Qwen3.6-35B on the card whole: **156
+tok/s** instead of 129-139, prefill 5604 instead of 4789. On a 16 GB card with 23 GB of RAM, where
+Flash-Next streams from flash behind a 4.1 GB device cache and a 20.8 GB RAM cache, it decodes at
+18-29 tok/s with every build. #505's cache policy adds 18% to a long prompt's prefill (374 to
+441-444), alone and with #523.
+
+On 2026-11-09 a rented 12 GB card (RTX 3060 class) with a 120.7 GiB control group ran the published
+v0.40.2 Linux archive on Qwen3.8-Flash-Next IQ3_S: `--auto` kept the model resident, cached 5.3 GB
+of the experts used most on the card (68% hits) and decoded at **16.0-17.5 tok/s**. Without the CUDA
+pack, or with it extracted next to the archive's folder rather than inside it, the same release
+ran on the CPU at 1.6-2.9 tok/s
+([bench-data/2026-11-09-rented-12gb-cuda-pack](bench-data/2026-11-09-rented-12gb-cuda-pack/README.md)).
 
 On a rented 16 GB card with 30 GiB of RAM (a 6-core desktop CPU, NVMe at 2.2 GB/s), the class of a
 home PC with a mid-range card, Qwen3.8-Flash-Next Q2_0 streams: `--auto` put the dense part and a

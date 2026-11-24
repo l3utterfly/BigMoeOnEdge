@@ -209,6 +209,15 @@ struct ComputeDevice {
     // each leg waited for, half of the round trip per crossing. See core/src/plan/device_probe.cpp.
     double split_seconds = 0.0;
 
+    // What a host half costs a layer of this device's graph, in seconds, 0 when unmeasured: a device
+    // op, a host op at the decode's thread count, and a device op again, run through the scheduler as
+    // a decode runs them, less the same ops all on the device. It is what a device cache's CPU share
+    // adds to every MoE layer whatever the share computes (planner.cpp, choose_device_cache_cpu_share),
+    // and `split_seconds` does not see it: a copy timed on its own misses the host's thread pool waking
+    // and the device's graph being cut. Measured on a 32 GB card: a share took a 48-layer decode graph
+    // from 50 to 146 splits, about 58 us each, where the copy alone read 11 us.
+    double host_hop_seconds = 0.0;
+
     // Boundary crossings this device adds to ONE token's graph, 0 when unmeasured (no probe fills
     // it today; it is kept for the record and the facts line). It is the term
     // that decides an offload in practice and the one a bandwidth figure cannot see. Two measured
@@ -342,6 +351,11 @@ struct HardwareProfile {
     uint64_t lock_in_place_bytes = 0;
     bool lock_in_place_bytes_known = true;
 
+    // Whether the process can hand memory to the kernel to DROP under pressure, rather than swap
+    // (pio::vm_offer). Where it can, the expert cache is offered instead of locked, so neither it
+    // nor anything it would have pushed out is written to the drive.
+    bool discardable_memory = false;
+
     // ── compute ─────────────────────────────────────────────────────────────────────
     uint32_t n_cores = 0; // 0 when unknown
 
@@ -357,6 +371,16 @@ struct HardwareProfile {
     // many threads a machine wants is a property of that machine, and the honest way to have it is
     // to ask the machine.
     uint32_t best_threads = 0;
+
+    // Every rung of that sweep, at the rate it reached: the counts the machine was asked about and
+    // its answer for each, empty when unmeasured. A count past `best_threads` whose rate is here was
+    // asked and lost, with every core left to it; the knob trial does not ask it again under a
+    // decode, where the expert reads take cores of their own (planner.cpp, thread_candidates).
+    struct ThreadRate {
+        uint32_t threads = 0;
+        double gibs = 0.0;
+    };
+    std::vector<ThreadRate> thread_rates;
 
     // How fast the HOST consumes weight bytes in THIS MODEL's own format, in GiB/s, 0 when
     // unmeasured. Not raw memory bandwidth, and the difference is the point: a quantized matmul

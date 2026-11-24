@@ -15,27 +15,32 @@
 
 Run Mixture-of-Experts models larger than your device's memory. The experts are read from flash as
 the model needs them. Android, iOS, macOS, Windows and Linux, built on llama.cpp.
+Unified Streaming Framework - from phones, laptops, consumer and data-center GPUs - Supports any hardware, any OS, any model, any quant.
+Automated resource scheduling tailor made to optimize tok/s.
 
 <table align="center">
 <tr>
-<td align="center" width="50%"><img src="docs/assets/screens/android.gif" width="220" alt="Qwen3.6-35B-A3B generating an answer on a 12 GB Android phone, in real time."></td>
-<td align="center" width="50%"><img src="docs/assets/screens/iphone.gif" width="220" alt="Qwen3.6-35B-A3B generating an answer on a 12 GB iPhone, in real time."></td>
+<td align="center" width="50%"><img src="https://github.com/user-attachments/assets/7967bed2-6094-489f-bd60-05b0b1980102" width="220" alt="Qwen3.6-35B-A3B generating an answer on a 12 GB Android phone, in real time."></td>
+<td align="center" width="50%"><img src="https://github.com/user-attachments/assets/26760326-2ef5-4b4a-950d-581c99e58206" width="220" alt="The iPhone app on a 12 GB iPhone with Qwen3.6-35B-A3B loaded: a chat about a picture, the plan, the models and the settings, in real time."></td>
 </tr>
 <tr>
-<td align="center">12 GB Android phone</td>
-<td align="center">12 GB iPhone</td>
+<td align="center">12 GB Android phone<br>Qwen3.6-35B-A3B · 5-6 tok/s</td>
+<td align="center">12 GB iPhone<br>Qwen3.6-35B-A3B · 6 tok/s</td>
 </tr>
 <tr>
-<td align="center" colspan="2"><img src="docs/assets/screens/desktop.gif" width="620" alt="Qwen3.6-35B-A3B generating an answer in the desktop app on a 16 GB Apple-silicon laptop, in real time, at 20 tok/s."></td>
+<td align="center" colspan="2"><img src="https://github.com/user-attachments/assets/0e1fd1d2-4976-4ecf-a56f-fee60f5dff74" width="620" alt="Qwen3.6-35B-A3B generating an answer in the desktop app on a 16 GB Apple-silicon laptop, in real time, at 21 tok/s."></td>
 </tr>
 <tr>
-<td align="center" colspan="2">16 GB Apple-silicon laptop</td>
+<td align="center" colspan="2">16 GB Apple-silicon laptop<br>Qwen3.6-35B-A3B · 18-24 tok/s</td>
 </tr>
 </table>
 
-<p align="center">▶ <a href="https://github.com/Helldez/BigMoeOnEdge/releases/download/v0.39.0/bigmoeonedge-0.39-tour.mp4"><b>Watch the tour</b></a> (2:38): models, the planner, chat, the agent on a folder, tasks and connected apps on a 16 GB Mac.</p>
+Qwen3.6-35B-A3B, larger than each device's memory; any MoE model in GGUF runs, at any
+quantization. Decode speeds are the [Performance](#performance) table's.
 
-Qwen3.6-35B-A3B (21 GB) in real time on each device. The model is larger than each device's memory.
+**The agent on a 2021 laptop, no GPU**: the viral voxel-pagoda prompt to the built-in agent on a ThinkPad with 16 GB of RAM, CPU only, and Qwen3.6-35B-A3B Q4_K_M. 988 lines at 2.3 tok/s, then the page in the app's preview; the speed-ups are marked on screen.
+
+<p align="center"><img src="https://github.com/user-attachments/assets/1da744d4-dd98-4d14-a76e-50bdf0d9aec4" width="640" alt="The built-in agent writing a voxel pagoda garden as one HTML file on a 2021 ThinkPad with 15 GB of RAM and no dedicated GPU, then the page in the app's preview, turning."></p>
 
 ## What it does
 
@@ -45,13 +50,13 @@ Qwen3.6-35B-A3B (21 GB) in real time on each device. The model is larger than ea
 - **Sets itself up.** `--auto` measures the machine and the model and picks the cache size, the
   threads and which device does what. The Plan screen shows each choice and why.
 - **Any MoE GGUF.** Whatever llama.cpp loads, in any quantization. No per-model code.
-- **Sees images.** Put a model's projector file (`mmproj`) beside it and the server reads images on
-  every API; the CLI with `--mmproj` and `--image`. Any vision model llama.cpp's projector library
-  knows, any quantization, every backend.
 - **Every backend.** CPU, Metal, CUDA, HIP, Vulkan, OpenCL and the Hexagon NPU. On a graphics card,
   the experts used most stay in its VRAM.
 - **Apps and a server.** A desktop app, phone apps, and an OpenAI- and Anthropic-compatible server
   for coding agents.
+- **Sees images.** Put a model's projector file (`mmproj`) beside it and the server reads images on
+  every API; the CLI with `--mmproj` and `--image`. Any vision model llama.cpp's projector library
+  knows, any quantization, every backend.
 
 ## Performance
 
@@ -59,14 +64,23 @@ Qwen3.6-35B-A3B (21 GB) in real time on each device. The model is larger than ea
 |---|---|---|---:|---|---:|
 | **Android phone** | 12 GB | DeepSeek V4 Flash 284B | 91 GB | flash | 1 |
 |  |  | Qwen3.8-Flash-Next 125B | 80 GB | flash | 2-4 |
-|  |  | Qwen3.6-35B-A3B | 21 GB | flash | 5 |
-| **iPhone** | 12 GB | Qwen3.6-35B-A3B | 21 GB | flash | 3 |
+|  |  | Qwen3.6-35B-A3B | 21 GB | flash | 5-6 |
+| **iPhone** | 12 GB | Qwen3.6-35B-A3B | 21 GB | flash | 6 |
 | **Apple-silicon laptop** | 16 GB | Qwen3.8-Flash-Next 125B | 76 GB | flash | 7-9 |
 |  |  | Qwen3.6-35B-A3B | 21 GB | flash | 18-24 |
 | **Windows laptop** | 16 GB | Qwen3.6-35B-A3B | 21 GB | flash | 5 |
+| **Desktop GPU** (NVIDIA) | 12 GB + 128 GB RAM | Qwen3.8-Flash-Next 125B | 84 GB | RAM, GPU cache | 16-17 |
 | **Desktop GPU** (NVIDIA) | 16 GB + 32 GB RAM | Qwen3.8-Flash-Next 125B | 66 GB | flash, GPU cache | 19-21 |
 | **Desktop GPU** (NVIDIA) | 24 GB + 96 GB RAM | Qwen3.8-Flash-Next 125B | 66 GB | RAM, GPU cache | 70 |
 |  |  | Qwen3.6-35B-A3B | 21 GB | GPU | 217 |
+| **Desktop GPU** (NVIDIA) | 24 GB + 62 GB RAM | Qwen3.6-35B-A3B | 21 GB | GPU | 154 |
+|  | 12 GB of it free | Qwen3.6-35B-A3B | 21 GB | RAM, GPU cache | 59-67 |
+|  |  | Gemma 4 26B-A4B | 17 GB | GPU | 114 |
+|  |  | Laguna XS 2.1 33B | 20 GB | GPU | 93-94 |
+| **Desktop GPU** (NVIDIA) | 8 GB + 31 GB RAM | Qwen3.8-Flash-Next 125B | 66 GB | flash, GPU cache | 16 |
+|  |  | Qwen3.6-35B-A3B | 21 GB | RAM, GPU cache | 37-44 |
+| **Two desktop GPUs** (NVIDIA) | 2 × 16 GB + 60 GB RAM | Qwen3.8-Flash-Next 125B | 66 GB | RAM, GPU cache | 41-48 |
+|  |  | DeepSeek V4 Flash 284B | 91 GB | flash, GPU cache | 5 |
 | **Datacenter GPU** (AMD, ROCm) | 192 GB | Qwen3.8-Flash-Next 125B | 66 GB | GPU | 53 |
 
 A range is the spread across runs. Method and every run:
@@ -132,6 +146,21 @@ print(reply.choices[0].message.content)
 opencode, 65536 for Claude Code
 ([sizing the context](docs/server-api.md#sizing-the-context-for-a-client)).
 
+```jsonc
+// opencode, ~/.config/opencode/opencode.json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "bmoe": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8765/v1", "apiKey": "local" },
+      "models": { "<model id from /v1/models>": { "limit": { "context": 32768, "output": 8192 } } }
+    }
+  },
+  "model": "bmoe/<model id from /v1/models>"
+}
+```
+
 ```bash
 # Claude Code
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8765
@@ -154,8 +183,7 @@ wire_api = "responses"
 env_key = "BMOE_API_KEY"   # export BMOE_API_KEY=local
 ```
 
-For opencode, add the server as an OpenAI-compatible provider at `http://127.0.0.1:8765/v1`. Under
-**Connect apps**, the app writes the settings for Codex CLI and opencode and shows the ones for
+Under **Connect apps**, the app writes the settings for opencode and Codex CLI and shows the ones for
 Claude Code.
 
 **The agent.** The desktop app has its own agent: it works in a folder you choose, reads and edits
@@ -183,12 +211,16 @@ unchanged, and an upgrade is a submodule bump. Which tensors are experts is read
 ## The planner
 
 <p align="center">
-  <img src="docs/assets/screens/plan-mac.png" width="820" alt="The Plan screen on a 16 GB Apple-silicon laptop with Qwen3.6-35B-A3B Q4_K_M: experts stream from flash with a 6.6 GiB cache, the prompt runs on the GPU and the tokens on the CPU, 23.9 tok/s and 94% cache hits measured, and where the memory goes.">
+  <img src="https://github.com/user-attachments/assets/98e6de3e-e27d-482d-bff1-26fc66074af4" width="820" alt="The Plan screen on a 16 GB Apple-silicon laptop with Qwen3.6-35B-A3B Q4_K_M: experts stream from flash with a 6.6 GiB cache, the prompt runs on the GPU and the tokens on the CPU, 23.9 tok/s and 94% cache hits measured, and where the memory goes.">
 </p>
 
 The planner reads the model's header and measures the machine: memory, storage speed, each CPU, GPU
 and NPU. Its rules name no device or platform, so a phone and a desktop get different plans from the
 same code. Values you set yourself are kept. See [docs/hardware-planning.md](docs/hardware-planning.md).
+
+<p align="center">
+  <img src="docs/assets/diagrams/plan-en.png" width="820" alt="The planner: the machine and the model go into the plan; the plan decides where each weight goes (VRAM, RAM or flash), which device reads the prompt and which one generates, and the cache sizes and threads; the first answer is measured and what is faster is kept for the next load.">
+</p>
 
 ## Platforms
 
@@ -214,9 +246,7 @@ Details: [docs/platforms.md](docs/platforms.md).
 | Any MoE model in GGUF | ✅ | few models | few models | its own format | few models |
 | Configures itself | ✅ `--auto` | picks the model by memory | expert-cache budget | `coli tune` | ❌ |
 
-Where a model fits in a gaming GPU plus RAM, Strata is two to four times faster. Where it streams from
-flash, every engine is in single digits and the drive sets the pace. Speeds and sources:
-[docs/comparison.md](docs/comparison.md).
+Speeds and sources: [docs/comparison.md](docs/comparison.md).
 
 ## Build from source
 
@@ -230,8 +260,10 @@ build/bin/bmoe-server --open
 
 A llama.cpp backend is a CMake flag passed through: `scripts/build-host.sh -DGGML_VULKAN=ON` (or
 `-DGGML_CUDA=ON`). Tests: `cd build && ctest --output-on-failure` (needs `python3` with `gguf`). Android:
-`scripts/build-android.ps1`, then the APK in [examples/android](examples/android). More:
-[CONTRIBUTING.md](CONTRIBUTING.md).
+`scripts/build-android.ps1`, then the APK in [examples/android](examples/android). On the phone
+itself, in Termux: `pkg install git cmake clang make nodejs-lts`, then the steps above with
+`scripts/build-host.sh -DBMOE_BACKEND_MODULES=OFF`, one CPU library for that phone's cores instead
+of a module per instruction-set tier. More: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Documentation
 

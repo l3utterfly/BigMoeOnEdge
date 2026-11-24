@@ -8,6 +8,8 @@ import androidx.compose.foundation.relocation.BringIntoViewRequester
 import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -21,6 +23,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
@@ -33,7 +36,9 @@ import io.bigmoeonedge.app.engine.contextWarning
 import io.bigmoeonedge.app.engine.text
 import io.bigmoeonedge.app.engine.Engine
 import io.bigmoeonedge.app.engine.ParamSpec
+import io.bigmoeonedge.app.engine.UpdateInfo
 import io.bigmoeonedge.app.engine.LanAddress
+import io.bigmoeonedge.app.engine.ListenPort
 import io.bigmoeonedge.app.engine.PlanDecision
 import io.bigmoeonedge.app.engine.ValueSource
 import io.bigmoeonedge.app.engine.differsFromPlan
@@ -41,6 +46,7 @@ import io.bigmoeonedge.app.engine.paramValueFromText
 import io.bigmoeonedge.app.engine.paramValueText
 import io.bigmoeonedge.app.engine.setByYou
 import io.bigmoeonedge.app.engine.resettableKeys
+import io.bigmoeonedge.app.engine.advancedCards
 import io.bigmoeonedge.app.engine.settingsCards
 import io.bigmoeonedge.app.engine.valueSource
 import kotlinx.coroutines.delay
@@ -51,6 +57,8 @@ private const val APP_SECTION = " app"
 private const val SHARE_SECTION = " share"
 private const val LOOK_SECTION = " appearance"
 private const val MINE_SECTION = " mine"
+private const val ADVANCED_SECTION = " advanced"
+private fun advancedCard(group: String) = " advanced:$group"
 
 /**
  * Settings, rendered from the engine's parameter table (`GET /api/params`) and nothing else: one
@@ -93,9 +101,8 @@ fun SettingsScreen(modifier: Modifier = Modifier, target: String = "", onLanded:
     val settable = remember(params) { params?.filter { it.type != "path" || it.groupReadOnly } }
 
     // A link to one setting lands on it: its card opened ("Set by you" for a value the person set;
-    // else its group, the row shown even where the table offers it no form); the row itself scrolls
-    // into view. Once per link, so editing
-    // another field afterwards does not jump back.
+    // else its group's card, under Advanced settings for a row the form leaves to the plan); the row
+    // itself scrolls into view. Once per link, so editing another field afterwards does not jump back.
     LaunchedEffect(landing, settable, cfg != null) {
         if (landing.isEmpty() || settable == null || cfg == null) return@LaunchedEffect
         val spec = settable.firstOrNull { it.key == landing }
@@ -103,13 +110,17 @@ fun SettingsScreen(modifier: Modifier = Modifier, target: String = "", onLanded:
         jump = ""
         if (spec == null) return@LaunchedEffect
         landedMine = !spec.groupReadOnly && spec.key in cfg.userKeys
-        openCards = openCards + ((if (landedMine) MINE_SECTION else spec.group) to true)
+        openCards = openCards + when {
+            landedMine -> mapOf(MINE_SECTION to true)
+            spec.form || spec.groupReadOnly -> mapOf(spec.group to true)
+            else -> mapOf(ADVANCED_SECTION to true, advancedCard(spec.group) to true)
+        }
         landedOn = spec.key
     }
 
     Scaffold(
         modifier = modifier,
-        topBar = { TopAppBar(title = { Text("Settings") }, navigationIcon = { Box(Modifier.padding(start = 16.dp)) { BrandMark(wordmark = false) } }) },
+        topBar = { TopAppBar(title = { Text("Settings") }, navigationIcon = { Box(Modifier.padding(start = 16.dp)) { BrandMark(wordmark = false) } }, colors = shellTopBarColors()) },
         snackbarHost = { SnackbarHost(snackbar) },
     ) { padding ->
         Column(
@@ -119,7 +130,7 @@ fun SettingsScreen(modifier: Modifier = Modifier, target: String = "", onLanded:
             // First, because it is the one setting that reaches past this phone; its header says the state
             // with the card folded.
             val ctx = contextWarning(engine.info?.model.takeIf { engine.serverUp && engine.info?.ready == true }, params)
-            ShareSection(openCards[SHARE_SECTION] == true, { openCards = openCards + (SHARE_SECTION to it) }, ctx) { jump = it }
+            ShareSection(openCards[SHARE_SECTION] == true, { openCards = openCards + (SHARE_SECTION to it) }, engine.port, ctx) { jump = it }
             val lookOpen = openCards[LOOK_SECTION] == true
             FoldCard("Appearance", "", lookOpen, onToggle = { openCards = openCards + (LOOK_SECTION to !lookOpen) }) {
                 Appearance()
@@ -153,10 +164,11 @@ fun SettingsScreen(modifier: Modifier = Modifier, target: String = "", onLanded:
                 else -> {
                     val decisions = remember(cfg.plan) { cfg.plan.orEmpty().associateBy { it.knob } }
                     val mine = remember(settable, cfg) { setByYou(settable, cfg) }
-                    val cards = remember(settable, mine, landedOn, landedMine) {
-                        val pinned = if (landedMine) emptySet() else setOfNotNull(landedOn.ifEmpty { null })
-                        settingsCards(settable, pinned, mine.map { it.key }.toSet())
-                    }
+                    val cards = remember(settable, mine) { settingsCards(settable, mine = mine.map { it.key }.toSet()) }
+                    // Everything else a client may set, behind one fold and cut into the same groups: the plan
+                    // sets these, and a person who wants to choose (the devices that run the prompt and the
+                    // answer, the cache, the reads) finds them all here.
+                    val advanced = remember(settable, mine) { advancedCards(settable, mine.map { it.key }.toSet()) }
                     val resettable = remember(settable, cfg) { resettableKeys(cfg.userKeys, cfg.launchKeys, settable) }
 
                     if (resettable.isNotEmpty()) {
@@ -204,6 +216,28 @@ fun SettingsScreen(modifier: Modifier = Modifier, target: String = "", onLanded:
                             }
                         }
                     }
+                    if (advanced.isNotEmpty()) {
+                        val advOpen = openCards[ADVANCED_SECTION] == true
+                        FoldCard(
+                            "Advanced settings · ${advanced.sumOf { it.params.size }}",
+                            "Everything else the engine lets you set, which the plan usually decides: the devices that run " +
+                                "the prompt and the answer, the cache, the reads, and the experimental and debug options.",
+                            advOpen, onToggle = { openCards = openCards + (ADVANCED_SECTION to !advOpen) },
+                        ) {
+                            advanced.forEach { c ->
+                                val key = advancedCard(c.group)
+                                val open = openCards[key] == true
+                                FoldCard(c.label, c.help, open, onToggle = { openCards = openCards + (key to !open) }) {
+                                    c.params.forEach { spec ->
+                                        ParamRow(
+                                            spec, cfg, decisions[spec.key], readOnly = false, landing = !landedMine && spec.key == landedOn,
+                                            onSet = { set(spec.key, it) }, onReset = { reset(listOf(spec.key)) }, showLevel = true,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -220,6 +254,7 @@ fun SettingsScreen(modifier: Modifier = Modifier, target: String = "", onLanded:
                 }
                 Hint("The live figures of the current answer, and the CSV recording.")
             }
+            if (io.bigmoeonedge.app.BuildConfig.RELEASE_UPDATES) Updates(engine.serverUp)
             engine.info?.let { Text("Engine ${it.version}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             Spacer(Modifier.height(24.dp))
         }
@@ -252,11 +287,12 @@ private fun FoldCard(
 
 /**
  * Serve on the network: the switch, and once on, what a client on another device needs (the
- * address, the key, the context a client asks for) and what sharing costs (the traffic is in clear).
- * The header says the state with the card folded, so whether the phone is reachable is never hidden.
+ * address with the port the server took, the key, the context a client asks for), the port the
+ * person prefers, and what sharing costs (the traffic is in clear). The header says the state with
+ * the card folded, so whether the phone is reachable is never hidden.
  */
 @Composable
-private fun ShareSection(open: Boolean, onOpen: (Boolean) -> Unit, ctx: ContextWarning?, onRaise: (String) -> Unit) {
+private fun ShareSection(open: Boolean, onOpen: (Boolean) -> Unit, port: Int?, ctx: ContextWarning?, onRaise: (String) -> Unit) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     var share by remember { mutableStateOf(AppPrefs.shareOnNetwork(context)) }
@@ -278,7 +314,8 @@ private fun ShareSection(open: Boolean, onOpen: (Boolean) -> Unit, ctx: ContextW
             val (text, colour) = when {
                 !share -> "Off" to MaterialTheme.colorScheme.onSurfaceVariant
                 first == null -> "On · not on a network" to warnColor()
-                else -> "On · ${LanAddress.address(first)}" to MaterialTheme.colorScheme.onSurfaceVariant
+                port == null -> "On · starting" to MaterialTheme.colorScheme.onSurfaceVariant
+                else -> "On · ${LanAddress.address(first, port)}" to MaterialTheme.colorScheme.onSurfaceVariant
             }
             Text(text, fontSize = 12.sp, color = colour, maxLines = 1)
         },
@@ -300,22 +337,30 @@ private fun ShareSection(open: Boolean, onOpen: (Boolean) -> Unit, ctx: ContextW
                 fontSize = 12.sp, color = warnColor(),
             )
         }
-        lan.forEach { ip ->
-            val address = LanAddress.address(ip)
+        if (port == null && lan.isNotEmpty()) Hint("The engine is starting; its address appears once it listens.")
+        if (port != null) lan.forEach { ip ->
+            val address = LanAddress.address(ip, port)
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(address, fontFamily = CodeFont, fontSize = 15.sp, modifier = Modifier.weight(1f))
                 TextButton(shape = Corner, onClick = { clipboard.setText(AnnotatedString(address)) }) { Text("Copy") }
             }
         }
         Text("API key", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        // Masked: the screen may be seen or recorded, and the key is what lets a device in. On its
+        // own full-width line, wrapping if it must: a key cut short is copied by hand short and
+        // answered 401. Shown in blocks of four to read it off; the text is not selectable, and Copy
+        // copies the raw key.
+        Text(
+            (if (showKey) key else "•".repeat(key.length)).chunked(4).joinToString(" "),
+            fontFamily = CodeFont, fontSize = 15.sp, modifier = Modifier.fillMaxWidth(),
+        )
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            // Masked: the screen may be seen or recorded, and the key is what lets a device in.
-            Text(if (showKey) key else "•".repeat(key.length), fontFamily = CodeFont, fontSize = 13.sp, maxLines = 1, modifier = Modifier.weight(1f))
             TextButton(shape = Corner, onClick = { showKey = !showKey }) { Text(if (showKey) "Hide" else "Show") }
             TextButton(shape = Corner, onClick = { clipboard.setText(AnnotatedString(key)) }) { Text("Copy") }
             TextButton(shape = Corner, onClick = { key = AppPrefs.regenerateApiKey(context); Engine.restart(context) }) { Text("New key") }
         }
-        first?.let { Hint("In a client: base URL ${LanAddress.url(it)}, and the key above.") }
+        if (first != null && port != null) Hint("In a client: base URL ${LanAddress.url(first, port)}, and the key above.")
+        PortField(port)
         // Where the clients are switched on, what they need: said here whether or not the status
         // line's warning was dismissed.
         if (ctx?.short == true) {
@@ -325,6 +370,99 @@ private fun ShareSection(open: Boolean, onOpen: (Boolean) -> Unit, ctx: ContextW
             }
         }
         Text("Prompts and answers cross the network unencrypted: use it on a network you trust.", fontSize = 12.sp, color = warnColor())
+    }
+}
+
+/**
+ * The port the person prefers for the server, empty for the server's own default. Applied by
+ * restarting the engine; the server moves past a port another program holds, and the field then says
+ * where it went, so a client set up for the chosen port is pointed at the one in use.
+ */
+@Composable
+private fun PortField(listening: Int?) {
+    val context = LocalContext.current
+    var chosen by remember { mutableStateOf(AppPrefs.port(context)) }
+    var text by remember { mutableStateOf(if (chosen > 0) chosen.toString() else "") }
+    var error by remember { mutableStateOf<String?>(null) }
+    fun commit() {
+        val p = ListenPort.chosen(text)
+        if (p == null) {
+            error = "a port from ${ListenPort.MIN} to ${ListenPort.MAX}, or empty for the default"
+            return
+        }
+        error = null
+        if (p == chosen) return
+        chosen = p
+        AppPrefs.setPort(context, p)
+        Engine.restart(context)
+    }
+    val hint = error ?: when {
+        listening == null -> null
+        chosen > 0 && listening != chosen -> "Port $chosen is in use, so the engine is on $listening."
+        else -> "The engine listens on port $listening. Changing it restarts the engine."
+    }
+    OutlinedTextField(
+        value = text,
+        onValueChange = { text = it; error = null },
+        label = { Text("Port") },
+        placeholder = { Text("Default") },
+        isError = error != null,
+        supportingText = hint?.let { { Text(it) } },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+        keyboardActions = KeyboardActions(onDone = { commit() }),
+        modifier = Modifier.fillMaxWidth().onFocusChanged { if (!it.isFocused) commit() },
+    )
+}
+
+/**
+ * Updates, as on every front-end: nothing checks in the background, the button asks the server to
+ * read the signed release feed. A newer release opens its page, where the APK is installed over
+ * this one (the release key is the same every time, so models and settings stay).
+ */
+@Composable
+private fun Updates(serverUp: Boolean) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var info by remember { mutableStateOf<UpdateInfo?>(null) }
+    var checking by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf("") }
+    BmoeCard(padding = 12.dp) {
+        Text("Updates", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = MaterialTheme.colorScheme.primary)
+        val i = info
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(Modifier.weight(1f)) {
+                if (i == null) {
+                    Hint("Nothing checks in the background. Check when you want to.")
+                } else {
+                    Text("This is version ${i.current}", fontSize = 13.sp)
+                    Text(if (i.available) "Version ${i.latest} is available." else "It is the latest.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            OutlinedButton(
+                shape = Corner,
+                enabled = serverUp && !checking,
+                onClick = {
+                    checking = true
+                    error = ""
+                    scope.launch {
+                        Engine.checkUpdate().onSuccess { info = it }.onFailure { error = it.message ?: "no answer" }
+                        checking = false
+                    }
+                },
+            ) { Text(if (checking) "Checking…" else "Check for updates") }
+        }
+        val page = i?.releasePage
+        if (i != null && i.available && page != null) {
+            Button(shape = Corner, colors = primaryButtonColors(), modifier = Modifier.fillMaxWidth(), onClick = {
+                runCatching {
+                    context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(page)))
+                }
+            }) { Text("Get version ${i.latest}") }
+            Hint("Download the APK from the release page and install it over this one: your models and settings stay.")
+        }
+        if (error.isNotEmpty()) Text("The check did not work. Check the connection and try again: $error", fontSize = 12.sp, color = warnColor())
+        if (!serverUp) Hint("The engine checks for updates: start it first.")
     }
 }
 
@@ -374,6 +512,8 @@ private fun ParamRow(
     landing: Boolean,
     onSet: (Any?) -> Unit,
     onReset: () -> Unit,
+    // Say when the row is experimental or a debug aid (Advanced settings, where those rows live).
+    showLevel: Boolean = false,
 ) {
     val value = cfg.value(spec.key)
     val mine = spec.key in cfg.userKeys
@@ -421,6 +561,8 @@ private fun ParamRow(
         }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             if (!readOnly) Chip(source.chip, if (source == ValueSource.DEFAULT) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.primary)
+            if (showLevel && spec.level == "experimental") Chip("experimental", warnColor())
+            if (showLevel && spec.level == "debug") Chip("debug", warnColor())
             if (spec.lossy) Chip("changes the reply", warnColor())
             if (spec.scope == "request") Chip("per message", MaterialTheme.colorScheme.onSurfaceVariant)
             if (spec.key in cfg.reloadKeys) Chip("needs reload", warnColor())
@@ -437,7 +579,12 @@ private fun ParamRow(
     }
 }
 
-/** A number (or `auto`, where the row accepts it) or free text; committed when the field is left. */
+/**
+ * A number (or `auto`, where the row accepts it) or free text. Saved by the check beside the field,
+ * shown while the typed text differs from the saved value, by Done, or when the field is left. Not
+ * on a pause: a pause saved a value still being typed ("0" on the way to "0.5"), and the field,
+ * rebuilt from the saved value, took the text from under the person's fingers.
+ */
 @Composable
 private fun NumberOrTextField(spec: ParamSpec, value: Any?, focus: FocusRequester, onSet: (Any?) -> Unit) {
     var text by remember(spec.key, value) { mutableStateOf(paramValueText(value)) }
@@ -468,6 +615,11 @@ private fun NumberOrTextField(spec: ParamSpec, value: Any?, focus: FocusRequeste
         suffix = spec.unit?.let { { Text(it, fontSize = 12.sp) } },
         isError = error != null,
         supportingText = hint?.let { { Text(it) } },
+        // Compose keeps the focus when the person taps beside the field or leaves the screen, so
+        // Done and the focus alone could lose a typed value: the check saves it in one tap.
+        trailingIcon = if (text != paramValueText(value)) {
+            { IconButton(onClick = { commit() }) { Icon(Icons.Filled.Check, contentDescription = "Save") } }
+        } else null,
         singleLine = spec.type != "text",
         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
         keyboardActions = KeyboardActions(onDone = { commit() }),

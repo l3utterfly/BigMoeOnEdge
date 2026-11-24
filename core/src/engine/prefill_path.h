@@ -75,17 +75,18 @@ public:
     // The expert cache the slots take turns with (PrefillDeviceConfig::slots_on_demand). Call before
     // open(); null leaves the cache alone.
     void share_memory_with(ExpertStreamSource * cache) { cache_ = cache; }
+    // The expert cache the arena may fill from (PrefillDeviceConfig::from_cache), whether or not it
+    // also shares memory with the slots. Call before open().
+    void read_experts_from(ExpertStreamSource * cache) { cache_read_ = cache; }
     // One llama_decode, on whichever side place() last chose. On the device the arena is started
     // before and drained after, and a failed expert read fails the decode: the graph would have
     // computed on a slot that never filled.
     int decode(llama_context * ctx, const llama_batch & b);
     // The same bracket around a batch of embeddings (an image's tokens, media_input.h).
     int decode_ext(llama_context * ctx, llama_batch_ext * b);
-    // For every llama_memory_clear(data) of the target context: llama.cpp clears the buffers it
-    // allocated, which the moved model state no longer lives in.
-    void clear_state();
 
     uint64_t arena_read_bytes() const { return arena_ ? arena_->read_bytes() : 0; }
+    uint64_t arena_cache_bytes() const { return arena_ ? arena_->cache_bytes() : 0; }
     double arena_stall_seconds() const { return arena_ ? arena_->stall_seconds() : 0.0; }
     uint64_t arena_routed_used() const { return arena_ ? arena_->routed_used() : 0; }
     uint64_t arena_routed_demand() const { return arena_ ? arena_->routed_demand() : 0; }
@@ -101,7 +102,8 @@ private:
     RouterHook * hook_ = nullptr;
     llama_context * ctx_ = nullptr;
     ExpertStreamSource * cache_ = nullptr;
-    size_t yielded_budget_ = 0; // the cache budget to give back when the slots are released; 0 = nothing yielded
+    ExpertStreamSource * cache_read_ = nullptr;
+    bool lent_ = false; // the slots hold memory lent by the cache, returned when they are released
     bool said_no_room_ = false;
     std::vector<LayerExperts> arena_layers_;
     std::vector<std::string> arena_shards_;

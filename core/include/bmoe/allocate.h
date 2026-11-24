@@ -121,6 +121,14 @@ struct AllocationInputs {
     // cycle of it, the cache is sized to what can be locked rather than to what can be held.
     bool cache_lock = false;
 
+    // The expert cache is offered to the kernel instead (MoeStreamConfig::cache_discard, on a
+    // platform with the mechanism): an entry no layer used in the last pass is the kernel's to drop
+    // under pressure. The margin is room for a reclaim that writes, compressing or swapping, and the
+    // kernel takes an offered page back by dropping it, which writes nothing. So, like a locked
+    // cache, an offered one stands outside the margin, all but one token cycle of it: the experts
+    // the last pass used are not offered, and are ordinary memory.
+    bool cache_offered = false;
+
     // The engine's own fixed cache guard, REPORTED and never enforced here. It is a generic
     // constant that predates the per-model floor and is the weaker of the two: a budget above this
     // model's own token cycle returns hits however small it looks next to a number chosen once for
@@ -154,13 +162,40 @@ struct AllocationInputs {
     uint64_t layers_home_bytes = 0;
     double layers_home_saved = 0.0;
     uint32_t layers_home_count = 0; // the layers it brings home, for the rationale
+
+    // ── what an earlier load measured of this decode (MeasuredKnobs::decode_*) ─────────────────
+    // `compute_scale` multiplies every group's host compute term: the ratio between the compute a load
+    // of the same configuration measured and what this cost model priced it at, so the groups move
+    // together and stay priced relative to each other. `hit_scale` multiplies the cache's credited
+    // hit rate at every size (the curve, or the linear credit), the ratio between the hits measured
+    // at that load's budget and what was credited there. 1 is the plan with nothing measured.
+    double compute_scale = 1.0;
+    double hit_scale = 1.0;
 };
 
 // One line of the memory ledger: something the run holds for its whole length, and whether it is
 // held reclaim-exempt. The rows are what a reader checks a run against - the two ceilings are only
 // meaningful next to what was charged to them.
+//
+// A row is told apart by its kind, never by its name: the name is what a reader sees (and what the
+// server's plan view and --explain print), so it may be reworded without a stage that drops or
+// replaces a row silently missing it.
+enum class LedgerKind {
+    ContextCompute, // the context and the compute buffers
+    Projector,      // a vision projector
+    Checkpoints,    // the context checkpoints
+    Device,         // an armed device's host-side share
+    Dense,          // the dense weights the dense policy keeps
+    ExpertCache,    // the expert cache
+    DeviceSlots,    // the prefill device's slots, held in turn with the cache
+};
+
+// The row's display name, the one spelling of each.
+const char * ledger_kind_name(LedgerKind k);
+
 struct LedgerRow {
-    std::string name;
+    LedgerKind kind = LedgerKind::ContextCompute;
+    std::string name; // for display only; see LedgerKind
     uint64_t bytes = 0;
     bool locked = false;
     // Held in turn with the expert cache rather than with it: not part of `held`, which is the
@@ -272,5 +307,10 @@ Allocation allocate(const HardwareProfile & hw,
                     const ModelProfile & model,
                     const AllocationInputs & in,
                     const PlannerPolicy & pol);
+
+// The compute this cost model prices one decoded token at on the host, every group of `model` at the
+// host's measured rates and no compute_scale: what a measured decode of the same configuration is
+// compared with to calibrate it. 0 where a rate is unmeasured.
+double host_compute_seconds(const HardwareProfile & hw, const ModelProfile & model);
 
 } // namespace bmoe

@@ -357,6 +357,7 @@ FitVerdict verdict_parts(const FitInputs & in) {
         v.mode = "not readable";
         v.fit = "unknown";
         v.headline = "Nothing could be read about this file";
+        v.summary = "Nothing could be read about this file, so it could not be checked.";
         v.memory = "the file's header could not be read, so nothing about it is known";
         return v;
     }
@@ -367,6 +368,10 @@ FitVerdict verdict_parts(const FitInputs & in) {
         // A projector is downloaded beside its model, which then reads images; the other companions
         // have no use here yet.
         v.downloadable = in.role == "projector";
+        v.summary = in.role == "projector"
+                        ? "Not a model on its own: it gives image input to the model it is downloaded beside."
+                        : "Not a model to chat with.";
+        v.tone = in.role == "projector" ? "" : "err";
         v.memory = in.role == "projector"
                        ? "a multimodal projector, by its header: downloaded beside the model of the same conversion, "
                          "it gives that model image input (the server pairs the two by their headers)"
@@ -394,6 +399,20 @@ FitVerdict verdict_parts(const FitInputs & in) {
     }
     v.budget = budget;
 
+    // A model that runs whole from its file, in a person's words: held in memory where it fits what
+    // is free now, slow where it does not, and no claim where the free memory is not known.
+    const auto whole_model = [&](FitVerdict & w) {
+        if (!budget) {
+            w.summary = "Runs here. The memory free now could not be read, so its speed is not known.";
+        } else if (in.file_bytes <= budget) {
+            w.summary = "Runs here, whole in memory: the fastest answers.";
+            w.tone = "ok";
+        } else {
+            w.summary = "Runs here, but it is larger than the memory free now: expect slow answers.";
+            w.tone = "warn";
+        }
+    };
+
     if (!in.is_moe) {
         v.mode = "plain mmap";
         v.fit = "no_streaming";
@@ -407,6 +426,7 @@ FitVerdict verdict_parts(const FitInputs & in) {
                                ? "so it fits in memory"
                                : "so the parts the system cannot hold are read back from the file as they are used")
                     : std::string());
+        whole_model(v);
         return v;
     }
     if (!in.streamable) {
@@ -415,15 +435,20 @@ FitVerdict verdict_parts(const FitInputs & in) {
         v.headline = "Runs here without streaming";
         v.memory = "a MoE model whose experts this engine does not stream" +
                    (in.refusal.empty() ? std::string() : ": " + in.refusal) + "; it runs whole from the file";
+        whole_model(v);
         return v;
     }
     v.mode = "streams";
     v.fit = "fits";
     v.headline = "Fits here: the experts stream from flash";
-    v.memory = "the experts stream from flash and " + mib(in.dense_bytes) +
-               " stays resident, plus a cache of at least one token cycle (" + mib(in.token_cycle) + ")";
+    // What stays resident is the plan's: the dense weights but the tables it leaves mapped.
+    const uint64_t mapped = std::min(in.mapped_bytes, in.dense_bytes);
+    const uint64_t resident = in.dense_bytes - mapped;
+    v.memory = "the experts stream from flash and " + mib(resident) + " stays resident" +
+               (mapped ? " (the " + mib(mapped) + " of tables read a row at a time stay on the file)" : std::string()) +
+               ", plus a cache of at least one token cycle (" + mib(in.token_cycle) + ")";
     if (budget) {
-        const uint64_t floor = in.dense_bytes + in.token_cycle;
+        const uint64_t floor = resident + in.token_cycle;
         v.memory += floor <= budget ? "; that fits in the " + mib(budget) + " this process may hold" + credit +
                                           ", and the plan sizes the cache from the rest"
                                     : "; that is more than the " + mib(budget) + " this process may hold" + credit +
@@ -431,11 +456,21 @@ FitVerdict verdict_parts(const FitInputs & in) {
         if (floor > budget) {
             v.fit = "will_not_fit";
             v.headline = "Will not fit in the memory this process may hold";
+            v.summary = "Too large for the memory free here now: it may not start, or answer very slowly.";
+            v.tone = "err";
+        } else {
+            v.summary = in.file_bytes <= budget
+                            ? "Runs here, within the memory free now."
+                            : "Runs here. It is larger than the memory free now, so it reads the parts it needs from "
+                              "storage as it answers.";
+            v.tone = "ok";
         }
     } else {
         // It streams, but whether its floor fits is not known: no colour of a fit it may not be.
         v.fit = "unknown";
         v.headline = "Streams from flash; the memory free here could not be read";
+        v.summary = "Runs here, reading the parts it needs from storage. The memory free now could not be read, so "
+                    "its speed is not known.";
     }
     return v;
 }
@@ -449,6 +484,8 @@ FitVerdict fit_verdict(const FitInputs & in) {
     if (!v.downloadable && v.fit != "not_a_model") {
         v.fit = "no_disk";
         v.headline = "Will not fit on this disk";
+        v.summary = "Not enough free storage here to download it.";
+        v.tone = "err";
     }
     return v;
 }

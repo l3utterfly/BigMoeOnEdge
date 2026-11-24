@@ -15,10 +15,12 @@
 // decommits explicitly. Both honour a page-granularity that the caller rounds to.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
@@ -179,9 +181,10 @@ struct ChildResult {
 };
 bool can_run_self();
 ChildResult run_self(const std::vector<std::string> & args, double timeout_seconds, std::string * out);
-// The path the kernel started this process from (not argv[0], which is whatever the caller
-// typed), or "" where the platform does not say. Its directory is where a release's backend
-// modules are looked for.
+// The file the kernel started this process from (not argv[0], which is whatever the caller
+// typed), every link on the way resolved, or "" where the platform does not say. Its directory is
+// where a release's backend modules are looked for, so a link to the executable from another
+// folder (install.sh puts one on PATH) still finds them (#605).
 std::string self_path();
 
 // Reserved (address-only) region; physical pages appear on commit, vanish on evict.
@@ -206,6 +209,37 @@ bool vm_pin(void * p, size_t sz);
 void vm_evict(void * p, size_t sz);
 void vm_release(void * p, size_t sz);
 
+// Discardable spans: memory the kernel may take back by DROPPING it, never by writing it anywhere.
+// Anonymous memory that is merely unpinned is swapped or compressed under pressure, and swap is a
+// write to the drive; memory that is pinned makes the kernel swap everything else instead. A cache
+// whose contents can be read again from the model file needs neither: offered pages are the first
+// the kernel reclaims, before it compresses or swaps anything, and a reclaimed page costs one read.
+//
+// Every platform has the mechanism; each spells it differently, which is all these three hide:
+//  - Darwin: a purgeable VM object per span (VM_PURGABLE_VOLATILE / NONVOLATILE). A state change is
+//    per object, not per page, and taking the span back reports whether the kernel emptied it.
+//  - Linux and Android: MADV_FREE. Nothing reports a loss, but a dropped page reads back as zero and
+//    a write cancels a pending drop, so vm_reclaim writes every page first and then checks it.
+//  - Windows: OfferVirtualMemory / ReclaimVirtualMemory, which reports a loss itself.
+//
+// vm_commit_discardable commits a page-aligned span so that it can later be offered (on Darwin the
+// span must be one object, so it replaces whatever was mapped there; elsewhere it is vm_commit).
+// vm_offer hands a committed span over; false where the platform cannot, and the span stays
+// ordinary memory. vm_reclaim takes an offered span back before anything reads it: true when every
+// page is still what was offered, false when any was dropped, and then the WHOLE span is ordinary,
+// committed, zero-or-stale memory the caller must fill again. A page whose words are all zero may be
+// reported dropped although it was not; that costs a read, never a wrong answer.
+// All three take page-aligned spans that no other owner shares a page with.
+bool vm_discard_supported();
+bool vm_commit_discardable(void * p, size_t sz);
+bool vm_offer(void * p, size_t sz);
+bool vm_reclaim(void * p, size_t sz);
+// Whether an offered span is still held, asked without taking it back: 1 held, 0 dropped, -1 when
+// the platform cannot tell. Residency is the answer where an offered page stays mapped until the
+// kernel takes it (mincore). Windows unmaps an offered range at once (out of the working set and
+// PAGE_NOACCESS until reclaimed), so residency there reads "dropped" for every offer: -1.
+int vm_offered_held(const void * p, size_t sz);
+
 // Drop the resident pages of a FILE-BACKED mapping (the model's mmap) so a later touch refaults them
 // from the file. Distinct from vm_evict, which decommits ANONYMOUS reserved-cache pages: this is for
 // the clean, read-only weight mapping — MADV_DONTNEED discards the resident copy without writing
@@ -221,6 +255,22 @@ void vm_drop_file_pages(void * p, size_t sz);
 // clean pages only; a page any process still maps stays. A no-op where the platform offers no such
 // advice (Windows, Darwin: neither has posix_fadvise).
 void drop_file_cache(const char * path);
+
+// The same for one byte range of the file, whole pages inside it only. Where a range has just been
+// unmapped (vm_drop_file_pages), this is what frees its pages now rather than when pressure finds
+// them: unmapped, they are still the cache's and still count against a container's limit.
+void drop_file_cache_range(const char * path, uint64_t offset, uint64_t size);
+
+// Read the byte ranges {offset, size} of a file through the system's cache and discard the bytes:
+// what brings those pages into the cache as a mapping's reads would, on every platform alike, with
+// 64-bit offsets everywhere. In pieces of read_through_piece; `stop` (nullable) ends it between two.
+// False when the file cannot be opened or a read fails.
+bool read_through_cache(const char * path,
+                        const std::vector<std::pair<uint64_t, uint64_t>> & ranges,
+                        const std::atomic<bool> * stop = nullptr);
+// Large enough that the reads run sequentially at the drive's rate, small beside any memory a model
+// is run in.
+inline constexpr size_t read_through_piece = size_t(8) << 20;
 
 // Drop the resident pages of an ANONYMOUS range someone else allocated and still owns, keeping the
 // range valid: the next touch maps a zero page instead of faulting. For memory whose contents moved
@@ -273,7 +323,8 @@ uint64_t mem_available_bytes();
 
 // What a memory control group still lets this process take, in bytes: the tightest of its group
 // and every ancestor it can see, each as the limit less what the group holds, plus the group's own
-// inactive file pages, which the kernel drops before it would end anything. A container caps a
+// file pages (active and inactive, as MemAvailable counts them), which the kernel drops before it
+// would end anything. A container caps a
 // process this way whatever the machine has free, and exceeding the cap ends the process, so it is
 // the same kind of fact as a phone app's own share. 0 where no finite limit is set or none can be
 // read (no cgroups, an unlimited group, another kernel). The paths are parameters so a test can

@@ -74,7 +74,7 @@ expert matmuls are running — needs a wait point that no public API exposes. Th
 place where BigMoeOnEdge carries a llama.cpp extension.
 
 **What it is.** A single optional hook, ~25 lines, living on the fork branch
-`bmoe/expert-ready-hook` of `Helldez/llama.cpp` as a single commit on top of the upstream
+`bmoe/expert-ready-hook` of `Helldez/llama.cpp` as one commit on top of the upstream
 pin. It adds nothing to the model files and changes no data layout; it is a callback the
 CPU MoE kernel invokes.
 
@@ -119,10 +119,33 @@ is affected, and it fails with a clear runtime error instead of silently falling
 server's default for overlap and the `overlap_available` it reports are read from the backend
 that loaded, not from a build flag.
 
-**Sunset condition.** This fork exists *solely* for this one hook. The moment upstream
-ships an equivalent per-expert readiness/residency callback, the branch is dropped and the
-submodule bumps straight back to `ggml-org/llama.cpp`. It is a tide-me-over until the wait
+**Sunset condition.** This commit exists *solely* for this one hook. The moment upstream
+ships an equivalent per-expert readiness/residency callback, it is dropped, and once section 3b's
+commit is dropped too, the submodule bumps straight back to `ggml-org/llama.cpp`. It is a tide-me-over until the wait
 point is public, not a divergence we intend to maintain.
+
+## 3b. Hexagon weight writes (fork fix)
+
+The device prefill's expert arena (`core/src/moe/device_arena.cpp`, [npu-prefill.md](npu-prefill.md))
+refills two weight slots from loader threads while the NPU computes. It does that through the public
+`ggml_backend_tensor_set`, and until the 0.43 bump that call was all the Hexagon backend needed: it
+tiled the written bytes on the writer's thread. Upstream's runtime repack (llama.cpp #31744) changed
+two things under it, and the fork branch carries one more commit, on top of the hook, that puts them
+back for weights only:
+
+- **Tiling at write.** Upstream tiles a weight at graph time, the whole tensor at once on the graph's
+  thread, and remembers it in the tensor. A refilled slot was either read as raw bytes (wrong numbers)
+  or, re-tiled per graph, serialized the refill behind the NPU. The commit tiles a write that covers
+  whole 2-D slices (a whole weight, or one expert) on the writer's thread, as before; any other write
+  is a plain copy and the graph tiles it as upstream does.
+- **No queue flush on a weight write.** Every `set_tensor` began with a flush of the DSP session, which
+  is not thread-safe. Loader threads flushing it while the graph's thread ran the NPU ended the process
+  (`rsp.seq == batch_rsp_seq + 1` asserted, or `dspqueue_read` failed). No op writes a weight, so a
+  weight write has nothing to wait for; other buffers still flush.
+
+Nothing changes off Hexagon: the commit touches only `ggml/src/ggml-hexagon`. Sunset: when upstream
+tiles on a weight write and leaves the session alone there, or gives a streamer another public way to
+refill a weight buffer between graphs, this commit is dropped at the next bump.
 
 ## The chat glue: llama.cpp `common` (not the streaming seam)
 
@@ -150,6 +173,12 @@ session decodes through its own placed decode, so the arena, the prefill device 
 see an image's graphs as they see a text batch's. The library is built through upstream's own
 `LLAMA_BUILD_MTMD` hook, as a library of its own (`libmtmd`), and nothing in it is patched. Like
 `common`, it is not a stable API: a submodule bump re-reads these calls.
+
+Cancellation uses the existing public `llama_set_abort_callback` for decode and `mtmd`'s `cb_eval`
+for image encoding. Each reads the session latch or the current `GenerateRequest::stop` atomic;
+the caller owns that flag and the engine borrows it only until generation returns. The encoder
+checks the same combined state before reading an interrupted graph's output. This adds no upstream
+API or vendor patch.
 `enable_thinking` is only a *request* to the template, and many templates never read it, so the
 engine renders the template to find out (three renders at open, no model names involved) and, where
 the flag is inert *and* reasoning is a structural section of the format, asks for a **continuation**
@@ -187,7 +216,10 @@ reason. The integration changes neither upstream code nor the streamed-weight la
 
 `context_checkpoints.cpp` keeps its checkpoints in `common_prompt_checkpoint`, the type llama.cpp's
 server keeps them in, and copies them with its `update_tgt` / `load_tgt` helpers, which call the public
-`llama_state_seq_*_ext` functions with `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`. The restore rule (how far
+`llama_state_seq_*_ext` functions with `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`. Where they are taken is
+the server's rule too, over the user messages `common` finds with the template's message delimiters
+(`common_chat_msg_delimiters::split`); the server's loop itself is not a library, so the rule is
+written again in `ContextCheckpoints::next_stop`. The restore rule (how far
 back a checkpoint may reach under a sliding window) is the server's, and the MTP driver's own state is
 saved beside it with `common_speculative_get_state`, as the server does. See [session.md](session.md).
 
@@ -279,10 +311,14 @@ except where noted:
   at run time). So the engine marks only the matmul matrices `WEIGHTS` and puts every other layer weight
   (norms, biases, scales), as found from the ops the capture graph applies to it, in plain device
   memory.
-- **Two context knobs.** `n_outputs_max` bounds the logit rows the context reserves, and toggling
-  `llama_set_causal_attn` off and on makes the next decode redo the compute-buffer reservation, which
-  the engine uses once, with the weights on the device, so the CPU does not keep a reservation for a
-  graph it never runs.
+- **Two context knobs.** `n_outputs_max` bounds the logit rows the context reserves, and a change of
+  `llama_set_embeddings`, put back before the next decode, makes that decode redo the compute-buffer
+  reservation (`core/src/engine/compute_reservation`). The engine asks once, with the weights on the
+  device, so the CPU does not keep a reservation for a graph it never runs. Which setter llama.cpp
+  answers with a new reservation is its behaviour, not its API: `llama_set_causal_attn` was the one
+  used until upstream #28751 stopped re-reserving on it, and from the bump of #278 the CPU kept its
+  all-CPU reservation with every output unchanged (#657). The gate `compute_reservation` counts the
+  reservations the request yields, so a bump that changes this fails it.
 - **Concurrent uploads into one buffer.** The arena's loader threads call `ggml_backend_tensor_set`
   on different views of the same slot buffer at once. ggml does not document this as thread-safe; it
   holds for the CPU, RPC and Hexagon backends today because each write touches only its own bytes.
@@ -312,12 +348,13 @@ except where noted:
 ## Upgrading llama.cpp
 
 Because the submodule pins the `bmoe/expert-ready-hook` fork branch (section 3), a bump
-rebases that 1-commit branch onto the new upstream tag, re-pushes it, and re-pins:
+rebases that branch's commits (the hook, and the Hexagon weight writes of section 3b) onto the new
+upstream tag, pushes it as a new branch, and re-pins:
 
 ```bash
-# in a Helldez/llama.cpp checkout: rebase the single hook commit onto the new tag
-git fetch upstream && git checkout bmoe/expert-ready-hook
-git rebase <newer-upstream-tag> && git push --force-with-lease origin bmoe/expert-ready-hook
+# in a Helldez/llama.cpp checkout: rebase the fork's commits onto the new tag, as a new branch
+git fetch upstream && git checkout -b bmoe/expert-ready-hook-<ddmm> <current-pin>
+git rebase <newer-upstream-tag> && git push origin bmoe/expert-ready-hook-<ddmm>
 
 # in this repo: move the submodule to the rebased commit, rebuild, run the gates
 cd third_party/llama.cpp && git fetch origin && git checkout <rebased-commit>
@@ -338,11 +375,44 @@ instead of silently corrupting output. Each expert layout has a gate to keep gre
 If a future release moves the two hooks (a stable expert-residency API, say) upstream,
 this seam shrinks further or disappears — `core/` does not change.
 
+### A layer of the graph is not always a block of the file
+
+The seam reads a layer's index off its node names (`ffn_moe_topk-<il>`) and a tensor's block off
+its name (`blk.<il>.`), and for every architecture before this base the two were one number. A
+model that runs a core of its blocks more than once per token breaks that: llama.cpp numbers each
+later pass as layers of its own, past the last block, computing from the first pass's tensors. On
+the model this base adds, 24 blocks run as 48 layers.
+
+Nothing in the engine names such a model. At capture the hook reads, for every layer of the graph,
+which block's weights its nodes take as sources (`RouterHook::block_of`: the first block weight a
+layer reads, with the matrix of its indexed matmul, the expert tensor itself, having the last word)
+and the order the graph reaches its layers in (`layer_order`). The streamer then loads a routing
+node's experts for the block, the device arena walks its slots in the graph's order instead of
+counting up (`DeviceExpertArena::set_graph_order`), and the planner counts a token's demand over
+the layers the engine numbers (`ModelProfile::n_layer` against `n_block`,
+[hardware-planning.md](hardware-planning.md)). Before this, streaming such a model loaded a later
+pass's experts for a block that does not exist and computed on whatever the tensor held: plausible
+text, different at every start, and no error. The tiny model `scripts/make-tiny-moe.py --arch
+inkling2_loop` is its gate.
+
 Pinned submodule at the time of writing: `Helldez/llama.cpp` branch
-`bmoe/expert-ready-hook-0411`, commit `7ac98f4`: the single expert-ready-hook commit
-(section 3), in the variant that also answers the CPU registry's `get_proc_address` so a build that
-loads the CPU backend as a module reaches it, on top of upstream `ggml-org/llama.cpp` tag
-`v0.9.0` (`cd959ba` of 2026-11-04, 164 commits past the previous base, `8ca4060` of 2026-10-28).
+`bmoe/expert-ready-hook-2011`, commit `09e3dc4`: the Hexagon weight-writes commit (section 3b) on
+`49d1367`, the expert-ready-hook commit (section 3), in the variant that also answers the CPU registry's `get_proc_address` so a build that
+loads the CPU backend as a module reaches it, on top of upstream `ggml-org/llama.cpp` commit
+`29b52d3` of 2026-11-20 (386 commits past the previous base, tag `b12214`, `6590d25` of
+2026-11-09; the last tag before it is `b12591`). Both fork commits moved over unchanged. This base
+brings the Inkling 2 architectures, the second of which runs a core of its blocks more than once per
+token (above). Two things moved under the engine: `common_fit_params` and
+`common_get_device_memory_data` take the model as a list of paths, which the placement probe passes
+as a list of one, and the lazy grammar that failed to build for a Qwen3.5 `json_object` request with
+`tools: auto` now builds, so the request the server used to refuse may go through
+([server-api.md](server-api.md)). It also deprecates `llama_batch` and `llama_decode` for
+`llama_batch_ext` and `llama_process`: the engine's decode path is still written on the first two,
+which work as before, and the build keeps a deprecation a warning where it treats warnings as
+errors. Moving to the new batch is owed before upstream removes the old one. The op numbering
+changed (`GGML_OP_ADD1` and the two `DIAG_MASK` ops are gone) while the backend module version did
+not, so a backend module built against the previous base passes ggml's own check and must not be
+loaded by this one.
 The hook still fires ahead of upstream's tiled `mul_mat_id` path, which G4 proves. Each bump gets
 its own fork branch and the
 previous ones stay, so every commit an old pin names remains reachable (see `.gitmodules` /

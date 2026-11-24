@@ -38,7 +38,12 @@ prompt, a 2048-token context:
 
 `--auto` decides the prefill device on its own: it measures this model's matmul 128 tokens wide on
 the host and on every device, and arms the fastest one that gave the host's answer and whose two
-layer slots still fit the memory ledger. A device it armed is optional - if it cannot be set up the
+layer slots still fit the memory ledger. Where the only thing the device's row takes is the expert
+cache - under one token cycle with it, where without it the cache streamed - that is a trade the plan
+prices on this machine's own requests (prompt tokens and tokens decoded per request, and the host's
+prefill rate, recorded on every load): a chat of long prompts and short answers arms the device, a
+long answer from a short prompt keeps the cache, and with nothing recorded yet the cache is kept.
+A device it armed is optional - if it cannot be set up the
 prefill runs on the host - while one named with `--prefill-device` still fails the load when it
 cannot be used. See "The prefill plan" in [hardware-planning.md](hardware-planning.md).
 
@@ -98,9 +103,10 @@ prefilled in 85 s on Vulkan in fp32 against 65 s on four cores, and the fp16 Vul
 produced text that was not text. OpenCL named by hand is refused by the arena: the backend pads
 every quantized tensor's allocation, so one expert does not fit its share of the slot. What the
 GPU buys on this phone is nothing yet; what the run bought is that the rule said so before a user
-did. The load with the NPU armed then ended in the allocator, twice, before the first token: the
-NPU figure above is the probe's, and the run is tracked in
-[#264](https://github.com/Helldez/BigMoeOnEdge/issues/264).
+did. The load with the NPU armed then ended in the allocator, twice, before the first token
+([#264](https://github.com/Helldez/BigMoeOnEdge/issues/264), since fixed): the NPU figure above is
+the probe's. The release APK's own run, with the Hexagon backend at its defaults, is under
+[What else had to move](#what-else-had-to-move).
 
 **Memory is the limit on a model with a large KV cache.** The device path holds the two expert slots
 (1.1 GB on this model), the device's compute buffers (0.8 GB at ubatch 2048) and the model state in
@@ -139,27 +145,24 @@ too, so a device that compiles that graph differently can flip a near-tie token:
 laptop with Metal, a 35B-A3B's answer with `--mtp` diverged a few lines in, where `--ngram`, which
 leaves the graph alone, was identical.
 
-Layla's Hexagon backend exposes `ggml_backend_streaming_buffer_type_v1` through the backend
-registry. The arena requests matrix and flat streaming buffers explicitly. Their layout is fixed
-at allocation, and complete uploads into disjoint idle storage are safe on loader threads without
-draining the session queue. The scheduler synchronizes before routing/layer-end callbacks; the
-arena releases old slots there and waits for each incoming slot before its consumers run. This
-restores parallel read/repack overlap with NPU compute. Default HTP buffers are unchanged and no
-upload-repacking environment option is needed. Keep runtime repacking at its normal default and
-keep device confirmation enabled. Without the capability, the arena still serializes uploads on
-the graph thread; newer backends with graph-time tiling require `GGML_HEXAGON_RT_REPACK=0` as the
-slower compatibility workaround for reused slots.
-
 ### The arena: two layers of the model at a time
 
 A model larger than RAM cannot give the NPU a copy of itself. The NPU gets two layer-sized slots
 instead, and every layer's weights are bound to one of them, alternating. While the NPU computes
-layer k out of one slot, loader threads prepare the next uploads for layer k+1:
+layer k out of one slot, loader threads fill the other with the layer the graph runs next. That is
+layer k+1 on every model whose blocks run once; a graph that comes back to a block (a looped core)
+is followed in its own order, read off the capture graph, and a block the slots still hold is not
+read again. Where the next layer's slot is the one being computed from, it is read at its own
+routing node instead, as with one slot:
 
-- **experts** are read from the gguf with `O_DIRECT`, one expert at a time, and handed to the backend
-  with `ggml_backend_tensor_set` on a per-expert view by the graph thread at a pacing point.
-  Backend uploads may synchronize the device command queue, so workers must never issue them
-  concurrently with graph execution. Each loader retains one staging buffer until its upload finishes;
+- **experts** are read from the gguf with `O_DIRECT`, one expert at a time, or copied from the expert
+  cache when it holds them (below), and handed to the backend with `ggml_backend_tensor_set` on a
+  per-expert view. That call is where the Hexagon backend repacks them into its matrix-engine tiles,
+  so the repack runs in parallel across the loaders. Upstream moved the repack to graph time in the
+  backend the 0.43 bump brought, a whole tensor at once on the graph's thread, and made every write
+  wait on the DSP's queue; the fork commit described in [seam.md](seam.md) tiles a weight again as it
+  is written, and a weight write no longer touches the queue (two loader threads flushing it while the
+  NPU computed ended the process);
 - **the other layer weights** (attention, norms, shared experts) are already resident on the host,
   so filling them is a copy, not a read.
 
@@ -210,6 +213,28 @@ identical between the two:
 | Gemma 4 26B-A4B Q4_K_M | ~58% of 128 | 6.69 s | 3.70 s | 1.81x |
 | Nemotron 3.5 30B-A3B Q4_0 | ~79% of 128 | 7.42 s | 6.81 s | 1.09x |
 
+### Filling from the expert cache (default; `--no-prefill-from-cache` reads everything from flash)
+
+Between prompts the expert cache holds what the conversation has been routing to, and a device graph
+never admits into it or evicts from it. So before a loader reads an expert from flash it asks the
+cache: one that is resident is copied from RAM instead, the same bytes in the same layout, and the
+device receives exactly what the read would have given it. `prefill_dev_cache_mib` counts what came
+that way. It works with whole layers and with routed reads alike, on any device.
+
+Measured on a 16 GB Mac (M5), Qwen3.6-35B-A3B Q4_K_M, prefill on Metal (`--prefill-device MTL0`,
+ubatch 1024, a 7000 MiB cache), a session of four 3.6 - 4.3k-token documents with a short question
+after each, two runs of each in alternation, same text in all four:
+
+| | flash only | from the cache |
+|---|---:|---:|
+| the four documents' prefill | 73.7 s, 50.4 s | 33.2 s, 31.9 s |
+| arena reads from flash | 297 GiB | 178 GiB |
+| copied from the cache | 0 | 119 GiB (36 - 44 % per document) |
+| graph waiting on the arena | 24.4 s, 28.6 s | 9.8 s, 10.5 s |
+
+The share copied is about the share of the expert set the cache holds; a follow-up that stays on
+the topic finds more of its experts there than a new document does.
+
 The gain is what each layer leaves unrouted: Nemotron's prompts route to most of its experts, many
 of its layers cross the 0.85 fallback, and it barely gains. The figures are for top-4 routing; with
 a model's own top-8 a prompt routes to more experts and the gain is smaller (not measured).
@@ -217,21 +242,32 @@ Per-decision numbers: `bench-data/2026-09-29-prefill-routed/`.
 
 ### What else had to move
 
-- **The KV cache and recurrent state** move once, at load, into the NPU's host buffer type: memory the
-  CPU reads directly and the NPU addresses too, so decode and prefill share one cache. Left in plain
-  CPU memory, every attention of a device graph would run on the CPU. The Hexagon backend exposes that
-  buffer type only with `GGML_HEXAGON_HOSTBUF=1`, which the app sets. The buffers llama.cpp first
+- **The KV cache and recurrent state** move once, at load, into the device's host buffer type where it
+  offers one: memory the CPU reads directly and the device addresses too, so decode and prefill share
+  one cache, and a device graph's attention runs on the device. The Hexagon backend offers one only
+  with `GGML_HEXAGON_HOSTBUF=1`, which upstream made its default in the backend the 0.43 bump brought
+  and every front-end sets back to `0` ([backends.md](backends.md)): on a 12 GB phone it bought no prefill
+  (Qwen3.6-35B-A3B, a 1906-token prompt at 137-138 tok/s with it, 137-140 without), cost decode 7-13%
+  (an op of every decoded token went to the DSP, #544), and with Gemma 4 26B-A4B the load never
+  finished, the DSP never returning from the first layer. Without it the state stays in CPU memory and
+  the attention of a device graph runs on the CPU. Where it does move, the buffers llama.cpp first
   allocated the state in stay allocated, since only llama.cpp can free them, but nothing reads them
-  after the move, so their pages are handed back to the kernel (and again after each
-  `llama_memory_clear`, which rewrites them). Kept resident they would double the KV cache: 1760 MiB
-  on Gemma 4 26B-A4B at an 8192-token context, where Qwen3.6, mostly linear attention, has 143 MiB.
+  after the move, so their pages are handed back to the kernel, for good: a drop of the memory forgets
+  its cells and rewrites no buffer, neither these nor the moved state
+  ([session.md](session.md#independent-prompts-vs-multi-turn-chat)). Kept resident they would double
+  the KV cache: 1760 MiB on Gemma 4 26B-A4B at an 8192-token context when its windowed layers held
+  the whole context (they now hold their window), where Qwen3.6, mostly linear attention, has 143 MiB.
 - **Weights that are not a matmul's matrix.** A backend may hold a `WEIGHTS` buffer in a form only its
   matmul kernels address: with DMA64 on (the default above Hexagon v79), the Hexagon backend maps
   such a buffer for DMA only, and most of its other kernels refuse it at run time, which aborts the
   graph. Gemma 4 met it first: it broadcasts a per-expert scale with `REPEAT`. The capture pass records every layer weight some op reads other than as the matrix of a
-  `MUL_MAT`/`MUL_MAT_ID` (through views too), and those go to a second pair of slots in plain device
-  memory, in their own type. The matrices keep the `WEIGHTS` slots. No op moves: the scheduler still
-  runs each on the device, now on memory every kernel can read.
+  `MUL_MAT`/`MUL_MAT_ID` (through views too), and those go to plain device memory, in their own type.
+  The matrices keep the `WEIGHTS` slots. No op moves: the scheduler still runs each on the device, now
+  on memory every kernel can read. They are not streamed: every layer's are written once at load and
+  stay (4.4 MiB for Qwen3.6-35B-A3B, norms, biases and convolution kernels). Until 0.44.1 they took
+  turns in two slots like the matrices, and the Hexagon backend of the 0.43 bump flushes its DSP queue
+  on a write to plain memory: the loaders' writes, made while the NPU computed, raced the graph's
+  thread on that queue and ended the process.
 - **Weight types the device refuses.** A "Q4_0" gguf is a mix: the one above keeps its shared experts
   in Q5_0 and four attention projections in Q6_K, which the Hexagon matmul does not take. Left alone
   they ran on the CPU inside every device graph (65 matmuls, 111 splits, 17.6 s instead of 11.2 s).
@@ -263,16 +299,19 @@ Per-decision numbers: `bench-data/2026-09-29-prefill-routed/`.
   last, where it shadows no system library. A phone without the library simply does not load the
   module. (It must be the phone's library and not a loader in the APK: opened through the Khronos
   loader, the vendor library binds its own `cl*` calls to the loader's exports and the two
-  deadlock at the first platform query, measured on a Snapdragon phone.) The app also sets the
-  two Hexagon variables this section describes, `GGML_HEXAGON_HOSTBUF=1` and
-  `GGML_HEXAGON_OPPOLL=1`; only that backend reads them.
+  deadlock at the first platform query, measured on a Snapdragon phone.) Of the Hexagon variables
+  below, the front-ends set one, the host buffer, back to off; polling is left at the backend's default.
 - `--prefill-loaders N` (default 8) sets the threads that fill the slots, apart from `--io-threads`,
-  which stays the decode's read lanes. Loaders read in parallel; backend uploads run on the graph
-  thread. Historical measurements with parallel backend repacking do not describe this upload policy.
+  which stays the decode's read lanes. Each loader reads and repacks, and a K-quant repack is
+  CPU-heavy: on a Q4_K_M, 4 loaders left the NPU waiting 10.3 s of a 15.1 s prefill, 8 left it 5.0 of
+  10.0.
 - On device: `ADSP_LIBRARY_PATH` pointing at the directory with the `libggml-htp-v*.so` skels (fastrpc
-  resolves the one for the phone's NPU through it), and `GGML_HEXAGON_HOSTBUF=1`.
-  `GGML_HEXAGON_OPPOLL=1` makes the host poll for the DSP instead of waiting on an interrupt, which
-  halves the cost of each crossing.
+  resolves the one for the phone's NPU through it). `GGML_HEXAGON_HOSTBUF` is set to `0` (above).
+  `GGML_HEXAGON_OPPOLL` is left off too. It makes the host poll for the DSP instead of waiting on an
+  interrupt, and on Android the backend's zero-timeout poll goes to the blocking queue read, which
+  logs an error for every empty poll (#512). Measured on a 12 GB phone with Qwen3.6-35B-A3B Q4_K_M:
+  polled, 1.1 to 3.4 million log rows per load and a 1525-token prefill in 16.7 s; waiting on the
+  interrupt, a dozen to a thousand rows and 15.9 s. It once halved each crossing; it no longer pays.
 
 When the device is not there the run does not fail: a name the registry does not know (no backend in
 the build, or a phone without the fastrpc driver, where Hexagon registers nothing) and a device that
@@ -303,7 +342,8 @@ Price it with `--ppl` on the same Q4_0 model with and without the flag before re
 ## Telemetry
 
 `BMOE_DONE` and the CSV trailer carry `prefill_dev_tokens`, `prefill_dev_nodes` (nodes the device
-actually computed), `prefill_dev_read_mib` and `prefill_dev_stall_s`; `BMOE_DECIDE` carries the same
+actually computed), `prefill_dev_read_mib`, `prefill_dev_stall_s` and `prefill_dev_cache_mib` (what
+the arena copied from the expert cache instead of reading); `BMOE_DECIDE` carries the same
 device counters plus, in routed mode, `prefill_dev_routed` and `prefill_dev_demand` (experts routed,
 and those read at the routing node). See [telemetry.md](telemetry.md).
 

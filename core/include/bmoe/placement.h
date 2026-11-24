@@ -12,12 +12,36 @@
 // types — so the planner can be tested against a synthetic placement.
 #pragma once
 
+#include "bmoe/model_profile.h"
+
 #include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace bmoe {
+
+// llama.cpp's assignment of a model's layers to devices, the one rule every figure of a placement is
+// read against. `n_gpu_layers` counts slots from the top: the output first, then the blocks downwards,
+// and -1 is every slot. The input layer, which holds the embedding tables, never leaves the host.
+struct LayerSlots {
+    uint32_t n_layer = 0;   // the blocks; the slots are these and the output
+    uint32_t on_device = 0; // the slots a device holds, the output first: 0 to n_layer + 1
+    uint32_t first_device_slot() const { return n_layer + 1 - on_device; }
+    uint32_t host_blocks() const { return first_device_slot() < n_layer ? first_device_slot() : n_layer; }
+    bool output_on_device() const { return on_device > 0; }
+};
+LayerSlots layer_slots(int32_t n_gpu_layers, uint32_t n_layer);
+
+// The model's non-expert bytes the host holds under that assignment, read from the file's own parts:
+// the blocks below the first device slot (each block's own bytes where the profile has them, a share
+// by count where it does not), the embedding tables whole, the output where it was not moved, and
+// whatever else sits outside the blocks, which stays on the host.
+struct HostDense {
+    uint64_t bytes = 0;
+    uint64_t tables = 0; // of those, the embedding tables
+};
+HostDense host_dense_of(const ModelProfile & m, const LayerSlots & slots);
 
 struct Placement {
     // Whether the fitter ran and produced this. False means the caller planned without it, and
@@ -37,6 +61,10 @@ struct Placement {
     // stayed on the host, plus KV and compute buffers that live in host memory. This is what the
     // second stage subtracts from the residency budget before sizing its cache.
     uint64_t host_resident_bytes = 0;
+    // The embedding tables' bytes inside `host_resident_bytes` (HostDense::tables). A table is
+    // gathered by row, so a run may leave it in the mapping instead of holding it: what the host has
+    // to hold is the figure above less this. Zero where the model has no such table.
+    uint64_t host_table_bytes = 0;
 
     // Device-local memory the placement uses, summed over devices with memory of their own.
     uint64_t device_bytes = 0;
@@ -69,6 +97,20 @@ struct Placement {
     // memory, read off two context lengths rather than off the architecture. Zero for a context that
     // is all attention, or when not measured.
     uint64_t context_fixed_bytes = 0;
+
+    // A sliding-window cache holds its window and one ubatch of cells, up to the context's length
+    // (window_cells), so a narrower graph holds less of it. What one of those cells costs, on the host
+    // and on the devices, read off the same two widths as the compute buffers' slope, and the window
+    // from the file; zero where the model has none.
+    uint32_t n_swa = 0;
+    uint64_t host_window_cell_bytes = 0;
+    uint64_t device_window_cell_bytes = 0;
+    // The cells a windowed cache holds at graph width `width`.
+    uint64_t window_cells(uint32_t width) const {
+        if (n_swa == 0) return 0;
+        const uint64_t want = (uint64_t) n_swa + width;
+        return n_ctx && want > n_ctx ? n_ctx : want;
+    }
 
     // Which devices those compute buffers were projected for, and each one's part, at the width
     // they were projected at. A device the fitter did not project for (one it never places layers

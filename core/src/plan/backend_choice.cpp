@@ -61,4 +61,39 @@ HardwareProfile without_left_out(const HardwareProfile & hw, const BackendChoice
     return out;
 }
 
+std::vector<std::string> capacity_devices(const HardwareProfile & hw, const std::vector<std::string> & listed) {
+    const auto own = [&](const std::string & name) {
+        for (const ComputeDevice & d : hw.devices)
+            if (!d.is_cpu && d.name == name) return d.has_own_memory() && d.memory_total > 0;
+        return false;
+    };
+    std::vector<std::string> out;
+    for (const std::string & n : listed)
+        if (own(n)) out.push_back(n);
+    return out.empty() ? listed : out;
+}
+
+std::vector<std::string>
+surviving_devices(const HardwareProfile & hw, const std::vector<std::string> & listed, bool * dropped) {
+    const auto failed = [&](const std::string & name) {
+        for (const ComputeDevice & d : hw.devices)
+            if (!d.is_cpu && d.name == name) return d.usable == Tri::No;
+        return false;
+    };
+    std::vector<std::string> asked = listed;
+    if (asked.empty())
+        for (const ComputeDevice & d : hw.devices)
+            if (!d.is_cpu) asked.push_back(d.name);
+    std::vector<std::string> out;
+    bool any = false;
+    for (const std::string & n : asked) {
+        if (failed(n))
+            any = true;
+        else
+            out.push_back(n);
+    }
+    if (dropped) *dropped = any;
+    return any ? out : listed;
+}
+
 } // namespace bmoe

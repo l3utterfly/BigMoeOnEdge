@@ -3,6 +3,7 @@ package io.bigmoeonedge.app.engine
 import io.bigmoeonedge.app.chat.Chat
 
 import android.content.Context
+import android.os.SystemClock
 import android.content.Intent
 import androidx.core.content.ContextCompat
 import io.bigmoeonedge.app.data.AppPrefs
@@ -13,6 +14,7 @@ import io.bigmoeonedge.app.data.HfSearch
 import io.bigmoeonedge.app.data.hfSearchBody
 import io.bigmoeonedge.app.data.hfRequestBody
 import io.bigmoeonedge.app.data.MetricsRecorder
+import io.bigmoeonedge.app.data.ModelCheck
 import io.bigmoeonedge.app.data.Telemetry
 import io.bigmoeonedge.app.data.applyDone
 import io.bigmoeonedge.app.data.applyToken
@@ -50,6 +52,8 @@ data class ModelInfo(
     val busyThreads: Int,
     /** The context against what a client of the server sends; null from a server that does not say. */
     val ctxAdvice: CtxAdvice? = null,
+    /** The model reads images: it was loaded with its projector file (docs/server-api.md, "Images"). */
+    val vision: Boolean = false,
 ) {
     companion object {
         fun of(o: JSONObject?): ModelInfo? {
@@ -58,7 +62,7 @@ data class ModelInfo(
                 o.optString("name"), o.optString("path"), o.optString("arch"), o.optInt("n_ctx"),
                 o.optInt("n_expert_used"), o.optString("think_ctl", "template"), o.optDouble("load_s", 0.0),
                 o.optBoolean("streaming", false), o.optInt("compute_threads", 0), o.optInt("busy_threads", 0),
-                CtxAdvice.of(o.optJSONObject("ctx_advice")),
+                CtxAdvice.of(o.optJSONObject("ctx_advice")), o.optBoolean("vision", false),
             )
         }
     }
@@ -96,6 +100,10 @@ data class ServerInfo(
     val generating: Boolean,
     val ramTotalMib: Long,
     val ramAvailableMib: Long,
+    /** While planning or loading: the seconds since that load began; -1 from an older server. */
+    val loadElapsedS: Double,
+    /** The processor threads the server sees; 0 when it does not say. */
+    val cpuThreads: Int = 0,
 ) {
     val ready get() = state == "ready" && model != null
 
@@ -111,6 +119,8 @@ data class ServerInfo(
                 generating = o.optBoolean("generating", false),
                 ramTotalMib = host?.optLong("ram_total_mib", 0) ?: 0,
                 ramAvailableMib = host?.optLong("ram_available_mib", 0) ?: 0,
+                loadElapsedS = o.optDouble("load_elapsed_s", -1.0),
+                cpuThreads = host?.optInt("cpu_threads", 0) ?: 0,
             )
         }
     }
@@ -263,6 +273,8 @@ data class PlanResult(
     val predictedHitPct: Double = -1.0,
     /** What the loaded model's last turn measured; compared to the prediction only under [fromLastLoad]. */
     val measured: PlanMeasured? = null,
+    /** [measured] against the prediction in the server's words; sent only when the loaded model runs this plan. */
+    val speedCheck: SpeedCheck? = null,
     val pools: List<PlanPool> = emptyList(),
     val devices: List<PlanDevice> = emptyList(),
     /** Why there is no device beyond the host, in words; empty when there is one. */
@@ -285,6 +297,9 @@ data class PlanResult(
             predictedHitPct = o.optJSONObject("predicted")?.optDouble("cache_hit_pct", -1.0) ?: -1.0,
             measured = o.optJSONObject("measured")?.let {
                 PlanMeasured(it.optDouble("s_per_token", 0.0), it.optDouble("cache_hit_pct", -1.0), it.optInt("tokens"))
+            },
+            speedCheck = o.optJSONObject("speed_check")?.let {
+                SpeedCheck(it.optString("badge"), it.optString("against"), it.optString("tone") == "ok")
             },
             pools = objects(o.optJSONObject("memory")?.optJSONArray("pools")).map { p ->
                 PlanPool(
@@ -342,6 +357,10 @@ data class PlanLane(val label: String, val on: List<String>)
 
 data class PlanMeasured(val sPerToken: Double, val cacheHitPct: Double, val tokens: Int)
 
+/** Measured decode against the plan's, as the server words it (`speed_check`): a badge ("+26%",
+ *  "84x"), what it is set against, and whether the run met the plan (`tone`), for the colour. */
+data class SpeedCheck(val badge: String, val against: String, val ok: Boolean)
+
 /** One line of the memory ledger. `inTurn`: lent by the expert cache while a prompt runs. */
 data class PlanRow(val label: String, val bytes: Long, val locked: Boolean, val inTurn: Boolean)
 
@@ -377,8 +396,15 @@ data class EngineUi(
     val serverUp: Boolean = false,
     /** Why the server is not up: it has not started yet, it died (with its stderr), it was stopped. */
     val serverError: String? = null,
+    /**
+     * The engine ended on its own (a crash) and this app started it again: said where models are
+     * loaded until the next load begins, since the restarted engine has no model and no error of its own.
+     */
+    val crashNote: String? = null,
     /** How the running server was started: on the network with the key, or on loopback. */
     val shared: Boolean = false,
+    /** The port the running server took (ListenPort), once it has: null while it starts. */
+    val port: Int? = null,
     /** The system refuses this app any socket, loopback included: only the person can fix it (#298). */
     val networkDenied: Boolean = false,
     val info: ServerInfo? = null,
@@ -390,6 +416,12 @@ data class EngineUi(
     val cpuTempC: Double? = null,
     /** The stage a measurement is in; null when none runs. */
     val planProgress: PlanProgress? = null,
+    /**
+     * When the load in progress began (wall clock, ms), 0 when none is: from the seconds the server
+     * reports (`load_elapsed_s`) and the moment they arrived, so a screen that shows the count can be
+     * left and come back to without starting from zero, and shows the same seconds as every other UI.
+     */
+    val loadStartedAt: Long = 0L,
     /**
      * The plan the server holds for the chosen model (`GET /api/plan?cached=1`, never a measurement):
      * read when the server is reached, when a session opens and when a turn ends, so the Plan screen
@@ -420,8 +452,10 @@ object Engine {
     val state: StateFlow<EngineUi> = _state.asStateFlow()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    // Until a launch says otherwise, a key no server has: nothing it reaches is taken for the app's.
-    @Volatile private var api = Api(ServerProcess.baseUrl(), Api.randomKey())
+    // The client of the server this launch started, made once that server has said which port it
+    // took: until then there is no client, so the key is never sent to a port the app only assumed.
+    @Volatile private var client: Api? = null
+    private val api: Api get() = client ?: throw ConnectException("the engine is not listening yet")
     @Volatile private var connector: Job? = null
     @Volatile private var idleUnload: Job? = null
     @Volatile private var recorder: MetricsRecorder? = null
@@ -432,12 +466,17 @@ object Engine {
     // the exit of the server it stopped, which arrives seconds later, changes nothing.
     private val launches = AtomicLong(0)
     @Volatile private var currentLaunch = 0L
+    // The key the current launch's server was started with, for the client made once it listens.
+    @Volatile private var launchKey = ""
     // Whether a server this app started should be up: between a stop and the next start the
     // connector waits, rather than reconnect to the process that is still on its way out.
     @Volatile private var serving = false
     // The model a restart found loaded, to load again once the next server is up: changing the
     // address or the key is not a person asking to unload. Cleared once used, or by a plain stop.
     @Volatile private var reloadAfterRestart: String? = null
+    // When the engine was last started again after a crash: once a minute at most, so an engine that
+    // dies as it starts stays down with its reason instead of starting over and over.
+    @Volatile private var lastCrashRestart = 0L
 
     val current: EngineUi get() = _state.value
 
@@ -477,59 +516,88 @@ object Engine {
 
     // ── what the service reports ──
 
-    /** A server is about to start with [apiKey]: the client speaks to it, and its launch number is returned. */
+    /** A server is about to start with [apiKey]: its launch number is returned. */
     @Synchronized
     internal fun serverStarting(share: Boolean, apiKey: String): Long {
         val launch = launches.incrementAndGet()
         currentLaunch = launch
-        api = Api(ServerProcess.baseUrl(), apiKey)
+        launchKey = apiKey
+        client = null
         serving = true
-        _state.update { it.copy(serverError = null, shared = share) }
+        _state.update { it.copy(serverError = null, shared = share, port = null) }
         return launch
+    }
+
+    /** The server of [launch] listens on [port]: the client speaks to it from now on. */
+    @Synchronized
+    internal fun serverListening(launch: Long, port: Int) {
+        if (launch != currentLaunch) return // a server already stopped or replaced
+        client = Api(ServerProcess.baseUrl(port), launchKey)
+        _state.update { it.copy(port = port) }
     }
 
     @Synchronized
     internal fun serverStopping() {
         serving = false
         currentLaunch = launches.incrementAndGet()
+        client = null
         recorder?.close()
-        _state.update { it.copy(serverUp = false, serverError = "The engine was stopped.", info = null) }
+        _state.update { it.copy(serverUp = false, serverError = "The engine was stopped.", info = null, port = null) }
     }
 
+    /**
+     * The server of [launch] ended. Returns whether the service should start a new one: after a crash
+     * nobody asked for, so the engine is back for the next load or download without the person
+     * having to find Start engine in Settings. The new server loads nothing by itself, and a load
+     * that crashed it is not repeated: the plan's record already counts it against that device.
+     */
     @Synchronized
-    internal fun serverExited(launch: Long, code: Int, stderrTail: String) {
-        if (launch != currentLaunch) return // a server already stopped or replaced
+    internal fun serverExited(launch: Long, code: Int, stderrTail: String): Boolean {
+        if (launch != currentLaunch) return false // a server already stopped or replaced
         recorder?.close()
         val why = if (code == 0) "The engine stopped." else "The engine process ended (exit $code)."
         val tail = stderrTail.trim().takeLast(1500)
+        val now = SystemClock.elapsedRealtime()
+        val again = code != 0 && serving && (lastCrashRestart == 0L || now - lastCrashRestart > CRASH_RESTART_GAP_MS)
+        if (again) lastCrashRestart = now
         _state.update {
-            it.copy(serverUp = false, serverError = if (tail.isEmpty()) why else "$why\n$tail", info = null)
+            it.copy(
+                serverUp = false,
+                serverError = if (tail.isEmpty()) why else "$why\n$tail",
+                info = null,
+                crashNote = if (again) "The engine stopped unexpectedly (exit $code) and was started again." else it.crashNote,
+            )
         }
+        return again
     }
+
+    private const val CRASH_RESTART_GAP_MS = 60_000L
 
     // ── the event stream ──
 
     private suspend fun connectForever() {
         var backoffMs = 500L
         while (true) {
-            if (!serving) {
+            // Nothing to reach until the server this launch started has said where it listens.
+            val a = client
+            if (!serving || a == null) {
                 if (_state.value.serverUp) _state.update { it.copy(serverUp = false) }
-                delay(500L)
+                delay(if (serving) 100L else 500L)
                 continue
             }
-            val a = api
             try {
                 if (!a.isOurs()) {
-                    // Something answers on the port, and it is not the server this launch started:
-                    // another app's, or one left over. A conversation is not handed to it.
-                    if (a === api) {
+                    // Something answers on the port, and it is not the server this launch started.
+                    // The server holds its port alone and wrote it once bound, so this is not
+                    // expected; a conversation is still not handed to it.
+                    if (a === client) {
                         _state.update {
                             it.copy(
                                 serverUp = false,
                                 info = null,
-                                serverError = "Port ${ServerProcess.PORT} is held by a server this app did not start, so " +
-                                    "the engine cannot listen there. Close the program that holds it (or force-stop " +
-                                    "this app if it is an old engine of its own), then start the engine again.",
+                                serverError = "Port ${it.port} answers as a server this app did not start, so the " +
+                                    "engine is not used there. Start the engine again; if it persists, choose " +
+                                    "another port under Serve on the network.",
                             )
                         }
                     }
@@ -539,7 +607,7 @@ object Engine {
                 // Only while this launch is the one being served: after a stop or a restart the old
                 // process can still send a ping or a state frame for the seconds it takes to end, and
                 // one of those must not mark the engine up again or reach the screens.
-                val current = { serving && a === api }
+                val current = { serving && a === client }
                 a.events(
                     onEvent = { ev ->
                         if (current()) {
@@ -605,7 +673,19 @@ object Engine {
             "state" -> {
                 val info = ServerInfo.of(o)
                 val before = _state.value.info
-                _state.update { it.copy(info = info) }
+                val loadingNow = info.state == "loading" || info.state == "planning"
+                val loadingBefore = before?.state == "loading" || before?.state == "planning"
+                _state.update {
+                    it.copy(
+                        info = info,
+                        loadStartedAt = when {
+                            !loadingNow -> 0L
+                            info.loadElapsedS >= 0 -> System.currentTimeMillis() - (info.loadElapsedS * 1000).toLong()
+                            loadingBefore && it.loadStartedAt != 0L -> it.loadStartedAt
+                            else -> System.currentTimeMillis() // an older server: from its first event
+                        },
+                    )
+                }
                 if (info.ready && (before?.model?.path != info.model?.path || before?.model?.loadS != info.model?.loadS)) {
                     // A new session: a fresh metrics file for it, and the models list may have changed.
                     recorder?.sessionOpened(info, _state.value.config)
@@ -638,6 +718,7 @@ object Engine {
                 val t = _state.value.live.copy().applyDone(o)
                 recorder?.done(o)
                 _state.update { it.copy(live = t, lastDone = o) }
+                Chat.onTurnDone(o, _state.value.info?.model?.nCtx ?: 0, choosing = Decisions.state.value?.running == true)
                 // A finished turn is a new measurement beside the plan the model runs with.
                 if (_state.value.info?.model != null) refreshPlan()
             }
@@ -662,6 +743,7 @@ object Engine {
 
     suspend fun load(modelPath: String?): Result<Unit> = call {
         cancelIdleUnload()
+        _state.update { it.copy(crashNote = null) }
         api.load(modelPath)
     }
 
@@ -721,6 +803,11 @@ object Engine {
         catching { HfFacts.of(api.hfInspect(hfRequestBody(repo, name, token))) }
     }
 
+    /** The server's check of a catalog entry on this phone (data/ModelCheck.kt). */
+    suspend fun inspectEntry(id: String): Result<ModelCheck> = withContext(Dispatchers.IO) {
+        catching { ModelCheck.of(api.inspectEntry(id)) }
+    }
+
     /** Adds the model to the catalog and answers its id; the models list is refreshed so the entry shows. */
     suspend fun hfAdd(repo: String, name: String, token: String): Result<String> = withContext(Dispatchers.IO) {
         catching { api.hfAdd(hfRequestBody(repo, name, token)).getString("id") }.also { refreshModels() }
@@ -739,6 +826,9 @@ object Engine {
         }
     }
 
+    /** The release feed, read by the server when a person taps the button (docs/screens.md, "Updates"). */
+    suspend fun checkUpdate(): Result<UpdateInfo> = withContext(Dispatchers.IO) { catching { UpdateInfo.of(api.update()) } }
+
     /** A model in the server's models directory, deleted by the server by its listed name (every file of a set). */
     suspend fun deleteLocal(name: String): Result<Unit> = withContext(Dispatchers.IO) {
         catching { api.deleteLocal(name); Unit }.also { refreshModels() }
@@ -756,7 +846,15 @@ object Engine {
         catching { api.deletePartial(id); Unit }.also { refreshModels() }
     }
 
-    /** The client for a chat stream: the chat runs it on its own thread and owns the connection. */
+    /** The system prompt of conversation [id] as the server sends it (#625). */
+    suspend fun systemPrompt(id: String): Result<SystemPrompt> = withContext(Dispatchers.IO) {
+        catching { SystemPrompt.of(api.systemPrompt(id)) }
+    }
+
+    /**
+     * The client for a chat stream: the chat runs it on its own thread and owns the connection.
+     * Throws a ConnectException while no server of this app listens, as a closed port would.
+     */
     fun api(): Api = api
 
     private suspend fun call(block: () -> Unit): Result<Unit> = withContext(Dispatchers.IO) { catching(block) }

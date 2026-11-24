@@ -104,15 +104,37 @@ void price_unstreamed(Allocation & a) {
 
     // The ledger keeps what the run holds whatever it does with the weights, and drops the rest.
     Ledger & l = a.ledger;
-    l.rows.erase(
-        std::remove_if(l.rows.begin(), l.rows.end(),
-                       [](const LedgerRow & r) { return r.name == "dense" || r.name == "expert cache" || r.in_turn; }),
-        l.rows.end());
+    l.rows.erase(std::remove_if(l.rows.begin(), l.rows.end(),
+                                [](const LedgerRow & r) {
+                                    return r.kind == LedgerKind::Dense || r.kind == LedgerKind::ExpertCache ||
+                                           r.in_turn;
+                                }),
+                 l.rows.end());
     l.held = l.locked = 0;
     for (const LedgerRow & r : l.rows) {
         l.held += r.bytes;
         if (r.locked) l.locked += r.bytes;
     }
+}
+
+const char * ledger_kind_name(LedgerKind k) {
+    switch (k) {
+    case LedgerKind::ContextCompute:
+        return "context and compute";
+    case LedgerKind::Projector:
+        return "projector";
+    case LedgerKind::Checkpoints:
+        return "context checkpoints";
+    case LedgerKind::Device:
+        return "device";
+    case LedgerKind::Dense:
+        return "dense";
+    case LedgerKind::ExpertCache:
+        return "expert cache";
+    case LedgerKind::DeviceSlots:
+        return "device slots";
+    }
+    return "?";
 }
 
 const char * lane_name(Lane l) {
@@ -230,6 +252,13 @@ void measure_rates(Pricing & c) {
     // Measured on the model's own layer where it was, each half at its own rate.
     c.host_gibs = hw.host_expert_rate();
     c.host_dense_gibs = hw.host_dense_rate();
+    // What a load of this configuration measured the decode's compute at, against what these rates
+    // priced it at: the rates the compute runs at here, per-op and synchronisation costs included,
+    // which a matmul probe does not see. Both halves together, so their ratio stays as measured.
+    if (c.in.compute_scale > 0.0 && c.in.compute_scale != 1.0) {
+        c.host_gibs /= c.in.compute_scale;
+        c.host_dense_gibs /= c.in.compute_scale;
+    }
 
     // The refault price. What a mapped group costs once pressure has dropped its pages, paid one
     // page at a time. Measured separately because it is not a fraction of the sequential rate.
@@ -376,17 +405,18 @@ std::vector<Candidate> price_lanes(Pricing & c) {
                          "floor enforced here is the model's");
 
             // With this model's own hit curve, the cache is priced along it.
-            if (model.hit_curve.measured && c.in.cacheable_bytes > 0 && model.expert_bytes > 0) {
+            if (model.hit_curve.credited() && c.in.cacheable_bytes > 0 && model.expert_bytes > 0) {
                 push_curve_pieces(candidates, model.hit_curve,
                                   (double) c.in.cacheable_bytes / (double) model.expert_bytes, d.bytes, floor,
-                                  seconds_at_mibs(cycle, c.stream_mibs));
+                                  seconds_at_mibs(cycle, c.stream_mibs) * c.in.hit_scale);
                 continue;
             }
 
             // A cache holding the whole expert set saves every read. The credited hit rate is
             // linear in its size, so the saving per byte of RAM is constant above the floor and this
             // candidate can be ranked directly against the read-whole groups.
-            const double saved_full = seconds_at_mibs(cycle, c.stream_mibs) * std::min(1.0f, c.pol.cache_hit_optimism);
+            const double saved_full = seconds_at_mibs(cycle, c.stream_mibs) *
+                                      std::min(1.0, (double) c.pol.cache_hit_optimism * c.in.hit_scale);
             if (saved_full > 0.0)
                 candidates.push_back({g, Lane::ExpertStream, d.bytes, saved_full, saved_full / (double) d.bytes, true,
                                       floor, "expert cache"});
@@ -561,6 +591,61 @@ void spend_ranking(Pricing & c, std::vector<Candidate> & candidates) {
     c.unspent = remaining;
 }
 
+// What the dense policy holds whatever the ranking concluded. The run's dense mode copies every dense
+// tensor it is handed (AllocationInputs::reserved_bytes), so a group read whole every token that the
+// ranking found no room for is not left mapped in the run: it is held, beyond the budget, and the
+// ledger already charges it there. Priced as mapped it stood in the plan at its refault price while
+// the run computed it from RAM: measured on a 12 GB phone, Gemma 4 26B-A4B with a 16384 context
+// predicted 10-44 s a token (attention and the dense FFN at a 40 MiB/s refault) and decoded at
+// 0.45-0.55. So such a group takes the lane the run gives it, up to the reservation's bytes. A table
+// the graph only gathers rows from is the exception the run makes too (settle_mapped_tables): it stays
+// where the ranking put it.
+void hold_reserved(Pricing & c) {
+    const AllocationInputs & in = c.in;
+    Allocation & a = c.a;
+    if (in.reserved_bytes == 0) return;
+    uint64_t held = 0;
+    std::vector<int> left;
+    for (int i = 0; i < (int) WeightGroup::count; ++i) {
+        const WeightGroup g = (WeightGroup) i;
+        if (g == WeightGroup::Experts || c.model.group(g).bytes == 0) continue;
+        const GroupPlacement & p = a.at(g);
+        if (p.lane == Lane::Resident || p.lane == Lane::Pinned)
+            held += p.resident_bytes;
+        else if (p.lane == Lane::Mmap && p.device < 0 && !c.model.group(g).row_gatherable)
+            left.push_back(i);
+    }
+    std::sort(left.begin(), left.end(), [&](int x, int y) {
+        return c.model.group((WeightGroup) x).bytes > c.model.group((WeightGroup) y).bytes;
+    });
+    uint64_t room = in.reserved_bytes > held ? in.reserved_bytes - held : 0;
+    std::string names;
+    uint64_t over = 0;
+    for (int i : left) {
+        const WeightGroup g = (WeightGroup) i;
+        const GroupDemand & d = c.model.group(g);
+        if (d.bytes > room) continue;
+        const double compute = seconds_at_gibs(d.bytes_per_token, c.host_dense_gibs);
+        if (!std::isfinite(compute)) continue;
+        GroupPlacement & p = a.at(g);
+        room -= d.bytes;
+        over += d.bytes;
+        p.lane = a.dense_pinned ? Lane::Pinned : Lane::Resident;
+        p.resident_bytes = d.bytes;
+        p.seconds_per_token = compute;
+        p.reason = std::string(a.dense_pinned ? "pinned" : "resident") +
+                   ": the dense policy copies it whole, though the budget had no room for it";
+        names += (names.empty() ? "" : ", ") + std::string(group_name(g));
+    }
+    if (over == 0) return;
+    note(a, "dense-held", size_brief(over),
+         "The dense weights are held whole: " + size_brief(over) + " of them past the budget.",
+         "the dense policy copies every dense tensor, so " + names + " (" + mibs(over) +
+             ") are held in RAM although the ranking found no room for them within the budget: they are priced "
+             "as held, at their compute, which is what the run does, and the memory they take is charged to the "
+             "ledger past its ceiling, where the machine has to find it");
+}
+
 // The cache, sized against what the loader will actually leave. Two paths, and which one ran is the
 // difference between a number that was chosen and one that was merely available.
 //
@@ -590,17 +675,23 @@ void bound_cache(Pricing & c) {
         (in.lock_in_place_bytes > c.locked ? in.lock_in_place_bytes - c.locked : 0) & ~((1ull << 20) - 1);
     const bool cache_may_lock = in.cache_lock && cache_lock_room >= model.token_cycle_bytes;
     const bool cache_protected = cache_may_lock && in.lock_in_place_bytes_known;
+    // An offered cache is taken back by dropping it, never by a write (AllocationInputs::cache_offered),
+    // so it leaves the margin as a locked one does - all but the token cycle the last pass used.
+    const bool cache_offered = !cache_protected && in.cache_offered && in.cacheable_bytes > model.token_cycle_bytes;
     uint64_t holdable_cap = in.budget_bytes;
-    if (cache_protected && in.holdable_bytes > 0) {
-        // With the cache locked, most of what this run holds cannot be taken back, and a margin sized
-        // on all of it would be room left for a reclaim that cannot happen. It is sized on what stays
-        // ordinary instead, and never lowers the ceiling the caller was given. "Ordinary" is never
-        // less than the rows that really are: an unpinned dense set is memory the machine can take
-        // back however much lock is left unused beside it.
-        const uint64_t locked_all = c.locked + std::min(cache_lock_room, in.cacheable_bytes);
-        const uint64_t ordinary_rows = in.fixed_bytes + in.projector_bytes + in.checkpoint_bytes +
-                                       (in.device_locked ? 0 : in.device_bytes) +
-                                       (a.dense_pinned ? 0 : in.reserved_bytes);
+    if ((cache_protected || cache_offered) && in.holdable_bytes > 0) {
+        // With the cache locked or offered, most of what this run holds is not memory a reclaim has
+        // to write to take back, and a margin sized on all of it would be room left for a reclaim
+        // that does not happen. It is sized on what stays ordinary instead, and never lowers the
+        // ceiling the caller was given. "Ordinary" is never less than the rows that really are: an
+        // unpinned dense set is memory the machine can take back however much lock is left unused
+        // beside it, and an offered cache keeps the experts of its last pass as ordinary memory.
+        const uint64_t exempt_cache = cache_protected ? std::min(cache_lock_room, in.cacheable_bytes)
+                                                      : in.cacheable_bytes - model.token_cycle_bytes;
+        const uint64_t locked_all = c.locked + exempt_cache;
+        const uint64_t ordinary_rows =
+            in.fixed_bytes + in.projector_bytes + in.checkpoint_bytes + (in.device_locked ? 0 : in.device_bytes) +
+            (a.dense_pinned ? 0 : in.reserved_bytes) + (cache_offered ? model.token_cycle_bytes : 0);
         const uint64_t ordinary =
             std::max(in.holdable_bytes > locked_all ? in.holdable_bytes - locked_all : 0, ordinary_rows);
         const uint64_t m = std::max((uint64_t) ((double) ordinary * in.margin_frac), in.margin_min_bytes);
@@ -646,7 +737,7 @@ void bound_cache(Pricing & c) {
 
     if (priced > 0) {
         // What the ranking priced was priced under the caller's ceiling; where the ceiling was raised
-        // for a locked cache, the cache is what the difference is for. And what the ranking left
+        // for a locked or offered cache, the cache is what the difference is for. And what the ranking left
         // unspent goes to the cache too: the curve it priced on is a short record's, flat past the
         // experts those few tokens touched, so it calls a byte past them worth nothing, while a longer
         // answer routes to experts the record never saw and a byte left idle saves nothing at all.
@@ -694,21 +785,30 @@ void bound_cache(Pricing & c) {
     // The cost and the rationale, both from the size that was actually chosen.
     const double held = (double) sized / (double) in.cacheable_bytes;
     const HitCurve & curve = model.hit_curve;
-    const bool from_curve = curve.measured && model.expert_bytes > 0;
+    const bool from_curve = curve.credited() && model.expert_bytes > 0;
+    // Scaled by what a load measured at its own budget (AllocationInputs::hit_scale): the curve as a
+    // whole, so the sizes stay priced relative to each other.
     const double hit =
-        from_curve
-            ? curve.hit_share((uint64_t) ((double) sized * (double) model.expert_bytes / (double) in.cacheable_bytes))
-            : std::min(1.0, (double) c.pol.cache_hit_optimism * held);
+        std::min(1.0, from_curve ? curve.hit_share((uint64_t) ((double) sized * (double) model.expert_bytes /
+                                                               (double) in.cacheable_bytes)) *
+                                       in.hit_scale
+                                 : (double) c.pol.cache_hit_optimism * in.hit_scale * held);
     a.cache_hit_credited = hit;
     p.seconds_per_token =
         seconds_at_mibs((uint64_t) ((1.0 - hit) * (double) model.token_cycle_bytes), c.stream_mibs) +
         finite_or_zero(seconds_at_gibs(model.group(WeightGroup::Experts).bytes_per_token, c.host_gibs));
     char buf[320];
-    if (from_curve)
+    if (from_curve && curve.measured)
         std::snprintf(buf, sizeof(buf),
                       "streamed with a %s cache, %.0f%% of the expert set; credited hit rate %.0f%% [measured on "
                       "this model]: its own routing, %u decoded tokens, replayed through the cache at this size",
                       mibs(sized).c_str(), 100.0 * held, 100.0 * hit, curve.decode_tokens);
+    else if (from_curve)
+        std::snprintf(buf, sizeof(buf),
+                      "streamed with a %s cache, %.0f%% of the expert set; credited hit rate %.0f%% [prior]: %.1f "
+                      "token cycles, on the curve every model without a routing record is credited",
+                      mibs(sized).c_str(), 100.0 * held, 100.0 * hit,
+                      model.token_cycle_bytes ? (double) sized / (double) model.token_cycle_bytes : 0.0);
     else
         std::snprintf(buf, sizeof(buf),
                       "streamed with a %s cache, %.0f%% of the expert set; credited hit rate %.0f%%, which is "
@@ -774,8 +874,9 @@ void offer_devices(Pricing & c) {
         wanted_device = true;
 
         // The crossings this creates: the boundary is entered and left once per layer that has a
-        // group on each side, and the experts are always on the host today.
-        const uint32_t crossings = 2 * std::max(1u, model.n_moe_layer);
+        // group on each side, every time the token passes it, and the experts are always on the
+        // host today.
+        const uint32_t crossings = 2 * std::max(1u, model.moe_layer_runs());
         if (best->split_seconds <= 0.0) {
             const std::string rates = std::to_string((int) std::lround(best_rates.device)) + " vs " +
                                       std::to_string((int) std::lround(best_rates.host)) + " GiB/s";
@@ -846,18 +947,18 @@ void write_ledger(Pricing & c) {
     // a reader checks `locked` against is whichever the locked rows were charged to.
     a.ledger.lockable_cap = std::max(in.lockable_bytes, in.lock_in_place_bytes);
     a.ledger.lockable_cap_known = in.lockable_bytes_known && in.lock_in_place_bytes_known;
-    auto row = [&](const char * name, uint64_t bytes, bool is_locked) {
+    auto row = [&](LedgerKind kind, uint64_t bytes, bool is_locked) {
         if (bytes == 0) return;
-        a.ledger.rows.push_back({name, bytes, is_locked});
+        a.ledger.rows.push_back({kind, ledger_kind_name(kind), bytes, is_locked});
         a.ledger.held += bytes;
         if (is_locked) a.ledger.locked += bytes;
     };
-    row("context and compute", in.fixed_bytes, false);
-    row("projector", in.projector_bytes, false);
-    row("context checkpoints", in.checkpoint_bytes, false);
-    row("device", in.device_bytes, in.device_locked);
-    row("dense", in.reserved_bytes, a.dense_pinned);
-    row("expert cache", a.cache_bytes, a.cache_locked_bytes > 0);
+    row(LedgerKind::ContextCompute, in.fixed_bytes, false);
+    row(LedgerKind::Projector, in.projector_bytes, false);
+    row(LedgerKind::Checkpoints, in.checkpoint_bytes, false);
+    row(LedgerKind::Device, in.device_bytes, in.device_locked);
+    row(LedgerKind::Dense, in.reserved_bytes, a.dense_pinned);
+    row(LedgerKind::ExpertCache, a.cache_bytes, a.cache_locked_bytes > 0);
     if (in.device_turn_bytes > 0) {
         // The prefill-time account: the cache yields up to all of itself, and the slots take their
         // turn. Where the cache is at least as large as they are - and locked like them, or neither
@@ -869,7 +970,8 @@ void write_ledger(Pricing & c) {
         const uint64_t lock_yields = in.device_locked ? std::min(a.cache_locked_bytes, turn) : 0;
         const uint64_t locked_then = a.ledger.locked - lock_yields + (in.device_locked ? turn : 0);
         a.turn_fits = held_then <= a.ledger.holdable_cap && (!in.device_locked || locked_then <= a.ledger.lockable_cap);
-        a.ledger.rows.push_back({"device slots", turn, in.device_locked, true});
+        a.ledger.rows.push_back(
+            {LedgerKind::DeviceSlots, ledger_kind_name(LedgerKind::DeviceSlots), turn, in.device_locked, true});
     }
 }
 
@@ -885,6 +987,20 @@ void add_totals(Pricing & c) {
 }
 
 } // namespace
+
+double host_compute_seconds(const HardwareProfile & hw, const ModelProfile & model) {
+    double sum = 0.0;
+    for (int i = 0; i < (int) WeightGroup::count; ++i) {
+        const WeightGroup g = (WeightGroup) i;
+        const GroupDemand & d = model.group(g);
+        if (d.bytes == 0) continue;
+        const double t = seconds_at_gibs(d.bytes_per_token,
+                                         g == WeightGroup::Experts ? hw.host_expert_rate() : hw.host_dense_rate());
+        if (!std::isfinite(t)) return 0.0;
+        sum += t;
+    }
+    return sum;
+}
 
 Allocation allocate(const HardwareProfile & hw,
                     const ModelProfile & model,
@@ -902,6 +1018,7 @@ Allocation allocate(const HardwareProfile & hw,
     charge_fixed(c);
     std::vector<Candidate> candidates = price_lanes(c);
     spend_ranking(c, candidates);
+    hold_reserved(c);
     bound_cache(c);
     offer_devices(c);
     write_ledger(c);

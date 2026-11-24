@@ -83,8 +83,9 @@ cache-off (the default), and lets the dense-weights policy handle the other half
 
 There is one runtime move now, and it is the half of the governor that was never the problem.
 `--cache-brake` (on by default, `--no-cache-brake` to turn it off) halves the expert cache when the
-system takes it back mid-run, and that is all it does: it never grows the budget again within a run,
-and it never goes under one token's worst-case cycle.
+system takes it back mid-run, and that is all it does: it never grows an ordinary cache's budget again within a run,
+and it never goes under one token's worst-case cycle. A discardable cache is the exception (below): it climbs back by
+itself, because growing it into pressure costs a drop, never a write.
 
 It moves only when two signals agree, both about the engine's own work and its own pages, so it reads
 the same on every platform:
@@ -96,7 +97,10 @@ the same on every platform:
    A page the cache wrote and the kernel then compressed, swapped or trimmed is reclaim by definition.
 
 A slow token with every sampled page in place (the cores, the clock, a neighbour) moves nothing. A
-run that never stalls never pays for a sample.
+run that never stalls never pays for a sample. A token decoded under a knob trial's candidate
+([measured-planning.md](measured-planning.md)) is read by neither the stall test nor the reference:
+it is slow by choice, and on a phone one such token with a single sampled page out once halved the
+cache for the rest of the session.
 
 What it answers is what the planner cannot know at load: how much of the budget this machine will
 let the process keep, now. A 12 GB phone given a 6 GB share compressed 2.5 GB of an engine holding
@@ -206,6 +210,28 @@ holding the dense set — rather than reading unmeasured.
 Byte-identity gates: `G6` proves the rebind changes not a single output byte against the mmap-resident
 reference, and `G7` proves the same with O_DIRECT off (the read may bypass the page cache or not; the
 rebound bytes are identical either way).
+
+## Drop, never swap
+
+A process can hand the kernel memory it may DROP instead of writing anywhere, and now the
+expert cache does (`--cache-discard`, [cache-sizing.md](cache-sizing.md)). The kernel then answers
+pressure the cheapest way there is: the cache shrinks, a dropped expert is read again from flash,
+and nothing is swapped, neither the cache nor what a pinned cache would have pushed out. Measured
+under 9 GB of real pressure on a 16 GB Mac: every volatile purgeable object emptied and 0 bytes
+swapped. On Linux, `MADV_FREE`'d pages are reclaimed like clean file pages, without being
+compressed into zram or written back from it. Measured on the test phone (Android 16, 4 KiB pages)
+under 3 GB of pressure: the kernel freed 99.4% of 1 GB offered (`pglazyfreed` +1019 MiB). Every page
+came back either intact or zero, none of them wrong.
+
+The budget follows what the kernel lets the cache keep, down and back up. What keeps the brake from
+growing back does not hold here. Growing ordinary memory into pressure costs compression or swap
+before the next sample can see it, which is what made the governor oscillate. Growing an offered
+cache into pressure costs the kernel a drop and the cache a re-read, both cheap, and nothing is
+written. It grows only after a full pass with no drop, only as fast as misses need room, and never
+past the budget its owner set. A brake lowers it at once and does not replace that budget: the cache climbs back
+after the kernel has been quiet, and each brake doubles how long it waits ([cache-sizing.md](cache-sizing.md)). On a
+16 GB Mac a brake that set the halved budget as the new one held Gemma-4-26B at 0.8 GB of cache and 10.9 tok/s for the
+rest of a ten-turn chat.
 
 ## Portability of what remains
 

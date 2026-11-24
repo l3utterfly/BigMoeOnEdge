@@ -6,18 +6,11 @@
 
 add_executable(bmoe_moe_gates moe_gates.cpp)
 target_link_libraries(bmoe_moe_gates PRIVATE bmoe_core)
-add_executable(bmoe_device_arena_thread_test device_arena_thread_test.cpp)
-target_link_libraries(bmoe_device_arena_thread_test PRIVATE bmoe_core)
-get_target_property(_arena_ggml_source ggml-base SOURCE_DIR)
-target_include_directories(bmoe_device_arena_thread_test PRIVATE
-    ../core/src/moe ${_arena_ggml_source})
-add_test(NAME device_arena_thread COMMAND bmoe_device_arena_thread_test)
-set_tests_properties(device_arena_thread PROPERTIES TIMEOUT 30)
 # G16 probes the loopback rpc-server port before registering it.
 if(WIN32)
     target_link_libraries(bmoe_moe_gates PRIVATE ws2_32)
 endif()
-target_include_directories(bmoe_moe_gates PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
+target_include_directories(bmoe_moe_gates PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe ${CMAKE_SOURCE_DIR}/core/src/io)
 
 # A real Session::open with the full device confirmation and a page-aware fake mlock allowance.
 # The test adapter object supplies the production platform_io symbols, so the static archive's
@@ -25,12 +18,33 @@ target_include_directories(bmoe_moe_gates PRIVATE ${CMAKE_SOURCE_DIR}/core/src/m
 if(UNIX AND NOT ANDROID)
     add_executable(bmoe_startup_pin_fit_test startup_pin_fit_test.cpp startup_pin_platform_io.cpp)
     target_link_libraries(bmoe_startup_pin_fit_test PRIVATE bmoe_core)
+    # The same substitution for one syscall, pread: a real session whose expert reads can be refused.
+    add_executable(bmoe_expert_read_failure_test expert_read_failure_test.cpp expert_read_failure_platform_io.cpp)
+    target_link_libraries(bmoe_expert_read_failure_test PRIVATE bmoe_core)
 endif()
 
 add_executable(bmoe_lock_limits_test lock_limits_test.cpp)
 target_link_libraries(bmoe_lock_limits_test PRIVATE bmoe_core)
 target_include_directories(bmoe_lock_limits_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/io)
 add_test(NAME lock_limits COMMAND bmoe_lock_limits_test)
+
+# A release unpacked under a folder whose name is not ASCII (#677): the programs find the backends
+# beside themselves through that path. The whole output folder is copied, since the libraries the
+# CLI loads sit in it, and the CLI is asked to probe a device that does not exist: it loads the
+# backends first, and says so only if it got that far.
+if(TARGET bmoe-cli)
+    set(BMOE_NON_ASCII_BIN "${CMAKE_BINARY_DIR}/bin-日本語-ünï")
+    add_test(NAME non_ascii_install_path_setup
+             COMMAND ${CMAKE_COMMAND} -E copy_directory $<TARGET_FILE_DIR:bmoe-cli> "${BMOE_NON_ASCII_BIN}")
+    add_test(NAME non_ascii_install_path
+             COMMAND "${BMOE_NON_ASCII_BIN}/$<TARGET_FILE_NAME:bmoe-cli>" --probe-device no-such-device)
+    add_test(NAME non_ascii_install_path_cleanup
+             COMMAND ${CMAKE_COMMAND} -E remove_directory "${BMOE_NON_ASCII_BIN}")
+    set_tests_properties(non_ascii_install_path_setup PROPERTIES FIXTURES_SETUP non_ascii_bin)
+    set_tests_properties(non_ascii_install_path_cleanup PROPERTIES FIXTURES_CLEANUP non_ascii_bin)
+    set_tests_properties(non_ascii_install_path PROPERTIES FIXTURES_REQUIRED non_ascii_bin
+                         PASS_REGULAR_EXPRESSION "no such device to probe")
+endif()
 
 # Reasoning-parser wiring regression (issue #49). Needs no model — it drives the extracted
 # bmoe::detail::build_parse_params directly — so it runs unconditionally, unlike the gates below.
@@ -60,10 +74,24 @@ target_link_libraries(bmoe_prompt_stream_test PRIVATE bmoe_core)
 target_include_directories(bmoe_prompt_stream_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/engine)
 add_test(NAME prompt_stream COMMAND bmoe_prompt_stream_test)
 
+# The whole-model answer check's rules (core/src/engine/device_answer.h): how two computations of a
+# model are judged to agree, the graphs the sequence goes through, the configuration a session
+# reopens with. Pure policy, no model; the check itself on a loaded model is gate G28.
+add_executable(bmoe_device_answer_test device_answer_test.cpp)
+target_link_libraries(bmoe_device_answer_test PRIVATE bmoe_core)
+target_include_directories(bmoe_device_answer_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/engine)
+add_test(NAME device_answer COMMAND bmoe_device_answer_test)
+
 # The real Session path must apply request-local grammar to both token selection sites.
 add_executable(bmoe_output_constraint_session_test output_constraint_session_test.cpp)
 target_link_libraries(bmoe_output_constraint_session_test PRIVATE bmoe_core)
 target_include_directories(bmoe_output_constraint_session_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/engine)
+
+# The request that makes a context reserve its compute buffers again (compute_reservation.h): a
+# llama.cpp behaviour the prefill device depends on, checked on the tiny model every build.
+add_executable(bmoe_compute_reservation_test compute_reservation_test.cpp)
+target_link_libraries(bmoe_compute_reservation_test PRIVATE bmoe_core)
+target_include_directories(bmoe_compute_reservation_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/engine)
 
 # Thinking-control tests (issue #82). Drives bmoe::detail::probe_think_control and the prefill
 # against real vendored templates, so it needs no model and runs unconditionally.
@@ -97,6 +125,7 @@ add_test(NAME params_table COMMAND bmoe_params_test)
 if(TARGET bmoe_server_core)
     add_executable(bmoe_server_test server_test.cpp)
     target_link_libraries(bmoe_server_test PRIVATE bmoe_server_core)
+    target_compile_definitions(bmoe_server_test PRIVATE BMOE_CATALOG_PATH="${CMAKE_SOURCE_DIR}/catalog/models.json")
     add_test(NAME server_logic COMMAND bmoe_server_test)
 
     # The desktop app's server side: the signed release feed, backend packs, archives that would
@@ -107,12 +136,20 @@ if(TARGET bmoe_server_core)
     add_test(NAME feed_and_packs COMMAND bmoe_feed_test)
 endif()
 
-# The desktop app's rules (desktop/app_core.h): preferences, port, server arguments, which pages the
+# The desktop app's rules (desktop/app_core.h): preferences, server arguments, which pages the
 # bridge answers, which file runs as an update. No window, no server.
 if(TARGET bmoe_desktop_core)
     add_executable(bmoe_desktop_test desktop_test.cpp)
-    target_link_libraries(bmoe_desktop_test PRIVATE bmoe_desktop_core cpp-httplib)
+    target_link_libraries(bmoe_desktop_test PRIVATE bmoe_desktop_core)
     add_test(NAME desktop_rules COMMAND bmoe_desktop_test)
+endif()
+
+# The port the server listens on (server/listen_port.h): the fallback past ports in use, the probe
+# for a port something answers on, the port file a launcher reads. Real sockets on loopback.
+if(TARGET bmoe_server_platform)
+    add_executable(bmoe_listen_port_test listen_port_test.cpp)
+    target_link_libraries(bmoe_listen_port_test PRIVATE bmoe_server_platform cpp-httplib)
+    add_test(NAME listen_port COMMAND bmoe_listen_port_test)
 endif()
 
 # bmoe-server's engine host: loads, turns, cancel and unload across threads, and which failures
@@ -129,6 +166,12 @@ if(TARGET bmoe_server)
     add_executable(bmoe_agent_test agent_test.cpp)
     target_link_libraries(bmoe_agent_test PRIVATE bmoe_server)
     add_test(NAME agent COMMAND bmoe_agent_test)
+
+    # The server end to end over HTTP with the engine and the planner scripted (server.h, Embedding):
+    # a planned load opened once on the plan as made, and its other side opened when its side does not.
+    add_executable(bmoe_server_app_test server_app_test.cpp)
+    target_link_libraries(bmoe_server_app_test PRIVATE bmoe_server cpp-httplib)
+    add_test(NAME server_app COMMAND bmoe_server_app_test)
 endif()
 
 # release_file_mappings: on Windows it must find and drop this process's own view + section of a
@@ -144,6 +187,14 @@ add_executable(bmoe_file_reader_test file_reader_test.cpp)
 target_link_libraries(bmoe_file_reader_test PRIVATE bmoe_core)
 target_include_directories(bmoe_file_reader_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/io)
 add_test(NAME file_reader COMMAND bmoe_file_reader_test)
+
+# self_path: the executable's own file with every link resolved, so a link on PATH (what install.sh
+# puts there) still finds the backend modules beside the real file (#605). Starts itself again
+# through a link; no model.
+add_executable(bmoe_self_path_test self_path_test.cpp)
+target_link_libraries(bmoe_self_path_test PRIVATE bmoe_core)
+target_include_directories(bmoe_self_path_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/io)
+add_test(NAME self_path COMMAND bmoe_self_path_test)
 
 # The llama.cpp log bridge: DEBUG dropped unless asked, CONT following its message, a requested
 # cancel's decode errors demoted while it is in flight. Drives the installed callback; no model.
@@ -176,6 +227,13 @@ add_executable(bmoe_stall_union_test stall_union_test.cpp)
 target_link_libraries(bmoe_stall_union_test PRIVATE bmoe_core)
 target_include_directories(bmoe_stall_union_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
 add_test(NAME stall_union COMMAND bmoe_stall_union_test)
+
+# The discardable-cache policy against a fake kernel: which entries are offered and when, what a
+# lookup finds after a drop, when a drop is measurable. No platform, no model, no timing.
+add_executable(bmoe_discardable_entries_test discardable_entries_test.cpp)
+target_link_libraries(bmoe_discardable_entries_test PRIVATE bmoe_core)
+target_include_directories(bmoe_discardable_entries_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
+add_test(NAME discardable_entries COMMAND bmoe_discardable_entries_test)
 
 # How llama.cpp's tensor and graph-node names are read, and the fitter's expert-override patterns.
 # Pure string rules over the conventions every reader shares, so they run without a model.
@@ -240,7 +298,7 @@ endif()
 
 if(PYTHON3)
     # arch → (fixture id, gguf filename). Each gets a generate fixture + a gate run.
-    foreach(spec "qwen3moe" "gemma4" "nemotron_h_moe")
+    foreach(spec "qwen3moe" "gemma4" "nemotron_h_moe" "inkling2_loop")
         set(_model "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-${spec}.gguf")
         set(_fixture "TINY_MOE_MODEL_${spec}")
 
@@ -257,6 +315,16 @@ if(PYTHON3)
     add_test(NAME output_constraint_session COMMAND bmoe_output_constraint_session_test
              "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-qwen3moe.gguf")
     set_tests_properties(output_constraint_session PROPERTIES FIXTURES_REQUIRED TINY_MOE_MODEL_qwen3moe)
+
+    if(TARGET bmoe_expert_read_failure_test)
+        add_test(NAME expert_read_failure COMMAND bmoe_expert_read_failure_test
+                 "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-qwen3moe.gguf")
+        set_tests_properties(expert_read_failure PROPERTIES FIXTURES_REQUIRED TINY_MOE_MODEL_qwen3moe)
+    endif()
+
+    add_test(NAME compute_reservation COMMAND bmoe_compute_reservation_test
+             "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-qwen3moe.gguf")
+    set_tests_properties(compute_reservation PROPERTIES FIXTURES_REQUIRED TINY_MOE_MODEL_qwen3moe)
 
     if(TARGET bmoe_startup_pin_fit_test)
         add_test(NAME startup_pin_fit COMMAND bmoe_startup_pin_fit_test
@@ -288,6 +356,13 @@ endif()
 # device — which is the point: rules meant to hold on hardware we do not own are checked here.
 add_executable(bmoe_planner_test planner_test.cpp)
 target_link_libraries(bmoe_planner_test PRIVATE bmoe_core)
+# The planner's tests are one long main() whose locals (hundreds of whole plans) share one stack frame
+# on a compiler that does not overlap disjoint scopes: past the 1 MiB a Windows executable gets by
+# default it faults on entry, before a line is printed. The size every other platform here gives a
+# main thread.
+if(MSVC)
+    target_link_options(bmoe_planner_test PRIVATE /STACK:8388608)
+endif()
 add_test(NAME planner COMMAND bmoe_planner_test)
 
 # The routing trace the planner prices the cache from: its LRU replay against scripts/route-replay.py
@@ -304,6 +379,9 @@ target_include_directories(bmoe_memory_topology_test PRIVATE ${CMAKE_SOURCE_DIR}
 if(APPLE AND GGML_METAL)
     target_compile_definitions(bmoe_memory_topology_test PRIVATE BMOE_HAVE_METAL_MEMORY_PROBE=1)
 endif()
+if(GGML_OPENCL AND BMOE_OPENCL_INCLUDE)
+    target_compile_definitions(bmoe_memory_topology_test PRIVATE BMOE_HAVE_OPENCL_MEMORY_PROBE=1)
+endif()
 add_test(NAME memory_topology COMMAND bmoe_memory_topology_test)
 
 # The cache brake's policy, replayed on measured per-token compute traces.
@@ -317,3 +395,4 @@ add_test(NAME cache_brake COMMAND bmoe_cache_brake_test)
 add_executable(bmoe_knob_trial_test knob_trial_test.cpp)
 target_link_libraries(bmoe_knob_trial_test PRIVATE bmoe_core)
 add_test(NAME knob_trial COMMAND bmoe_knob_trial_test)
+

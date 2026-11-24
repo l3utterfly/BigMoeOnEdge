@@ -10,7 +10,7 @@ The same facts cut by operating system, next to the rest of what each platform h
 
 ## What the pinned llama.cpp carries
 
-Read from `ggml/src/` and `ggml/CMakeLists.txt` of the pinned submodule (`7ac98f4a8`, read again at that bump: same backends, same columns). A bump can
+Read from `ggml/src/` and `ggml/CMakeLists.txt` of the pinned submodule (`09e3dc4`, read again at that bump: same backends, same columns). A bump can
 add or remove rows; redo the reading rather than trusting this table.
 
 The last three columns come from reading the sources, not from running them: the type each backend
@@ -57,17 +57,18 @@ Three things in that table decide what this engine can do with a backend.
 
 | backend | where | state | what it does today |
 |---|---|---|---|
-| CPU | Android, Windows, macOS, Linux | measured on phones and desktops; gates run in CI on Linux | decode, prefill, expert streaming |
+| CPU | Android, Windows, macOS, Linux | measured on phones and desktops; gates run in CI on Linux, macOS and Windows | decode, prefill, expert streaming |
 | Hexagon | Android, Snapdragon with Hexagon v73 or later | measured on a phone; in the release APK (`scripts/build-hexagon-android.sh`). On Windows on Snapdragon, built into its own ARM64 archive (`-npu`), its DSP libraries in a catalog signed in CI: the driver runs them only after the user turns test-signing on and trusts that certificate, by hand ([npu-windows.md](npu-windows.md)); never run on a laptop | prefill on the NPU, decode on the CPU ([npu-prefill.md](npu-prefill.md)) |
 | Metal | macOS | measured on one 16 GB Apple-silicon laptop; on in every macOS build | prefill on the GPU, decode on the CPU ([npu-prefill.md](npu-prefill.md)) |
 | RPC | host test builds | a test fixture only: a loopback server fronting the CPU, so the prefill-device gates have a second device | nothing a front-end can select |
 | BLAS | macOS, where llama.cpp turns it on by default | linked, never given a weight; the planner does not list it as a device, since it registers as an accelerator, part of the host | nothing placed on it |
-| OpenCL | Android, Windows on ARM | built, in the Windows ARM64 archive with the Adreno kernels (never run on a Snapdragon laptop; the driver's own loader is used, none is shipped) and in the release APK beside Hexagon (`scripts/build-hexagon-android.sh`), importing the Khronos ICD loader so a phone without OpenCL still starts the engine, and the vendor's own library where there is one; in July the dense set on a phone's integrated GPU was measured and lost 27 % (`RunConfig::dense_on_device`) | run on a Snapdragon-class phone with an Adreno GPU: 344 GiB/s at prefill width against the cores' 36, and it did not reproduce the host's result, so the plan refuses it on correctness and the prefill stays where the decode is; named by hand it is refused by the arena, whose per-expert placement its padded allocations do not fit ([npu-prefill.md](npu-prefill.md)) |
+| OpenCL | Android, Windows on ARM | built, in the Windows ARM64 archive with the Adreno kernels (never run on a Snapdragon laptop; the driver's own loader is used, none is shipped) and in the release APK beside Hexagon (`scripts/build-hexagon-android.sh`), importing the Khronos ICD loader so a phone without OpenCL still starts the engine, and the vendor's own library where there is one; in July the dense set on a phone's integrated GPU was measured and lost 27 % | run on a Snapdragon-class phone with an Adreno GPU: 344 GiB/s at prefill width against the cores' 36, and it did not reproduce the host's result, so the plan refuses it on correctness and the prefill stays where the decode is; named by hand it is refused by the arena, whose per-expert placement its padded allocations do not fit ([npu-prefill.md](npu-prefill.md)) |
 | Vulkan | Android, Linux, Windows | built, in the release APK and in the Linux and Windows archives, as a module that loads only where a Vulkan driver is present. One 2020 phone ran it and its driver ended the probe, which is what the isolated probe contains | run on the same phone: 44 GiB/s one token wide against the cores' 36, and 36 at prefill width, so no prefill win; its fp16 path did not reproduce the host's result and its fp32 one did. Forced by hand, a 1727-token prompt prefilled in 85 s against 65 on the cores ([npu-prefill.md](npu-prefill.md)) |
-| CUDA, HIP, SYCL | Linux, Windows | not in any archive: a module built where the toolchain is (`-DGGML_CUDA=ON`, ...) and dropped beside the binary is loaded like the shipped ones; none has been run here | unknown |
+| CUDA, HIP | Linux, Windows | shipped as packs beside the archives ([platforms.md](platforms.md)), built by `.github/workflows/gpu-modules.yml` once per llama.cpp version; the GPUs they have code for are llama.cpp's release's, checked in CI by `scripts/check-gpu-targets.py`; measured on rented NVIDIA cards and one AMD datacenter card | every role a device with memory of its own takes |
+| SYCL | Linux, Windows | not in any archive: a module built where the toolchain is (`-DGGML_SYCL=ON`) and dropped beside the binary is loaded like the shipped ones; never run here | unknown |
 | MUSA, WebGPU, CANN, OpenVINO, ET, zDNN, ZenDNN, VirtGPU | - | never built here | unknown |
 
-Three backends, then, with a measurement behind them, out of eighteen.
+Five backends, then, with a measurement behind them, out of eighteen.
 
 Two decisions behind the archives, written down so they are not re-made by accident. CUDA and HIP
 stay out of the default archives: their runtime libraries weigh more than the rest of the archive,
@@ -99,7 +100,7 @@ any device llama.cpp's cache accepts can take it. The capture warm-up runs on a 
 cache, because with it on the expert matmuls read its slots instead of the host tensors the capture
 looks for; the context is then made again with it. It is refused with `--overlap` (whose wait sits
 inside the CPU's expert matmul, which no longer runs) and with a prefill device (which moves the
-layers); speculation works beside it, with the draft's own head served from the host. Gates G25a-c
+layers); speculation works beside it, with the draft's own head served from the host. Gates G25a-d
 (`tests/moe_gates.cpp`) prove the cached runs give the resident placement's bytes, the experts
 resident, streamed, and streamed under n-gram speculation, on a device with memory of its own (the
 loopback RPC device).
@@ -118,10 +119,18 @@ memory, and a device's backend copies ordinary memory through a staging buffer o
 backend may offer a host buffer type of its own (`ggml_backend_dev_host_buffer_type`: page-locked
 memory on CUDA, Vulkan and SYCL; none on Metal, OpenCL or RPC), and a copy from it can go straight to
 the device. The isolated device probe times the same upload from both (`upload_gibs`,
-`upload_host_buffer_gibs`), and where the second wins by the planner's margin and the host holds a
-second copy of the experts beside everything else, the plan names the device in
-`--expert-host-buffer`: at load the experts are copied into that buffer type, byte for byte in the
-file's layout, and the expert tensors pointed at the copy as the streamer points them at its slots.
+`upload_host_buffer_gibs`), and where the second wins by the planner's margin and the host holds the
+model, the plan names the device in `--expert-host-buffer`: at load the experts are copied into that
+buffer type, byte for byte in the file's layout, and the expert tensors pointed at the copy as the
+streamer points them at its slots. The copy takes the place of the experts' pages in the file's
+mapping, which are handed back once the tensors point at the copy, so the plan charges the experts
+once. Charged twice (until 0.45.1), the copy was refused on every 64 GB machine a 32 GB expert set
+ran on, and misses arrived at half the rate.
+That has to hold while the copy is made, so each tensor's pages are handed back as soon as its copy
+is, from the mapping and, where the system has the call, from its cache of the file: unmapped
+alone they still count against a container's limit, and under one the copy outran the kernel's
+reclaim (0.45.1 to 0.46.1, [field-reports.md](field-reports.md)). A copy larger than the system can
+give is not made: the cache uploads from the mapping.
 The capture that finds them runs on the context the device cache then makes again, so the decode
 context carries no callback. Experts streamed from flash live in the streamer's slots, which this
 does not move.
@@ -135,6 +144,25 @@ cache's order of computation), so that card cannot show the copy changes no outp
 does yet: the loopback RPC device the gates run on has no host buffer type of its own. The bytes
 are copied unchanged and the tensors' shapes and strides untouched, which is the argument until a
 gate runs on a device that has one.
+
+**Misses computed on the host.** With every expert on the device, the cores compute none of them,
+and each miss crosses the link before the device can compute it. `--device-cache-cpu-share F` hands
+a share `F` of the misses to the host, once the cache is full (`moe_cache_cpu_share` in
+`llama_context_params`): llama.cpp builds the layer's experts on the device from the cache and on
+the CPU from the host's copy, each half weighted only for the experts it computes, and adds the two;
+the CPU half does not wait for the device's. A miss computed on the host is not admitted, so below
+1 the cache keeps learning from the misses still uploaded. It needs the experts resident
+(`--moe-stream` off): over streamed experts the host half would read the streamer's slots, and no
+gate covers that yet. Gate G25d proves half the misses on the host give the resident placement's
+bytes. `--auto` arms no share: it is set by hand ([why](hardware-planning.md#who-computes-the-device-caches-misses)). Measured on a
+12 GB card (RTX 3060 class) with Qwen3.8-Flash-Next IQ3_S, every expert resident, a 5.3 GB cache, 256
+greedy tokens: 18.5 tok/s uploading every miss, 19.9 with half of them on the host, 20.8 with seven
+in ten, and 17.5 with all of them on the host, where the cache stops learning; a price of it picked
+0.76-0.78 there and decoded at 21.1-21.2. On a 32 GB card (RTX 5090 class) with Q2_0 the same price
+picked 0.89 and lost 40% (114 to 68 tok/s over 2048 tokens) with no miss reaching the host: a share
+above 0 gives every MoE layer a CPU half, a fixed cost the card pays either way. That is why `--auto`
+leaves every miss uploaded: a short timed decode on that card gave 70.9 tok/s with the share against
+103 without.
 
 Measured on a 24 GB discrete card (PCIe at about 26 GB/s, 48 host cores, 85 GiB of host memory),
 Qwen3.8-Flash-Next 125B GSQ-RCO Q2_0, every layer on the card, greedy:
@@ -179,6 +207,47 @@ So on unified memory it does not pay, and the plan never arms it there: a shared
 tier to fill. On the discrete card above the same synchronization is cheap and the cache is the
 fastest placement measured.
 
+## What the front-ends tell a backend before it loads
+
+Some of a ggml backend's behaviour can be chosen only through its environment, which it reads when it
+loads. `core/` reads no environment (AGENTS.md, rule 3); the front-ends do it, from one table every one
+of them applies before any backend loads (`frontend/backend_env.h`): bmoe-cli, bmoe-server and the apps
+that run it start the backends alike. An entry only fills a variable the environment left unset, so a
+value a person set stays, and ggml's own default stands unless a measurement said otherwise. A
+variable is read only by its own backend, so an entry costs nothing where that backend is not loaded,
+and no entry is tied to a platform: wherever the backend runs, it reads the same value.
+
+| Backend | Variable | Value | Why |
+|---|---|---|---|
+| OpenCL | `GGML_OPENCL_KERNEL_CACHE_DIR` | `<data>/backend-cache` | compiled kernels kept between runs, in a folder an app can write (the default is a temporary folder) |
+| Hexagon | `GGML_HEXAGON_HOSTBUF` | `0` | no host buffer, so the KV cache stays in CPU memory and a decoded token sends no op to the DSP. Upstream documents it as a debugging aid and made it the default in the backend the 0.43 bump brought; on a 12 GB phone it cost 7-13% of the decode, bought no prefill, and hung Gemma 4's load on the NPU (#512, #544, [npu-prefill.md](npu-prefill.md)) |
+| CUDA, ROCm | `GGML_CUDA_REGISTER_HOST` | `1` | enables the backend's generic entry point for pinning memory a process allocated (`ggml_backend_register_host_buffer`), which the engine asks for by name for the experts' host copy behind a device cache ([measured-planning.md](measured-planning.md)): on a rented 3090, 117 GB of GLM-4.7's experts took 97 s to allocate as the backend's own pinned memory, where touching ordinary memory on 16 threads and pinning it took 6 s every 32 GB |
+
+ROCm is ggml's CUDA backend built with HIP, so it reads the same variable and gets the same entry.
+**Only CUDA has been measured**: pinning on ROCm goes through `hipHostRegister`, whose speed on an AMD
+card is not known here. A backend without the entry point, or one that declines, gets its own host memory as
+before, at the speed it allocates it. Metal has no host buffer type of its own, so there is no copy
+to make on a Mac, whether its GPU shares the memory or not.
+
+**Still at ggml's default, and touching this engine's paths.** Each needs a measurement on the
+hardware it is for before it gets an entry:
+
+- CUDA, ROCm: CUDA graphs on the decode (`GGML_CUDA_DISABLE_GRAPHS`, `GGML_CUDA_GRAPH_OPT`), with the
+  router hook between a layer's nodes.
+- Vulkan: where the experts' host copy and the uploads live (`GGML_VK_PREFER_HOST_MEMORY`,
+  `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM`) and whether uploads go through the transfer queue
+  (`GGML_VK_ASYNC_USE_TRANSFER_QUEUE`). Vulkan has no pinning entry point, and how fast it allocates
+  its host buffer is not measured.
+- Metal: how long a model's buffers stay resident after a load ends (`GGML_METAL_RESIDENCY_KEEP_ALIVE_S`,
+  `GGML_METAL_NO_RESIDENCY`), which back-to-back loads on a Mac depend on.
+- Hexagon: polling (`GGML_HEXAGON_OPPOLL`), off by default: on, it logged over a million error rows a
+  load on a phone for under 1 s of a 16 s prefill (#512).
+- CPU: KleidiAI's SME kernels on Arm (`GGML_KLEIDIAI_SME`).
+
+The rest of the backends' variables (around three hundred in the pinned llama.cpp, most of them
+OpenCL's kernel choices per quantization) select kernels, debug, or turn a feature off around a
+driver's fault; they stay ggml's to decide.
+
 ## How a backend reaches the planner
 
 No rule names a backend. A device that registers is enumerated, asked for its memory, and
@@ -203,7 +272,8 @@ each of the others.
 NVIDIA runtime and cuBLAS, HIP against ROCm) is not in the installers but a pack of its own, which
 the desktop app installs where it applies ([desktop-app.md](desktop-app.md)). The server installs
 it into `<data>/backends/<id>/`, and at start-up the engine loads modules from each folder under
-`<data>/backends/` after the executable's own: `core/` does not know the data folder, so
+`<data>/backends/` after the executable's own (the folder of the executable's file, every link to
+it resolved, so a link on PATH such as `install.sh` makes still finds them: #605). `core/` does not know the data folder, so
 `register_backends()` takes the folders from its front-end (the server; the CLI passes none and
 loads from its own folder only). A folder adds a module only for a backend no folder before it
 had, the executable's first, so no device registers twice; within a folder the module named after
@@ -224,7 +294,11 @@ backends of one card on the same measured rate: this model's expert block where 
 probe ran on all of them, the GEMV otherwise, never one of each. Another backend replaces the first
 only where it is faster by the planner's margin; the plan then names the devices in
 `--device-list`, the capacity fitter places on that list, and every rule after the choice sees one
-device per card (`core/src/plan/backend_choice.cpp`). A device whose id the backend does not report
+device per card (`core/src/plan/backend_choice.cpp`). An integrated GPU is a card of its own and stays
+in the list, but the fitter is not asked of it where a listed device has memory of its own
+(`capacity_devices`): it adds no capacity, the fitter would still put layers on it, and a placement
+that touches the host's memory is set aside whole. llama.cpp's own default list leaves an integrated
+GPU out beside a discrete one for the same reason; the list the plan hands it has to as well. A device whose id the backend does not report
 is never taken for another one's card. Nothing here knows which backend is usually faster where:
 the release archives carry the modules, and the machine answers.
 

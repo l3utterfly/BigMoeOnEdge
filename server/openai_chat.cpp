@@ -1,5 +1,6 @@
 #include "openai_chat.h"
 #include "image_part.h"
+#include "request_sampling.h"
 
 #include <algorithm>
 
@@ -263,7 +264,8 @@ bool parse_chat_request(const json & body, const RunConfig & cfg, OpenAiChatRequ
         err = "the last message must be from the user or a tool: there is nothing to answer otherwise";
         return false;
     }
-    if (!parse_tools(body, turn, err) || !parse_tool_choice(body, turn, err) || !parse_response_format(body, turn, err))
+    if (!parse_tools(body, turn, err) || !parse_tool_choice(body, turn, err) ||
+        !parse_response_format(body, turn, err) || !parse_request_sampling(body, SamplingDialect::Chat, turn, err))
         return false;
 
     turn.n_predict = cfg.n_predict;
@@ -288,12 +290,17 @@ bool parse_chat_request(const json & body, const RunConfig & cfg, OpenAiChatRequ
     out.stream = body.contains("stream") && body["stream"].is_boolean() && body["stream"].get<bool>();
     out.include_usage = body.contains("stream_options") && body["stream_options"].is_object() &&
                         body["stream_options"].value("include_usage", json(false)) == json(true);
+    out.return_progress = body.contains("return_progress") && body["return_progress"] == json(true);
     return true;
+}
+
+std::string tool_call_id(const std::string & response_id, size_t index) {
+    return "call_" + response_id + "_" + std::to_string(index);
 }
 
 void ensure_tool_call_ids(std::vector<ChatToolCall> & calls, const std::string & response_id) {
     for (size_t i = 0; i < calls.size(); ++i)
-        if (calls[i].id.empty()) calls[i].id = "call_" + response_id + "_" + std::to_string(i);
+        if (calls[i].id.empty()) calls[i].id = tool_call_id(response_id, i);
 }
 
 std::string finish_reason(const RunResult & r, int n_predict) {
@@ -358,6 +365,42 @@ json chunk_json(const ChatResponseMeta & meta, const json & delta, const json & 
 
 json tool_calls_delta(const std::vector<ChatToolCall> & calls) {
     return {{"tool_calls", tool_calls_json(calls, /*indexed*/ true)}};
+}
+
+json tool_call_events_delta(const std::vector<ToolCallEvent> & events) {
+    json calls = json::array();
+    for (const ToolCallEvent & e : events) {
+        // The protocol has no close: a call ends where the next one begins, or with the turn.
+        if (e.type == ToolCallEvent::Type::Open)
+            calls.push_back({{"index", (int) e.index},
+                             {"id", e.id},
+                             {"type", "function"},
+                             {"function", {{"name", e.name}, {"arguments", ""}}}});
+        else if (e.type == ToolCallEvent::Type::Delta)
+            calls.push_back({{"index", (int) e.index}, {"function", {{"arguments", e.arguments}}}});
+    }
+    return calls.empty() ? json(nullptr) : json{{"tool_calls", calls}};
+}
+
+namespace {
+
+json utf8_bytes(const std::string & s) {
+    json b = json::array();
+    for (unsigned char c : s)
+        b.push_back((int) c);
+    return b;
+}
+
+} // namespace
+
+json logprob_entry(const TokenMetrics & m, int top) {
+    json candidates = json::array();
+    for (size_t i = 0; i < m.top_logprobs.size() && (int) i < top; ++i) {
+        const TokenLogprob & c = m.top_logprobs[i];
+        candidates.push_back(
+            {{"id", c.id}, {"token", c.piece}, {"logprob", c.logprob}, {"bytes", utf8_bytes(c.piece)}});
+    }
+    return {{"token", m.piece}, {"logprob", m.logprob}, {"bytes", utf8_bytes(m.piece)}, {"top_logprobs", candidates}};
 }
 
 json usage_chunk_json(const ChatResponseMeta & meta, const RunSummary & s) {

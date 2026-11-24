@@ -4,6 +4,7 @@
   import { differsFromPlan, helpParts, isDefault, specialLabel, typicalText, valueSource } from '../../lib/schema';
   import type { ParamSpec, ParamValue, PlanDecision } from '../../lib/types';
   import { settings } from '../../stores/settings.svelte';
+  import { t } from '../../lib/text';
 
   let {
     spec,
@@ -13,6 +14,7 @@
     decision,
     needsReload = false,
     readOnly = false,
+    showLevel = false,
   }: {
     spec: ParamSpec;
     value: ParamValue | undefined;
@@ -23,6 +25,8 @@
     needsReload?: boolean;
     /** Shown, not edited: its group is set elsewhere. */
     readOnly?: boolean;
+    /** Say when the row is experimental or a debug aid (Advanced settings, where those rows live). */
+    showLevel?: boolean;
   } = $props();
 
   const id = $derived(`param-${spec.key}`);
@@ -83,11 +87,11 @@
 
 {#snippet undo()}
   {#if planOffer}
-    <button type="button" class="link" onclick={() => settings.reset(spec.key)}>Use plan value{planText ? `: ${planText}` : ''}</button>
+    <button type="button" class="link" onclick={() => settings.reset(spec.key)}>{planText ? t('param.usePlan.value', { value: planText }) : t('param.usePlan')}</button>
   {:else if userSet && decision && source === 'you' && (decision.group ?? 'set') === 'set'}
-    <button type="button" class="link" onclick={() => settings.reset(spec.key)}>Let the plan set it</button>
+    <button type="button" class="link" onclick={() => settings.reset(spec.key)}>{t('param.letPlan')}</button>
   {:else if userSet}
-    <button type="button" class="link" onclick={() => settings.reset(spec.key)}>Reset to default</button>
+    <button type="button" class="link" onclick={() => settings.reset(spec.key)}>{t('param.reset')}</button>
   {/if}
 {/snippet}
 
@@ -111,18 +115,21 @@
       <label class="label" for={id}>{spec.label}</label>
     {/if}
     <span class="badges">
-      {#if spec.lossy}<span class="badge warn" title="This setting changes what the model outputs">changes output</span>{/if}
-      {#if spec.scope === 'request'}<span class="badge info" title="Applies from the next message, without a reload">per message</span>{/if}
-      {#if needsReload}<span class="badge warn" title="The loaded model runs with another value until it is reloaded">needs reload</span>{/if}
+      {#if showLevel && (spec.level === 'experimental' || spec.level === 'debug')}
+        <span class="badge warn" title={t(`param.level.${spec.level}.title`)}>{t(`param.level.${spec.level}`)}</span>
+      {/if}
+      {#if spec.lossy}<span class="badge warn" title={t('param.lossy.title')}>{t('param.lossy')}</span>{/if}
+      {#if spec.scope === 'request'}<span class="badge info" title={t('param.request.title')}>{t('param.request')}</span>{/if}
+      {#if needsReload}<span class="badge warn" title={t('param.reload.title')}>{t('param.reload')}</span>{/if}
       {#if !readOnly}
-        <span class="badge source {source}" title={sourceTitle}>{source === 'you' ? 'set by you' : source === 'plan' ? 'from the plan' : 'default'}</span>
+        <span class="badge source {source}" title={sourceTitle}>{t(`param.source.${source === 'you' || source === 'plan' ? source : 'default'}`)}</span>
       {/if}
     </span>
   </div>
 
   {#if readOnly}
     <div class="control">
-      <output id={id} class="readonly figure" tabindex="-1">{displayValue(value) || 'none'}</output>
+      <output id={id} class="readonly figure" tabindex="-1">{displayValue(value) || t('param.none')}</output>
     </div>
   {:else if spec.type !== 'bool'}
     <div class="control">
@@ -149,7 +156,7 @@
           id={id}
           type="text"
           inputmode={numeric ? 'decimal' : undefined}
-          placeholder={numeric ? 'number or auto' : ''}
+          placeholder={numeric ? t('param.numberOrAuto') : ''}
           value={draft}
           oninput={onText}
           onfocus={() => (focused = true)}
@@ -157,7 +164,7 @@
           class:wide={spec.type === 'path' || spec.type === 'text'}
         />
         {#if numeric && spec.accepts_auto && draft.trim().toLowerCase() !== 'auto'}
-          <button type="button" onclick={() => { draft = 'auto'; commit('auto'); settings.flush(); }}>Auto</button>
+          <button type="button" onclick={() => { draft = 'auto'; commit('auto'); settings.flush(); }}>{t('param.auto')}</button>
         {/if}
       {/if}
       {#if spec.unit && numeric}<span class="muted unit">{spec.unit}</span>{/if}
@@ -176,13 +183,13 @@
     <p class="lead muted">{help.lead}</p>
   {/if}
   <details class="help">
-    <summary>More <span class="visually-hidden">about {spec.label}</span></summary>
+    <summary>{t('param.more')} <span class="visually-hidden">{t('param.more.about', { label: spec.label })}</span></summary>
     {#if help.rest}<p>{help.rest}</p>{/if}
     {#if spec.details}<p>{spec.details}</p>{/if}
     {#if spec.special?.length}
       <p>{spec.special.map((s) => `${displayValue(s.value)} = ${s.label}`).join('; ')}</p>
     {/if}
-    <p class="muted flag"><code>{spec.flag || (spec.switches ?? []).map((s) => s.flag).join(' ')}</code> default <code>{displayValue(spec.default)}</code>{#if spec.min !== undefined && numeric}, accepted from {spec.min}{spec.max !== undefined ? ` to ${spec.max}` : ''}{/if}</p>
+    <p class="muted flag"><code>{spec.flag || (spec.switches ?? []).map((s) => s.flag).join(' ')}</code> {t('param.default')} <code>{displayValue(spec.default)}</code>{#if spec.min !== undefined && numeric}{spec.max !== undefined ? t('param.range', { min: spec.min, max: spec.max }) : t('param.rangeFrom', { min: spec.min })}{/if}</p>
   </details>
 </div>
 

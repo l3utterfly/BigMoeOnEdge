@@ -10,7 +10,16 @@
 namespace bmoe::server {
 
 bool is_api_path(const std::string & path) {
-    return path.compare(0, 5, "/api/") == 0 || path.compare(0, 4, "/v1/") == 0;
+    if (path.compare(0, 5, "/api/") == 0 || path.compare(0, 4, "/v1/") == 0) return true;
+    // llama-server's paths without the /v1 prefix (llama_compat.h): the engine too, under the same key.
+    static const char * const roots[] = {"/health",           "/props",      "/metrics",        "/slots",
+                                         "/tokenize",         "/detokenize", "/apply-template", "/models",
+                                         "/chat/completions", "/responses"};
+    for (const char * r : roots) {
+        const std::string root = r;
+        if (path == root || path.compare(0, root.size() + 1, root + "/") == 0) return true;
+    }
+    return false;
 }
 
 // The port goes: after the bracket for a bracketed IPv6 literal, after the colon when there is
@@ -83,7 +92,10 @@ AccessDecision check_access(const AccessPolicy & policy, const RequestFacts & r)
     // the API behind it, and a client on the network has no page.
     // Either header carries it: Bearer is how OpenAI clients and the UI send a key, X-Api-Key how
     // Anthropic clients do.
-    if (api && !policy.api_key.empty() && !bearer_matches(r.authorization, policy.api_key) &&
+    // /health answers without it, as llama-server's does: a supervisor or a start script asks it
+    // before it holds the key, and the answer says only whether a model is ready.
+    const bool health = !write && (r.path == "/health" || r.path == "/v1/health");
+    if (api && !health && !policy.api_key.empty() && !bearer_matches(r.authorization, policy.api_key) &&
         !key_matches(r.x_api_key, policy.api_key))
         return {401, "an API key is required: send it as Authorization: Bearer <key> (or X-Api-Key: <key>)", ""};
 
@@ -106,6 +118,7 @@ const std::vector<LocalOnlyRoute> & local_only_routes() {
     static const std::vector<LocalOnlyRoute> routes = {
         {"DELETE", "/api/models/local/**", "delete a model"},
         {"POST", "/api/models/url", "add a model from a link"},
+        {"PUT", "/api/models/folders", "choose the folders models are kept in"},
         {"GET", "/api/backends", "list the backend packs"},
         {"POST", "/api/backends/*/install", "install a backend pack"},
         {"GET", "/api/update", "check for an update"},
@@ -273,13 +286,17 @@ bool is_preview_path(const std::string & path) {
     return !id.empty() && id.find('/') == std::string::npos;
 }
 
-const std::vector<std::pair<std::string, std::string>> & preview_headers() {
+const std::vector<std::pair<std::string, std::string>> & preview_headers(bool network) {
     // A workspace file is the agent's work, not this UI: an HTML page or an SVG it wrote may carry
-    // script. The policy itself sandboxes the document (an opaque origin, whatever frame shows it),
-    // lets its own inline script and styles run so a page the agent built can be tried, and lets it
-    // load nothing from anywhere: no request to this server's API, no other host, no form. Only the
-    // UI's own page may frame it.
-    static const std::vector<std::pair<std::string, std::string>> h = {
+    // script. Either way the policy sandboxes the document (an opaque origin, whatever frame shows
+    // it), lets its own script and styles run so a page the agent built can be tried, and keeps it
+    // from this server: no request to its API (plain http on this machine, never an https: source),
+    // no form, no frame, and only the UI's own page may frame it.
+    //
+    // What differs is the internet. Without it the page loads nothing from anywhere, so anything it
+    // takes from the network (a library, a font, data it fetches) is missing. With it the page
+    // reaches https hosts as any page a person opens does: every kind of load, whatever it is for.
+    static const std::vector<std::pair<std::string, std::string>> closed = {
         {"Content-Security-Policy", "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; "
                                     "style-src 'unsafe-inline'; img-src data: blob:; font-src data:; "
                                     "media-src data: blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; "
@@ -288,7 +305,21 @@ const std::vector<std::pair<std::string, std::string>> & preview_headers() {
         {"Referrer-Policy", "no-referrer"},
         {"X-Frame-Options", "SAMEORIGIN"},
     };
-    return h;
+    static const std::vector<std::pair<std::string, std::string>> open = {
+        {"Content-Security-Policy",
+         "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' blob: https:; "
+         "style-src 'unsafe-inline' https:; img-src data: blob: https:; font-src data: https:; "
+         "media-src data: blob: https:; connect-src https: wss:; worker-src blob: https:; object-src 'none'; "
+         "base-uri 'none'; form-action 'none'; frame-ancestors 'self'"},
+        {"X-Content-Type-Options", "nosniff"},
+        {"Referrer-Policy", "no-referrer"},
+        {"X-Frame-Options", "SAMEORIGIN"},
+    };
+    return network ? open : closed;
+}
+
+bool preview_network_for(const std::string & mode, bool loopback) {
+    return mode == "on" || (mode == "auto" && loopback);
 }
 
 } // namespace bmoe::server

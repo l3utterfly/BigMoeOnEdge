@@ -5,6 +5,7 @@
 import { displayValue } from './coerce';
 import { commandLine } from './format';
 import { sameValue, specialLabel } from './schema';
+import { t } from './text';
 import type { Config, ParamSpec, ParamValue, PlanDecision, PlanDevice, PlanMeasured, PlanMemoryPool } from './types';
 
 /**
@@ -67,8 +68,37 @@ export function memorySegments(pool: PlanMemoryPool): MemorySegment[] {
   if (whole <= 0) return [];
   const out: MemorySegment[] = held.map((r, i) => ({ label: r.label ?? r.name, bytes: r.bytes, frac: r.bytes / whole, locked: r.locked, slot: i }));
   const free = whole - sum;
-  if (free > 0) out.push({ label: 'Free', bytes: free, frac: free / whole, locked: false, slot: -1 });
+  if (free > 0) out.push({ label: t('plan.memory.free'), bytes: free, frac: free / whole, locked: false, slot: -1 });
   return out;
+}
+
+/**
+ * The memory bar as cells (docs/design.md, "The signature"): each of `n` cells takes the slot of the
+ * segment it falls in, by largest remainder, so the counts add up to `n` and a part held at all
+ * keeps at least one cell where there is room for it.
+ */
+export function memoryCells(segs: readonly MemorySegment[], n = 40): number[] {
+  if (segs.length === 0 || n <= 0) return [];
+  const exact = segs.map((s) => s.frac * n);
+  const counts = exact.map((x) => Math.floor(x));
+  let left = n - counts.reduce((a, c) => a + c, 0);
+  const order = exact.map((x, i) => ({ i, r: x - Math.floor(x) })).sort((a, b) => b.r - a.r);
+  for (const o of order) {
+    if (left <= 0) break;
+    counts[o.i]++;
+    left--;
+  }
+  // A held part rounded to nothing takes a cell from the largest one.
+  for (let i = 0; i < counts.length; i++) {
+    if (counts[i] === 0 && segs[i].bytes > 0) {
+      const big = counts.indexOf(Math.max(...counts));
+      if (counts[big] > 1) {
+        counts[big]--;
+        counts[i] = 1;
+      }
+    }
+  }
+  return segs.flatMap((s, i) => Array<number>(counts[i]).fill(s.slot));
 }
 
 /** A badge's colour, from a device's role alone: green when it works here, red when it was refused. */
@@ -82,22 +112,27 @@ export function rateScale(devices: readonly PlanDevice[]): number {
   return devices.reduce((m, d) => Math.max(m, d.prompt_ratio), 1);
 }
 
+/** A decode rate as a person reads it: one decimal, or two significant digits where one decimal would read 0.0. */
+export function rateText(tokS: number): string {
+  if (!Number.isFinite(tokS) || tokS <= 0) return '-';
+  return tokS >= 0.1 ? tokS.toFixed(1) : tokS.toPrecision(2);
+}
+
 export interface SpeedCheck {
   predictedTokS: number | null;
   measuredTokS: number | null;
-  /** Measured against predicted, as bmoe-cli prints it: positive when the run beat the plan. */
-  deltaPct: number | null;
   predictedHitPct: number | null;
   measuredHitPct: number | null;
 }
 
+/** The figures the Plan page's tiles draw. Measured against predicted in words is the server's
+ *  (`speed_check`, server/plan_view.h), never worked out here. */
 export function speedCheck(predicted: { s_per_token?: number; cache_hit_pct?: number } | undefined, measured: PlanMeasured | undefined): SpeedCheck {
   const ps = predicted?.s_per_token ?? 0;
   const ms = measured?.s_per_token ?? 0;
   return {
     predictedTokS: ps > 0 ? 1 / ps : null,
     measuredTokS: ms > 0 ? 1 / ms : null,
-    deltaPct: ps > 0 && ms > 0 ? 100 * (ps / ms - 1) : null,
     predictedHitPct: predicted?.cache_hit_pct ?? null,
     measuredHitPct: measured && measured.cache_hit_pct >= 0 ? measured.cache_hit_pct : null,
   };

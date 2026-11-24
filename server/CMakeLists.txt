@@ -11,7 +11,7 @@ if(NOT TARGET cpp-httplib)
 endif()
 
 # The release target this build is, as the feed names it (docs/desktop-app.md): which installer,
-# archive and backend packs are this machine's. Empty where the releases ship nothing (a phone).
+# archive and backend packs are this machine's. Empty for an architecture the releases do not build.
 set(BMOE_TARGET_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
 if(APPLE AND CMAKE_OSX_ARCHITECTURES)
     set(BMOE_TARGET_ARCH "${CMAKE_OSX_ARCHITECTURES}")
@@ -25,8 +25,14 @@ else()
     set(BMOE_TARGET_ARCH "")
 endif()
 set(BMOE_BUILD_TARGET "")
-if(BMOE_TARGET_ARCH AND NOT IOS AND NOT ANDROID)
-    if(APPLE)
+if(BMOE_TARGET_ARCH)
+    # The phones are named too, so the update check says which build asked; the feed carries no
+    # installer for them (their apps ship beside it), and their packs list none of these targets.
+    if(ANDROID)
+        set(BMOE_BUILD_TARGET "android-${BMOE_TARGET_ARCH}")
+    elseif(IOS)
+        set(BMOE_BUILD_TARGET "ios-${BMOE_TARGET_ARCH}")
+    elseif(APPLE)
         set(BMOE_BUILD_TARGET "macos-${BMOE_TARGET_ARCH}")
     elseif(WIN32)
         set(BMOE_BUILD_TARGET "windows-${BMOE_TARGET_ARCH}")
@@ -40,9 +46,10 @@ endif()
 # feed sets this to its own key's base64.
 set(BMOE_FEED_PUBLIC_KEY "" CACHE STRING "Base64 Ed25519 public key the release feed is verified with (empty: server/feed_key.h's)")
 
-# What the server and the desktop app ask the operating system (platform.h): no engine in it, so
-# the app links it without the engine.
-add_library(bmoe_server_platform STATIC platform.cpp)
+# What the server and the desktop app ask the operating system (platform.h), and the port the server
+# listens on and reports (listen_port.h): no engine in it, so the app links it without the engine.
+add_library(bmoe_server_platform STATIC platform.cpp listen_port.cpp)
+target_link_libraries(bmoe_server_platform PUBLIC bmoe_frontend PRIVATE cpp-httplib)
 target_include_directories(bmoe_server_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(bmoe_server_platform SYSTEM PUBLIC ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/vendor)
 target_compile_definitions(bmoe_server_platform PRIVATE BMOE_BUILD_TARGET="${BMOE_BUILD_TARGET}")
@@ -75,6 +82,8 @@ add_library(bmoe_server_core STATIC
     anthropic_messages.cpp
     decide_protocol.cpp
     openai_chat.cpp
+    llama_compat.cpp
+    request_sampling.cpp
     openai_responses.cpp
     image_part.cpp
     turn_queue.cpp
@@ -119,7 +128,6 @@ add_library(bmoe_server STATIC
     model_library.cpp
     model_inspect.cpp
     planner_adapter.cpp
-    routing_store.cpp
     service_manager.cpp
     agent.cpp
     agent_external.cpp
@@ -134,14 +142,6 @@ if(WIN32)
     target_link_libraries(bmoe_server PUBLIC ws2_32)
 endif()
 
-# The hardware planner is a library the engine may or may not carry. Detected by its header, the
-# same way the overlap hook is detected by its own: the server offers /api/plan when it is there
-# and says it is not otherwise, with nothing to configure.
-if(EXISTS "${CMAKE_SOURCE_DIR}/core/include/bmoe/planner.h")
-    target_compile_definitions(bmoe_server PRIVATE BMOE_HAVE_PLANNER=1)
-    message(STATUS "bmoe-server: hardware planner present (/api/plan enabled)")
-endif()
-
 # On iOS an app links the library instead (examples/ios/app): no executable, nothing to stage.
 if(IOS)
     return()
@@ -149,6 +149,7 @@ endif()
 
 add_executable(bmoe-server main.cpp)
 target_link_libraries(bmoe-server PRIVATE bmoe_server)
+bmoe_utf8_process(bmoe-server)
 
 # Beside the libraries, so the build tree runs without touching PATH.
 set_target_properties(bmoe-server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

@@ -316,6 +316,7 @@ void probe_bandwidth(HardwareProfile & hw, const ModelProfile & model) {
         uint32_t best_n = 0;
         for (int t : thread_ladder(hw.n_cores)) {
             const RunResult r = run_gemv(dev, probe, t, false);
+            if (r.ok) hw.thread_rates.push_back({(uint32_t) t, r.gibs});
             if (r.ok && r.gibs > best_rate * 1.02) { // a rung has to beat the incumbent by more than noise
                 best_rate = r.gibs;
                 best_n = (uint32_t) t;
@@ -391,7 +392,7 @@ void probe_bandwidth(HardwareProfile & hw, const ModelProfile & model) {
             const RunResult r = run_gemv(dev, wide, 0, false);
             if (!r.ok) continue;
             d.wide_matmul_gibs = r.gibs;
-            d.wide_identity_ok = agrees(r.out, wide_ref) ? Tri::Yes : Tri::No;
+            d.wide_identity_ok = agrees(r.out, wide_ref, detail::k_max_nmse_device_wide) ? Tri::Yes : Tri::No;
         }
     }
 

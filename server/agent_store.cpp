@@ -67,9 +67,12 @@ namespace {
 bool read_json(const fs::path & p, json & out, std::vector<std::string> & warnings) {
     std::error_code ec;
     if (!fs::exists(p, ec)) return false;
-    std::ifstream f(p, std::ios::binary);
     std::ostringstream ss;
-    ss << f.rdbuf();
+    {
+        // Closed before any rename below: Windows will not rename a file that is still open.
+        std::ifstream f(p, std::ios::binary);
+        ss << f.rdbuf();
+    }
     try {
         out = json::parse(ss.str());
         return true;
@@ -222,6 +225,7 @@ json AgentStore::create_conversation(json fields) {
            {"mode", fields.value("mode", std::string("ask"))},
            {"route", fields.value("route", std::string("local"))},
            {"agent", fields.value("agent", std::string("builtin"))},
+           {"system", fields.value("system", std::string())},
            {"state", "idle"},
            {"created", t},
            {"updated", t},

@@ -16,6 +16,8 @@ final class Engine: ObservableObject {
     @Published private(set) var serverError: String?
     /// Whether the running server listens on the network, with the shown key.
     @Published private(set) var shared = false
+    /// The port the running server took (ListenPort), once it has: nil while it starts.
+    @Published private(set) var port: Int?
     @Published private(set) var info: ServerInfo?
     @Published private(set) var params: [ParamSpec] = []
     @Published private(set) var config: ConfigState?
@@ -30,6 +32,8 @@ final class Engine: ObservableObject {
     @Published private(set) var lastDone: JSON?
     /// The stage a measurement is in (Measure, or an auto load), from `plan_progress`; nil when none runs.
     @Published private(set) var planProgress: PlanProgress?
+    /// The load under way: the seconds the server reported and when; a screen counts on from them.
+    @Published private(set) var loadBase: (elapsed: Double, at: Date)?
     /// The plan the server holds for the chosen model (`GET /api/plan?cached=1`, never a measurement):
     /// read when the server is reached, when a session opens and when a turn ends, so the Plan screen
     /// opens on it at once and its measured figures land when the answer does, whichever screen is open.
@@ -45,10 +49,22 @@ final class Engine: ObservableObject {
     private let server = EngineServer()
     private let recorder: MetricsRecorder
     private let downloader: ModelDownloader
-    private(set) var api: APIClient
+    /// The client of the server this launch started, made once that server has said which port it
+    /// took: until then there is none, so the key is never sent to a port the app only assumed.
+    private var client: APIClient?
+    /// Throws as a closed port would while no server of this app listens.
+    var api: APIClient {
+        get throws {
+            guard let c = client else { throw URLError(.cannotConnectToHost) }
+            return c
+        }
+    }
+    /// Each start is a launch of its own: what an earlier one finds out arrives too late to count.
+    private var launch = 0
     private var connector: Task<Void, Never>?
     private var restartAfterExit = false
-    /// The conversations' events (`conversation`, `item`, `delta`): the chat's model reads them off
+    /// The conversations' events (`conversation`, `item`, `delta`, and `done` for the figures of the
+    /// turn that ended): the chat's model reads them off
     /// the one event stream rather than holding a second one.
     var conversationEvents: ((String, JSON) -> Void)?
     /// The server was reached (again): what the chat keeps of the server is read anew.
@@ -59,8 +75,6 @@ final class Engine: ObservableObject {
     init() {
         recorder = MetricsRecorder(directory: paths.metrics)
         downloader = ModelDownloader(modelsDir: paths.documents, resumeDir: paths.downloads)
-        // Until a launch says otherwise, a key no server has: nothing it reaches is taken for ours.
-        api = APIClient(baseURL: server.baseURL, apiKey: APIClient.randomKey())
         downloader.onChange = { [weak self] progress in
             Task { @MainActor in self?.downloads = progress }
         }
@@ -106,13 +120,32 @@ final class Engine: ObservableObject {
         let share = preferences.shareOnNetwork
         // A fresh key per launch on loopback; the shown one when the network is served.
         let key = share ? networkKey : APIClient.randomKey()
-        api = APIClient(baseURL: server.baseURL, apiKey: key)
+        launch += 1
+        let mine = launch
+        client = nil
+        port = nil
         shared = share
         serverError = nil
-        server.start(.init(share: share, key: key), paths: paths) { [weak self] code in
+        server.start(.init(share: share, key: key, port: preferences.port), paths: paths) { [weak self] code in
             self?.serverExited(code)
         }
+        Task { await followPort(launch: mine, key: key) }
         if connector == nil { connector = Task { await connectForever() } }
+    }
+
+    /// The port, once the server of `launch` has bound it: before its slow start-up (the compute
+    /// backends), so the app connects and waits in the listen queue rather than guess. Given up when
+    /// that server stops first; its exit then says why.
+    private func followPort(launch mine: Int, key: String) async {
+        let file = EngineServer.portFile(paths)
+        while server.running, launch == mine {
+            if let p = ListenPort.read(file) {
+                client = APIClient(baseURL: EngineServer.baseURL(port: p), apiKey: key)
+                port = p
+                return
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
     }
 
     /// Stops the server (and frees the model). `start()` brings it back.
@@ -133,12 +166,14 @@ final class Engine: ObservableObject {
     private func serverExited(_ code: Int32) {
         serverUp = false
         info = nil
+        client = nil
+        port = nil
         if restartAfterExit {
             restartAfterExit = false
             start()
             return
         }
-        // Exit 1 at start is a port another program holds (the server says so on its log).
+        // Exit 1 at start is every port in reach held by other programs (the server says so on its log).
         serverError = code == 0 ? "The engine was stopped." : "The engine stopped (exit \(code))."
     }
 
@@ -147,22 +182,24 @@ final class Engine: ObservableObject {
     private func connectForever() async {
         var backoff: UInt64 = 500_000_000
         while !Task.isCancelled {
-            guard server.running else {
-                try? await Task.sleep(nanoseconds: 500_000_000)
+            // Nothing to reach until the server this launch started has said where it listens.
+            guard server.running, let a = client else {
+                try? await Task.sleep(nanoseconds: server.running ? 100_000_000 : 500_000_000)
                 continue
             }
-            let a = api
             do {
                 guard try await a.isOurs() else {
-                    // Something answers on the port and it is not the server this launch started:
-                    // a conversation is not handed to it.
-                    serverError = "Port \(EngineServer.port) is held by a server this app did not start, so the engine "
-                        + "cannot listen there. Close the program that holds it, then start the engine again."
+                    // Something answers on the port and it is not the server this launch started. The
+                    // server holds its port alone and wrote it once bound, so this is not expected; a
+                    // conversation is still not handed to it.
+                    serverError = "Port \(port.map(String.init) ?? "?") answers as a server this app did not start, so "
+                        + "the engine is not used there. Start the engine again; if it persists, choose another "
+                        + "port under Serve on the network."
                     try? await Task.sleep(nanoseconds: 5_000_000_000)
                     continue
                 }
                 for try await event in a.events() {
-                    guard a === api else { break }
+                    guard a === client else { break }
                     if !serverUp {
                         serverUp = true
                         serverError = nil
@@ -233,6 +270,12 @@ final class Engine: ObservableObject {
             let next = ServerInfo(o)
             let before = info
             info = next
+            if next.busyLoading {
+                // The server's count where it gives one; an older server's load counts from its first event.
+                if let s = next.loadElapsedSeconds { loadBase = (s, Date()) } else if loadBase == nil { loadBase = (0, Date()) }
+            } else {
+                loadBase = nil
+            }
             if next.ready, before?.model?.path != next.model?.path || before?.model?.loadSeconds != next.model?.loadSeconds {
                 // A new session: a fresh metrics file for it, and the models list may have changed.
                 if preferences.metricsCSV { recorder.sessionOpened(info: next, config: config) }
@@ -260,6 +303,8 @@ final class Engine: ObservableObject {
             live = t
             lastDone = o
             recorder.done(o)
+            // The turn's figures belong to the answer it wrote: the chat puts them under it.
+            conversationEvents?("done", o)
             // A finished turn is a new measurement beside the plan the model runs with.
             if info?.model != nil { Task { await refreshPlan() } }
         case "plan_progress":
@@ -378,6 +423,7 @@ final class Engine: ObservableObject {
     func hfInspect(_ repo: String, name: String, token: String) async throws -> HFFacts {
         try await api.hfInspect(repo: repo, name: name, token: token)
     }
+    func inspectEntry(_ id: String) async throws -> ModelCheck { try await api.inspectEntry(id: id) }
 
     /// Adds the model to the catalog and starts its download, as the other entries download;
     /// answers the entry's id, whose row the screen scrolls to.
@@ -422,6 +468,13 @@ final class Preferences: ObservableObject {
         didSet { defaults.set(shareOnNetwork, forKey: "shareOnNetwork") }
     }
 
+    /// The port the person chose for the server, 0 for the server's own default. A preference, not a
+    /// promise: the server moves past it when another program holds it (ListenPort). Kept under the
+    /// key the launch argument `-BmoePort N` sets, so a simulator run can still pick one.
+    @Published var port: Int {
+        didSet { defaults.set(port, forKey: "BmoePort") }
+    }
+
     /// How the app looks: the system's light or dark, or always one of them. The web UI's choice.
     enum Theme: String, CaseIterable, Identifiable {
         case system, light, dark
@@ -441,6 +494,7 @@ final class Preferences: ObservableObject {
 
     init() {
         shareOnNetwork = defaults.bool(forKey: "shareOnNetwork")
+        port = ListenPort.chosen(String(defaults.integer(forKey: "BmoePort"))) ?? 0
         metricsCSV = defaults.object(forKey: "metricsCSV") as? Bool ?? false
         theme = defaults.string(forKey: "theme").flatMap(Theme.init(rawValue:)) ?? .system
     }

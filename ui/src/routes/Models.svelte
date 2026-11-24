@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import HuggingFace from '../components/models/HuggingFace.svelte';
+  import ModelFolders from '../components/models/ModelFolders.svelte';
   import UrlImport from '../components/models/UrlImport.svelte';
   import PlanProgress from '../components/plan/PlanProgress.svelte';
   import ProgressBar from '../components/ProgressBar.svelte';
@@ -8,6 +9,7 @@
   import { api } from '../lib/api';
   import { formatBytes, resumeLabel } from '../lib/format';
   import { libraryRows, type LibraryRow, type RowState } from '../lib/library';
+  import { router } from '../stores/router.svelte';
   import { href } from '../lib/route';
   import { roleLabel, splitByRole } from '../lib/roles';
   import type { CatalogEntry, ModelsResponse } from '../lib/types';
@@ -32,18 +34,6 @@
   let empty = $derived(!!data && yours.length === 0 && localGroups.companions.length === 0);
   let planning = $derived(server.info?.state === 'planning');
   let loading = $derived(server.info?.state === 'loading' || planning);
-
-  // Seconds since the load began, so a long load reads as progress rather than as a hang.
-  let elapsed = $state(0);
-  $effect(() => {
-    if (!loading) {
-      elapsed = 0;
-      return;
-    }
-    const t0 = Date.now();
-    const id = setInterval(() => (elapsed = Math.round((Date.now() - t0) / 1000)), 1000);
-    return () => clearInterval(id);
-  });
 
   async function refresh() {
     try {
@@ -130,7 +120,24 @@
     });
   }
 
+  // A load started here ends in a conversation, as the first-run setup's does: the person loaded a
+  // model to talk to it. Only while this screen is open, and not after a failed load.
+  let goChatAfter = $state('');
+  // Seen planning or loading since the click: an "empty" before that is the state the click found.
+  let sawLoad = false;
+  $effect(() => {
+    if (!goChatAfter) return;
+    const st = server.info?.state;
+    if (st === 'planning' || st === 'loading') sawLoad = true;
+    else if (st === 'ready' && sawLoad && server.info?.model?.path === goChatAfter) {
+      goChatAfter = '';
+      location.hash = href('chat');
+    } else if (st === 'error' || (st === 'empty' && sawLoad)) goChatAfter = '';
+  });
+
   function load(path: string) {
+    sawLoad = false;
+    goChatAfter = path;
     act(`load:${path}`, () => api.load(path));
   }
 
@@ -144,14 +151,6 @@
     return { update: go };
   }
 
-  const stateLabel: Record<RowState, string> = {
-    available: 'Available',
-    downloading: 'Downloading',
-    partial: 'Partly downloaded',
-    on_disk: 'On this machine',
-    loaded: 'Loaded',
-    incomplete: 'Shards missing',
-  };
   const stateClass: Record<RowState, string> = {
     available: '',
     downloading: 'info',
@@ -160,7 +159,25 @@
     loaded: 'ok',
     incomplete: 'err',
   };
-  import { t } from '../lib/text';
+  import { t, tp } from '../lib/text';
+
+  // "Already have models?": the folders section opened on adding one, from the first-model card or
+  // a link (`#/models/add-folder`, the first-run setup's).
+  let whereOpen = $state(false);
+  let whereEl: HTMLDetailsElement | undefined = $state();
+  let addNow = $state(0);
+  function addFolder() {
+    whereOpen = true;
+    addNow++;
+    queueMicrotask(() => whereEl?.scrollIntoView({ block: 'start', behavior: 'smooth' }));
+  }
+  // Once per arrival on the link, not again each time the list refreshes.
+  let handled = false;
+  $effect(() => {
+    const wanted = router.target === 'add-folder' && !!data;
+    if (wanted && !handled) addFolder();
+    handled = wanted;
+  });
 </script>
 
 <div class="page-col">
@@ -170,27 +187,25 @@
 </div>
 
 {#if error}
-  <p class="banner error" role="alert">Could not list models: {error} <button type="button" onclick={refresh}>Retry</button></p>
+  <p class="banner error" role="alert">{t('models.listFailed')} {error} <button type="button" onclick={refresh}>{t('action.retry')}</button></p>
 {/if}
 {#if actionError}
   <p class="banner error" role="alert">{actionError}</p>
 {/if}
 {#if server.info?.state === 'error'}
-  <p class="banner error">Last load failed: {server.info.error}</p>
+  <p class="banner error">{t('models.loadFailed')} {server.info.error}</p>
 {/if}
 
-{#if server.info?.model}
+{#if server.info?.model && !rows.some((r) => r.state === 'loaded')}
+  <!-- A model opened from outside the listed folders has no row: the banner carries it. A listed
+       one is said on its own row, not twice. -->
   <div class="banner info">
     <span>{t('models.loaded')} <strong>{server.info.model.name}</strong> ({server.info.model.arch}, {t('models.loadTime', { s: server.info.model.load_s.toFixed(1) })})</span>
     <StreamingBadge streaming={server.info.model.streaming} />
-    {#if !rows.some((r) => r.state === 'loaded')}
-      <!-- A model opened from outside the listed folders has no row to carry these. -->
-      <button type="button" onclick={() => act('unload', api.unload)} disabled={pending.unload}>Unload</button>
-      <a class="button primary" href={href('chat')}>Go to Chat</a>
-    {/if}
+    <button type="button" onclick={() => act('unload', api.unload)} disabled={pending.unload}>{t('models.unload')}</button>
+    <a class="button primary" href={href('chat')}>{t('models.goToChat')}</a>
   </div>
 {:else if loading}
-  <p class="banner warn" role="status">{planning ? 'Measuring this machine, then loading' : 'Loading the model'} · {elapsed} s</p>
   {#if planning}<PlanProgress progress={server.planProgress} />{/if}
 {/if}
 
@@ -204,73 +219,76 @@
       <div class="title">
         <strong class="name">{r.title}</strong>
         {#if e?.quant}<span class="badge">{e.quant}</span>{/if}
-        <span class="badge {stateClass[r.state]}">{stateLabel[r.state]}</span>
+        <span class="badge {stateClass[r.state]}">{t(`models.state.${r.state}`)}</span>
         {#if m}
-          {#if m.streamable}
-            <span class="badge ok">streamable</span>
-          {:else}
-            <span class="badge warn" title="This build does not stream this architecture: it runs as plain mmap">not streamable</span>
+          <!-- How it runs is the header's to say: nothing while shards are missing or it is unread. -->
+          {#if m.complete && m.arch}
+            {#if m.streamable}
+              <span class="badge ok">{t('models.streamable')}</span>
+            {:else}
+              <span class="badge warn" title={t('models.notStreamable.title')}>{t('models.notStreamable')}</span>
+            {/if}
           {/if}
           {#if m.projector}
-            <span class="badge" title="A projector file beside it ({m.projector}): loaded with the model, it reads images">vision</span>
+            <span class="badge" title={t('models.vision.title', { file: m.projector })}>{t('models.vision')}</span>
           {/if}
         {/if}
-        {#if e?.added}<span class="badge" title="Added from a repository or a link">added</span>{/if}
+        {#if e?.added}<span class="badge" title={t('models.added.title')}>{t('models.added')}</span>{/if}
       </div>
       <p class="muted meta">
-        {formatBytes(size)}{#if m?.arch}, {m.arch}{/if}{#if m && m.shards > 1}, {m.shards} shards{:else if e?.note}, {e.note}{/if}
+        {formatBytes(size)}{#if m?.arch}, {m.arch}{/if}{#if m && m.shards > 1}, {t('models.shards', { n: m.shards })}{:else if e?.note}, {e.note}{/if}
         {#if m && m.name !== r.title}· <code>{m.name}</code>{:else if !m && e}· <code>{e.file}</code>{/if}
-        {#if m?.folder}· in <code>{m.folder}</code>{/if}
-        {#if m && data && m.dir !== data.models_dir}· in <code>{m.dir}</code>{/if}
+        {#if m?.folder}· {t('models.in')} <code>{m.folder}</code>{/if}
+        {#if m && data && m.dir !== data.models_dir}· {t('models.in')} <code>{m.dir}</code>{/if}
       </p>
       {#if e?.blurb && !m}<p class="blurb">{e.blurb}</p>{/if}
       {#if r.state === 'downloading'}
-        <ProgressBar received={dl?.received ?? e?.received ?? 0} total={dl?.total || e?.bytes || 0} label="Download progress for {r.title}" />
+        <ProgressBar received={dl?.received ?? e?.received ?? 0} total={dl?.total || e?.bytes || 0} label={t('models.progress', { name: r.title })} />
         {#if dl?.state === 'running' && dl.error}<p class="muted note">{dl.error}</p>{/if}
       {:else if r.state === 'partial' && e}
-        <ProgressBar received={e.received ?? 0} total={e.bytes} label="Downloaded so far of {r.title}" />
+        <ProgressBar received={e.received ?? 0} total={e.bytes} label={t('models.partial', { name: r.title })} />
       {/if}
       {#if dl?.state === 'error'}
-        <p class="err">Download failed: {dl.error}</p>
+        <p class="err">{t('models.downloadFailed', { error: dl.error })}</p>
       {:else if dl?.state === 'cancelled' && r.state !== 'available'}
-        <p class="muted note">Download cancelled. The partial file is kept: Resume continues it.</p>
+        <p class="muted note">{t('models.cancelled')}</p>
       {/if}
       {#if confirming === r.key && m}
         <p class="err" role="alert">
-          Delete {m.files.length === 1 ? 'this file' : `all ${m.files.length} files`} ({formatBytes(m.bytes)}) from the disk? Press Delete again to confirm.
+          {tp('models.confirmDelete', m.files.length, { size: formatBytes(m.bytes) })}
         </p>
       {/if}
     </div>
     <div class="actions">
       {#if r.state === 'loaded' && m}
-        <button type="button" disabled={loading || pending[`load:${m.path}`]} onclick={() => load(m.path)}>Reload<span class="visually-hidden"> {r.title}</span></button>
-        <button type="button" disabled={pending.unload} onclick={() => act('unload', api.unload)}>Unload</button>
-        <a class="button primary" href={href('chat')}>Go to Chat</a>
+        <button type="button" disabled={loading || pending[`load:${m.path}`]} onclick={() => load(m.path)}>{t('models.reload')}<span class="visually-hidden"> {r.title}</span></button>
+        <button type="button" disabled={pending.unload} onclick={() => act('unload', api.unload)}>{t('models.unload')}</button>
+        <a class="button primary" href={href('chat')}>{t('models.goToChat')}</a>
       {:else if r.state === 'on_disk' && m}
-        <button type="button" class="primary" disabled={loading || pending[`load:${m.path}`]} onclick={() => load(m.path)}>Load<span class="visually-hidden"> {r.title}</span></button>
+        <button type="button" disabled={loading || pending[`load:${m.path}`]} onclick={() => load(m.path)}>{t('models.load')}<span class="visually-hidden"> {r.title}</span></button>
       {:else if r.state === 'downloading' && e}
         <button type="button" class="danger" disabled={pending[`cancel:${e.id}`]} onclick={() => act(`cancel:${e.id}`, () => api.cancelDownload(e.id))}>
-          Cancel<span class="visually-hidden"> download of {r.title}</span>
+          {t('action.cancel')}<span class="visually-hidden"> {t('models.downloadOf', { name: r.title })}</span>
         </button>
       {:else if (r.state === 'partial' || r.state === 'available' || r.state === 'incomplete') && e}
-        <button type="button" class="primary" disabled={pending[`dl:${e.id}`]} onclick={() => download(e)}>
-          {e.partial ? resumeLabel(e.received ?? 0, e.bytes) : 'Download'}<span class="visually-hidden"> {r.title}</span>
+        <button type="button" disabled={pending[`dl:${e.id}`]} onclick={() => download(e)}>
+          {e.partial ? resumeLabel(e.received ?? 0, e.bytes) : t('hf.download')}<span class="visually-hidden"> {r.title}</span>
         </button>
         {#if e.partial}
-          <button type="button" class="danger" disabled={pending[`part:${e.id}`]} onclick={() => deletePartial(e)} title="Delete the partially downloaded file and free its space">
-            Delete partial<span class="visually-hidden"> download of {r.title}</span>
+          <button type="button" class="danger" disabled={pending[`part:${e.id}`]} onclick={() => deletePartial(e)} title={t('models.deletePartial.title')}>
+            {t('models.deletePartial')}<span class="visually-hidden"> {t('models.downloadOf', { name: r.title })}</span>
           </button>
         {/if}
       {/if}
       {#if r.deleteName && r.state !== 'loaded' && r.state !== 'downloading'}
         <button type="button" class="danger" disabled={pending[`del:${r.key}`]} onclick={() => deleteModel(r)}>
-          {confirming === r.key ? 'Delete' : 'Delete...'}<span class="visually-hidden"> {r.title} from the disk</span>
+          {confirming === r.key ? t('action.delete') : t('models.deleteAsk')}<span class="visually-hidden"> {t('models.fromDisk', { name: r.title })}</span>
         </button>
-        {#if confirming === r.key}<button type="button" onclick={() => (confirming = '')}>Keep</button>{/if}
+        {#if confirming === r.key}<button type="button" onclick={() => (confirming = '')}>{t('action.keep')}</button>{/if}
       {/if}
       {#if e?.added && r.state !== 'downloading'}
-        <button type="button" disabled={pending[`rm:${e.id}`]} onclick={() => forget(e)} title="Take it off this list; files on disk stay">
-          Forget<span class="visually-hidden"> {r.title}</span>
+        <button type="button" disabled={pending[`rm:${e.id}`]} onclick={() => forget(e)} title={t('models.forget.title')}>
+          {t('models.forget')}<span class="visually-hidden"> {r.title}</span>
         </button>
       {/if}
     </div>
@@ -280,21 +298,22 @@
 {#if data}
   {#if empty}
     <section class="card first">
-      <h2>Get your first model</h2>
+      <h2>{t('models.first')}</h2>
+      <p class="have">{t('models.have')} <button type="button" class="link" onclick={addFolder}>{t('models.have.add')}</button></p>
       <ol class="three">
-        <li><strong>Find a model</strong>: search by name, or paste a repository.</li>
-        <li><strong>Check it fits here</strong>: the server reads its header and measures it against this machine, before any download.</li>
-        <li><strong>Download, then Load</strong>: Load appears on its row in Your models.</li>
+        <li><strong>{t('models.first.find')}</strong>{t('models.first.find.how')}</li>
+        <li><strong>{t('hf.check')}</strong>{t('models.first.check.how')}</li>
+        <li><strong>{t('models.first.download')}</strong>{t('models.first.download.how')}</li>
       </ol>
       <HuggingFace onAdded={added} />
       {#if suggested.length}
-        <h3>Or start from a suggestion</h3>
+        <h3>{t('models.fromSuggestion')}</h3>
         <div class="suggestions">
           {#each suggested as r (r.key)}
             {#if r.entry}
               {@const e = r.entry}
               <button type="button" disabled={pending[`dl:${e.id}`]} onclick={() => download(e)} title={e.blurb}>
-                Download {e.title}{e.quant ? ` (${e.quant})` : ''}, {formatBytes(e.bytes)}
+                {t('models.downloadSuggestion', { name: e.quant ? `${e.title} (${e.quant})` : e.title, size: formatBytes(e.bytes) })}
               </button>
             {/if}
           {/each}
@@ -304,35 +323,35 @@
         {#each suggested as r (r.key)}
           {@const dl = r.entry ? server.downloads[r.entry.id] : undefined}
           {#if dl?.state === 'error'}
-            <p class="err" role="alert">{r.title}: download failed: {dl.error}</p>
+            <p class="err" role="alert">{t('models.suggestionFailed', { name: r.title })} {dl.error}</p>
           {/if}
         {/each}
       {/if}
       <details class="more">
-        <summary>Or paste a direct link to a gguf</summary>
+        <summary>{t('models.orLink')}</summary>
         <UrlImport onAdded={added} />
       </details>
     </section>
   {:else}
-    <h2>Your models</h2>
-    <ul class="rows" aria-label="Your models">
+    <h2>{t('models.yours')}</h2>
+    <ul class="rows" aria-label={t('models.yours')}>
       {#each yours as r (r.key)}{@render row(r)}{/each}
     </ul>
     {#if localGroups.companions.length}
       <details class="companions">
-        <summary class="muted">{localGroups.companions.length} companion {localGroups.companions.length === 1 ? 'file' : 'files'}: not models to load, by their headers</summary>
+        <summary class="muted">{tp('models.companions', localGroups.companions.length)}</summary>
         <ul>
           {#each localGroups.companions as m (m.path)}
             {@const name = m.dir === data.models_dir ? (m.folder ? `${m.folder}/${m.name}` : m.name) : ''}
             <li>
               <span class="name">{m.name}</span>
               <span class="badge">{roleLabel(m.role ?? '')}</span>
-              <span class="muted">{formatBytes(m.bytes)}{m.arch ? `, ${m.arch}` : ''}{m.folder ? `, in ${m.folder}` : ''}</span>
+              <span class="muted">{formatBytes(m.bytes)}{m.arch ? `, ${m.arch}` : ''}{m.folder ? `, ${t('models.in')} ${m.folder}` : ''}</span>
               {#if name}
                 <button type="button" class="danger small" disabled={pending[`del:${m.path}`]} onclick={() => deleteModel({ key: m.path, title: m.name, local: m, entry: null, state: 'on_disk', suggested: false, deleteName: name })}>
-                  {confirming === m.path ? 'Delete' : 'Delete...'}<span class="visually-hidden"> {m.name}</span>
+                  {confirming === m.path ? t('action.delete') : t('models.deleteAsk')}<span class="visually-hidden"> {m.name}</span>
                 </button>
-                {#if confirming === m.path}<button type="button" class="small" onclick={() => (confirming = '')}>Keep</button>{/if}
+                {#if confirming === m.path}<button type="button" class="small" onclick={() => (confirming = '')}>{t('action.keep')}</button>{/if}
               {/if}
             </li>
           {/each}
@@ -340,26 +359,23 @@
       </details>
     {/if}
     {#if suggested.length}
-      <h3 class="suggested-title">Suggested</h3>
-      <ul class="rows" aria-label="Suggested models">
+      <h3 class="suggested-title">{t('models.suggested')}</h3>
+      <ul class="rows" aria-label={t('models.suggested.label')}>
         {#each suggested as r (r.key)}{@render row(r)}{/each}
       </ul>
     {/if}
 
-    <h2>Get another model</h2>
+    <h2>{t('models.another')}</h2>
     <HuggingFace onAdded={added} />
     <details class="card more">
-      <summary>Any other model: a direct link to a gguf</summary>
+      <summary>{t('models.anyLink')}</summary>
       <UrlImport onAdded={added} />
     </details>
   {/if}
 
-  <details class="where">
-    <summary class="muted">Where models live</summary>
-    <p class="muted">
-      Downloads land in <code>{data.models_dir}</code>; a gguf you copy there (or into a folder directly inside it) is listed too.
-      {#if data.scan_dirs?.length}Also listed, and loaded in place: {#each data.scan_dirs as d, i (d)}{i ? ', ' : ''}<code>{d}</code>{/each}.{/if}
-    </p>
+  <details class="where" bind:open={whereOpen} bind:this={whereEl}>
+    <summary class="muted">{t('models.where')}</summary>
+    <ModelFolders {data} onChanged={(next) => (data = next)} {addNow} />
   </details>
 {:else if !error}
   <div class="skel" aria-hidden="true">{#each [0, 1, 2] as i (i)}<span class="skeleton"></span>{/each}</div>
@@ -461,6 +477,9 @@
   .suggested-title {
     font-size: 0.95rem;
     margin: 1rem 0 0.5rem;
+  }
+  .have {
+    margin: 0 0 var(--s3);
   }
   .first h2 {
     margin-top: 0;

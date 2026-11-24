@@ -100,10 +100,14 @@ struct FitInputs {
     uint64_t file_bytes = 0;    // the whole model
     uint64_t present_bytes = 0; // already on disk, complete files only
     uint64_t disk_free = 0;     // in the models directory
-    uint64_t dense_bytes = 0;   // what stays resident under streaming
-    uint64_t token_cycle = 0;   // the expert bytes one token touches
-    uint64_t budget = 0;        // residency budget, 0 unknown
-    bool readable = false;      // the header parsed
+    uint64_t dense_bytes = 0;   // everything but the experts
+    // Of dense_bytes, the tables the graph only gathers rows from (model_probe: an embedding table
+    // not tied to the head). The plan leaves them mapped, so they are not resident: a per-layer
+    // table can be most of the dense bytes, and counting it refused models that run here.
+    uint64_t mapped_bytes = 0;
+    uint64_t token_cycle = 0; // the expert bytes one token touches
+    uint64_t budget = 0;      // residency budget, 0 unknown
+    bool readable = false;    // the header parsed
     bool is_moe = false;
     bool streamable = false;
     std::string refusal; // why a MoE is not streamed, when it is not
@@ -125,6 +129,12 @@ struct FitVerdict {
     // "unknown". Decided here from the facts above, so no client keeps a threshold of its own.
     std::string fit;
     std::string headline;
+    // The same answer for a person who is not choosing an engine: one sentence with no engine
+    // term in it, and the tone it is said in ("ok", "warn", "err", or "" where nothing is claimed),
+    // which a UI maps to a colour and nothing else. A first run shows these two; the headline and
+    // the memory sentence stay behind them, for whoever asks how it was checked.
+    std::string summary;
+    std::string tone;
 };
 FitVerdict fit_verdict(const FitInputs & in);
 

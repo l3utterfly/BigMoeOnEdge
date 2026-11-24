@@ -17,26 +17,33 @@ Esta es una traducción; el README en inglés es la referencia y puede ser más 
 
 Ejecuta modelos Mixture-of-Experts más grandes que la memoria de tu dispositivo. Los expertos se leen de la
 flash cuando el modelo los necesita. Android, iOS, macOS, Windows y Linux, construido sobre llama.cpp.
+Framework de streaming unificado: de teléfonos y portátiles a GPU de consumo y de centro de datos. Admite cualquier hardware, cualquier sistema operativo, cualquier modelo, cualquier cuantización.
+Planificación automática de recursos, hecha a medida para optimizar los tok/s.
 
 <table align="center">
 <tr>
-<td align="center" width="50%"><img src="docs/assets/screens/android.gif" width="220" alt="Qwen3.6-35B-A3B generando una respuesta en un teléfono Android de 12 GB, en tiempo real."></td>
-<td align="center" width="50%"><img src="docs/assets/screens/iphone.gif" width="220" alt="Qwen3.6-35B-A3B generando una respuesta en un iPhone de 12 GB, en tiempo real."></td>
+<td align="center" width="50%"><img src="https://github.com/user-attachments/assets/7967bed2-6094-489f-bd60-05b0b1980102" width="220" alt="Qwen3.6-35B-A3B generando una respuesta en un teléfono Android de 12 GB, en tiempo real."></td>
+<td align="center" width="50%"><img src="https://github.com/user-attachments/assets/26760326-2ef5-4b4a-950d-581c99e58206" width="220" alt="La app de iPhone en un iPhone de 12 GB con Qwen3.6-35B-A3B cargado: un chat sobre una imagen, el plan, los modelos y los ajustes, en tiempo real."></td>
 </tr>
 <tr>
-<td align="center">Teléfono Android de 12 GB</td>
-<td align="center">iPhone de 12 GB</td>
+<td align="center">Teléfono Android de 12 GB<br>Qwen3.6-35B-A3B · 5-6 tok/s</td>
+<td align="center">iPhone de 12 GB<br>Qwen3.6-35B-A3B · 6 tok/s</td>
 </tr>
 <tr>
-<td align="center" colspan="2"><img src="docs/assets/screens/desktop.gif" width="620" alt="Qwen3.6-35B-A3B generando una respuesta en la app de escritorio en un portátil Apple silicon de 16 GB, en tiempo real, a 20 tok/s."></td>
+<td align="center" colspan="2"><img src="https://github.com/user-attachments/assets/0e1fd1d2-4976-4ecf-a56f-fee60f5dff74" width="620" alt="Qwen3.6-35B-A3B generando una respuesta en la app de escritorio en un portátil Apple silicon de 16 GB, en tiempo real, a 21 tok/s."></td>
 </tr>
 <tr>
-<td align="center" colspan="2">Portátil Apple silicon de 16 GB</td>
+<td align="center" colspan="2">Portátil Apple silicon de 16 GB<br>Qwen3.6-35B-A3B · 18-24 tok/s</td>
 </tr>
 </table>
 
-Qwen3.6-35B-A3B (21 GB) en tiempo real en cada dispositivo. El modelo es más grande que la memoria de cada
-dispositivo.
+Qwen3.6-35B-A3B, más grande que la memoria de cada dispositivo; funciona cualquier modelo MoE en
+GGUF, con cualquier cuantización. Las velocidades de decodificación son las de la tabla de
+[Rendimiento](#rendimiento).
+
+**El agente en un portátil de 2021, sin GPU**: el prompt viral de la pagoda de vóxeles al agente integrado en un ThinkPad con 16 GB de RAM, solo CPU, y Qwen3.6-35B-A3B Q4_K_M. 988 líneas a 2,3 tok/s y luego la página en la vista previa de la app; las partes aceleradas se indican en pantalla.
+
+<p align="center"><img src="https://github.com/user-attachments/assets/1da744d4-dd98-4d14-a76e-50bdf0d9aec4" width="640" alt="El agente integrado escribe un jardín con una pagoda de vóxeles en un solo archivo HTML en un ThinkPad de 2021 con 15 GB de RAM y sin GPU dedicada; después, la página gira en la vista previa de la app."></p>
 
 ## Qué hace
 
@@ -50,6 +57,9 @@ dispositivo.
   los expertos más usados se quedan en su VRAM.
 - **Apps y un servidor.** Una app de escritorio, apps para el teléfono y un servidor compatible con OpenAI y
   Anthropic para agentes de programación.
+- **Ve imágenes.** Pon junto al modelo su archivo de proyector (`mmproj`) y el servidor lee imágenes en
+  todas las API; la CLI con `--mmproj` e `--image`. Cualquier modelo de visión que conozca la biblioteca de
+  proyectores de llama.cpp, en cualquier cuantización, en todos los backends.
 
 ## Rendimiento
 
@@ -57,14 +67,23 @@ dispositivo.
 |---|---|---|---:|---|---:|
 | **Teléfono Android** | 12 GB | DeepSeek V4 Flash 284B | 91 GB | flash | 1 |
 |  |  | Qwen3.8-Flash-Next 125B | 80 GB | flash | 2-4 |
-|  |  | Qwen3.6-35B-A3B | 21 GB | flash | 5 |
-| **iPhone** | 12 GB | Qwen3.6-35B-A3B | 21 GB | flash | 3 |
+|  |  | Qwen3.6-35B-A3B | 21 GB | flash | 5-6 |
+| **iPhone** | 12 GB | Qwen3.6-35B-A3B | 21 GB | flash | 6 |
 | **Portátil Apple silicon** | 16 GB | Qwen3.8-Flash-Next 125B | 76 GB | flash | 7-9 |
 |  |  | Qwen3.6-35B-A3B | 21 GB | flash | 18-24 |
 | **Portátil Windows** | 16 GB | Qwen3.6-35B-A3B | 21 GB | flash | 5 |
+| **GPU de escritorio** (NVIDIA) | 12 GB + 128 GB RAM | Qwen3.8-Flash-Next 125B | 84 GB | RAM, caché en GPU | 16-17 |
 | **GPU de escritorio** (NVIDIA) | 16 GB + 32 GB RAM | Qwen3.8-Flash-Next 125B | 66 GB | flash, caché en GPU | 19-21 |
 | **GPU de escritorio** (NVIDIA) | 24 GB + 96 GB RAM | Qwen3.8-Flash-Next 125B | 66 GB | RAM, caché en GPU | 70 |
 |  |  | Qwen3.6-35B-A3B | 21 GB | GPU | 217 |
+| **GPU de escritorio** (NVIDIA) | 24 GB + 62 GB RAM | Qwen3.6-35B-A3B | 21 GB | GPU | 154 |
+|  | 12 GB de ellos libres | Qwen3.6-35B-A3B | 21 GB | RAM, caché en GPU | 59-67 |
+|  |  | Gemma 4 26B-A4B | 17 GB | GPU | 114 |
+|  |  | Laguna XS 2.1 33B | 20 GB | GPU | 93-94 |
+| **GPU de escritorio** (NVIDIA) | 8 GB + 31 GB RAM | Qwen3.8-Flash-Next 125B | 66 GB | flash, caché en GPU | 16 |
+|  |  | Qwen3.6-35B-A3B | 21 GB | RAM, caché en GPU | 37-44 |
+| **Dos GPU de escritorio** (NVIDIA) | 2 × 16 GB + 60 GB RAM | Qwen3.8-Flash-Next 125B | 66 GB | RAM, caché en GPU | 41-48 |
+|  |  | DeepSeek V4 Flash 284B | 91 GB | flash, caché en GPU | 5 |
 | **GPU de centro de datos** (AMD, ROCm) | 192 GB | Qwen3.8-Flash-Next 125B | 66 GB | GPU | 53 |
 
 Un rango es la variación entre ejecuciones. Método y todas las ejecuciones:
@@ -121,6 +140,21 @@ print(reply.choices[0].message.content)
 32768 basta para opencode, 65536 para Claude Code
 ([dimensionar el contexto](docs/server-api.md#sizing-the-context-for-a-client)).
 
+```jsonc
+// opencode, ~/.config/opencode/opencode.json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "bmoe": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8765/v1", "apiKey": "local" },
+      "models": { "<model id from /v1/models>": { "limit": { "context": 32768, "output": 8192 } } }
+    }
+  },
+  "model": "bmoe/<model id from /v1/models>"
+}
+```
+
 ```bash
 # Claude Code
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8765
@@ -143,8 +177,7 @@ wire_api = "responses"
 env_key = "BMOE_API_KEY"   # export BMOE_API_KEY=local
 ```
 
-Para opencode, añade el servidor como proveedor compatible con OpenAI en `http://127.0.0.1:8765/v1`. En
-**Connect apps**, la app escribe la configuración de Codex CLI y opencode y muestra la de
+En **Connect apps**, la app escribe la configuración de opencode y Codex CLI y muestra la de
 Claude Code.
 
 **El agente.** La app de escritorio tiene su propio agente: trabaja en una carpeta que eliges, lee y edita
@@ -172,13 +205,17 @@ archivo ([docs/which-models-stream.md](docs/which-models-stream.md)). Diseño:
 ## El planificador
 
 <p align="center">
-  <img src="docs/assets/screens/plan-mac.png" width="820" alt="La pantalla Plan en un portátil Apple silicon de 16 GB con Qwen3.6-35B-A3B Q4_K_M: los expertos llegan de la flash con una caché de 6.6 GiB, el prompt corre en la GPU y los tokens en la CPU, 23.9 tok/s y 94% de aciertos medidos, y adónde va la memoria.">
+  <img src="https://github.com/user-attachments/assets/98e6de3e-e27d-482d-bff1-26fc66074af4" width="820" alt="La pantalla Plan en un portátil Apple silicon de 16 GB con Qwen3.6-35B-A3B Q4_K_M: los expertos llegan de la flash con una caché de 6.6 GiB, el prompt corre en la GPU y los tokens en la CPU, 23.9 tok/s y 94% de aciertos medidos, y adónde va la memoria.">
 </p>
 
 El planificador lee la cabecera del modelo y mide la máquina: memoria, velocidad del almacenamiento, cada
 CPU, GPU y NPU. Sus reglas no nombran ningún dispositivo ni plataforma, así que un teléfono y un equipo de
 escritorio reciben planes distintos del mismo código. Los valores que fijas tú se respetan. Consulta
 [docs/hardware-planning.md](docs/hardware-planning.md).
+
+<p align="center">
+  <img src="docs/assets/diagrams/plan-es.png" width="820" alt="El planificador: la máquina y el modelo entran en el plan; el plan decide dónde va cada peso (VRAM, RAM o flash), qué dispositivo lee el prompt y cuál genera los tokens, y el tamaño de las cachés y los hilos; se mide la primera respuesta y lo más rápido se guarda para la próxima carga.">
+</p>
 
 ## Plataformas
 
@@ -204,9 +241,7 @@ Detalles: [docs/platforms.md](docs/platforms.md).
 | Cualquier modelo MoE en GGUF | ✅ | pocos modelos | pocos modelos | formato propio | pocos modelos |
 | Se configura solo | ✅ `--auto` | elige el modelo según la memoria | presupuesto de la caché de expertos | `coli tune` | ❌ |
 
-Cuando un modelo cabe en una GPU de gaming más la RAM, Strata es de dos a cuatro veces más rápido. Cuando se
-lee desde la flash, todos los motores se quedan por debajo de diez tokens por segundo y es el disco quien
-marca el ritmo. Velocidades y fuentes: [docs/comparison.md](docs/comparison.md).
+Velocidades y fuentes: [docs/comparison.md](docs/comparison.md).
 
 ## Compilar desde el código fuente
 

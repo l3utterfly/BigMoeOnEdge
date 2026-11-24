@@ -1,4 +1,6 @@
 #include "prefill_path.h"
+
+#include "compute_reservation.h"
 #include "bmoe/log.h"
 
 #include "../moe/router_hook.h"
@@ -161,16 +163,21 @@ bool PrefillPath::open_arena(const PrefillDeviceConfig & cfg,
     arena_layers_.clear();
     arena_->set_test_delay_us(cfg.test_load_delay_us);
     arena_->set_routed(cfg.routed, cfg.routed_full_frac);
+    arena_->set_cache(cfg.from_cache ? cache_read_ : nullptr);
     arena_->set_test_skip_demand(cfg.test_routed_skip_demand);
     if (!arena_->init_dense(devs_[0], dense_per_layer, hook_->non_matrix_weights(), perr)) {
         err = "prefill device " + cfg.device + " dense arena: " + perr;
         return false;
     }
+    // The slots follow the graph's own order of layers, which the capture read: a model that runs a
+    // block more than once comes back to it.
+    arena_->set_graph_order(hook_->layer_order(), hook_->layer_blocks());
     if (arena_->has_dense())
         log_printf(LogLevel::Info,
-                   "prefill-device dense arena: layer weights through 2 slots, %.1f MiB; %d converted "
-                   "to a type the device takes (%.1f MiB)",
-                   (double) arena_->dense_slot_bytes() / (1024.0 * 1024.0), arena_->dense_converted(),
+                   "prefill-device dense arena: layer matrices through 2 slots, the rest held, %.1f MiB (%.1f "
+                   "held); %d converted to a type the device takes (%.1f MiB)",
+                   (double) arena_->dense_slot_bytes() / (1024.0 * 1024.0),
+                   (double) arena_->dense_resident_bytes() / (1024.0 * 1024.0), arena_->dense_converted(),
                    (double) arena_->dense_converted_bytes() / (1024.0 * 1024.0));
     log_printf(LogLevel::Info, "prefill-device expert arena: %d layers through %d slot%s of %.1f MiB, %d loaders%s",
                arena_->n_layers(), arena_->n_slots(), arena_->n_slots() == 1 ? "" : "s",
@@ -183,18 +190,19 @@ bool PrefillPath::open_arena(const PrefillDeviceConfig & cfg,
 // CPU — a prefill this session will never run there. At a wide ubatch that reservation is gigabytes
 // of RAM the expert cache does not get (measured 2.2 GB at 2048 on a 35B-A3B, while the device's own
 // graph needed 136 MB at 1024). So reserve again, with the weights where a wide graph will actually
-// find them: toggling a context flag is the public way to have llama.cpp redo its reservation at the
-// next decode, and one device-placed decode is that decode. The CPU keeps only what its own graphs
-// (decode, a short tail) need, grown on demand from there.
+// find them: request_compute_reservation has llama.cpp redo its reservation at the next decode, and
+// one device-placed decode is that decode. The CPU keeps only what its own graphs (decode, a short
+// tail) need, grown on demand from there. The filler stays in the cells it wrote, which are freed:
+// the first prompt passes over them as over any free cell (Session::Impl::clear_memory). Zeroing
+// them would fault the whole state in at load, the moved copy and the buffers llama.cpp first
+// allocated, whose pages init_state has just handed back.
 bool PrefillPath::reserve_on_device(llama_context * ctx, const llama_vocab * vocab, int n_tokens) {
-    llama_set_causal_attn(ctx, false);
-    llama_set_causal_attn(ctx, true);
+    request_compute_reservation(ctx);
     std::vector<llama_token> toks((size_t) n_tokens, filler_token(vocab));
     place(true);
     const int rc = decode(ctx, llama_batch_get_one(toks.data(), n_tokens));
     place(false);
-    llama_memory_clear(llama_get_memory(ctx), true);
-    clear_state();
+    llama_memory_clear(llama_get_memory(ctx), /*data=*/false);
     return rc == 0;
 }
 
@@ -212,12 +220,10 @@ bool PrefillPath::place(bool on_device, bool hold_slots) {
     if (!dev_) return false;
     const bool turns = arena_ && arena_->on_demand();
     if (on_device && turns && !arena_->slots_held()) {
-        const size_t budget = cache_ ? cache_->cache_budget() : 0;
-        const size_t need = arena_->slot_bytes();
-        if (budget > 0) cache_->set_cache_budget(budget > need ? budget - need : 1);
+        if (cache_) cache_->lend_cache(arena_->slot_bytes());
         std::string err;
         if (!arena_->acquire(err)) {
-            if (budget > 0) cache_->set_cache_budget(budget);
+            if (cache_) cache_->return_cache();
             if (!said_no_room_)
                 log_printf(LogLevel::Warn, "prefill-device: %s; this prefill runs on the host", err.c_str());
             said_no_room_ = true;
@@ -227,7 +233,7 @@ bool PrefillPath::place(bool on_device, bool hold_slots) {
             }
             on_device = false;
         } else {
-            yielded_budget_ = budget;
+            lent_ = cache_ != nullptr;
         }
     }
     dev_->place(on_device);
@@ -237,8 +243,8 @@ bool PrefillPath::place(bool on_device, bool hold_slots) {
     }
     if (!on_device && !hold_slots && turns && arena_->slots_held()) {
         arena_->release();
-        if (cache_ && yielded_budget_ > 0) cache_->set_cache_budget(yielded_budget_);
-        yielded_budget_ = 0;
+        if (lent_) cache_->return_cache();
+        lent_ = false;
     }
     return on_device;
 }
@@ -263,10 +269,6 @@ int PrefillPath::decode_ext(llama_context * ctx, llama_batch_ext * b) {
         if (rc == 0 && arena_->failed()) rc = -1;
     }
     return rc;
-}
-
-void PrefillPath::clear_state() {
-    if (dev_) dev_->clear_state();
 }
 
 } // namespace bmoe::detail

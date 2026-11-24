@@ -15,13 +15,17 @@
 #pragma once
 
 #include "bmoe/config.h"
+#include "bmoe/measured_knobs.h"
 #include "bmoe/hardware_profile.h"
 #include "bmoe/model_profile.h"
 #include "bmoe/plan.h"
 #include "bmoe/routing.h"
 
+#include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace bmoe {
@@ -81,6 +85,34 @@ struct AutoPlan {
     HardwareProfile hw;
     ModelProfile model;
     Plan plan;
+
+    // The rest of what the rules ran on: the first stage's placement at the graph width the caller
+    // asked for, and the devices the backends were narrowed to. With the profiles, what replan() runs
+    // the rules on again.
+    Placement placement;
+    std::vector<std::string> backends;
+
+    // What a re-fit answers from besides the facts' own file, devices and backends: the graph's width,
+    // the context, the KV cache's types and the draft context the fit makes room for.
+    struct FitKey {
+        uint32_t width = 0;
+        uint32_t n_ctx = 0;
+        KvCacheType type_k = KvCacheType::F16, type_v = KvCacheType::F16;
+        std::string draft; // the speculation's own context, as the fit sees it ("" without one)
+        bool operator<(const FitKey & o) const {
+            return std::tie(width, n_ctx, type_k, type_v, draft) <
+                   std::tie(o.width, o.n_ctx, o.type_k, o.type_v, o.draft);
+        }
+    };
+    // The capacity fitter's placements at a narrower graph than `placement`'s: the re-fits the rules
+    // ask for (replan), each asked of the fitter once and then read from here. A re-fit answers from
+    // the same file, devices, context and cache types whatever the record of measurements, so asking
+    // again only costs time: on a 24 GB card with GLM-4.7 every re-fit loaded the model's metadata for a
+    // dozen dry runs. It is also the right answer: the fitter reads the devices' free memory, which is
+    // the machine's as it was planned on only before the served model holds any of it. Kept with the facts, so a copy
+    // of them (a server's plan basis) carries what was fitted; keyed by everything else a fit depends on, so a plan for
+    // another context or cache type asks the fitter again.
+    mutable std::map<FitKey, Placement> placement_at_width;
 };
 
 // Probe this machine and `cfg.model_path`, then plan `cfg` on them. `req` carries what the caller
@@ -93,6 +125,13 @@ struct AutoPlan {
 // runs last of all, because in its active mode it leaves the kernel busy and anything measured
 // after it would measure the recovery.
 AutoPlan probe_and_plan(const RunConfig & cfg, const PlanRequest & req, const AutoPlanOptions & opt = {});
+
+// The rules once more on the facts `facts` was planned on, with `knobs` as the record of measurements:
+// the planning half of probe_and_plan, the capacity fitter's re-fits at a narrower width included, and
+// no probe. A re-fit at a width the facts already hold is read from them (AutoPlan::placement_at_width),
+// so only a width not fitted before asks the fitter. What a front-end plans a plan's other side with
+// (the side a load opens when the one the plan names does not).
+Plan replan(const AutoPlan & facts, const RunConfig & cfg, const PlanRequest & req, const MeasuredKnobs & knobs);
 
 // The child's side of an isolated device probe, whole: start the backends, probe `device` for the
 // model at `model_path`, and return in `line` what the child prints on its standard output for the
