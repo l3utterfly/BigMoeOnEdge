@@ -102,7 +102,12 @@ void probe_device_support(HardwareProfile & hw, const ModelProfile & model);
 // front-end keeps backends installed after the program (the server's backend packs,
 // docs/backends.md). The library does not know where those are; the front-end that installed them
 // does. Only the first call's folders count.
-void register_backends(const std::vector<std::string> & extra_dirs = {});
+//
+// `search_dirs` are folders of the release itself that are not the executable's (a package that
+// keeps its modules in a folder of their own), searched exactly as the executable's is, CPU tiers
+// included. Each backend sits in one folder only.
+void register_backends(const std::vector<std::string> & extra_dirs = {},
+                       const std::vector<std::string> & search_dirs = {});
 
 // The module files register_backends() loads from `extra_dirs`, given the executable's folder
 // `exe_dir`: in each folder, in order, each file named as ggml names a backend module

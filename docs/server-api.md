@@ -22,6 +22,12 @@ desktop app, the phone apps and a supervisor of your own pass both, remove the f
 and read the port from it rather than assume one. Without `--port-fallback` a port in use stops the
 server at start, as before. The code is `server/listen_port.h`.
 
+**Backends kept outside the executable's folder.** The server loads the compute backends beside
+itself and the packs installed into the data folder, and nowhere else. `--backend-dir PATH`
+(repeatable) names one more folder of the release itself, searched exactly as the executable's is,
+the CPU backend's instruction-set tiers included: for a package that keeps its modules in a folder
+of their own. Each backend sits in one folder only; one found in two is registered twice.
+
 It is also the application framework of this project: the same server, reached the same way,
 stands behind every UI, on the desktop and on a phone ([application-framework.md](application-framework.md)).
 

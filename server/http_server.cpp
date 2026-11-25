@@ -159,6 +159,7 @@ struct Options {
     std::string skills_dir;             // the agent's bundled skills; default skills/ beside this binary
     std::string mcp_config;             // the MCP servers' config; default <data>/mcp.json
     std::vector<std::string> scan_dirs; // more directories whose models are listed, never written
+    std::vector<std::string> backend_dirs; // --backend-dir: more folders the release keeps backend modules in
     std::vector<std::string> allow_origins;
     std::string api_key;
     std::string api_key_file;             // --api-key-file: the key, read at start, never on the command line
@@ -209,6 +210,8 @@ void print_usage(const char * argv0) {
                 "  --scan-dir PATH      also list the models in PATH and in the folders directly inside it,\n"
                 "                       loaded in place (repeatable; one level deep, links to folders skipped)\n"
                 "  --data-dir PATH      settings and models (default: the per-user application data folder)\n"
+                "  --backend-dir PATH   also load the compute backends found in PATH, as those beside this\n"
+                "                       binary are (repeatable): a package that keeps its modules elsewhere\n"
                 "  --ui-dir PATH        the built web UI (default: ui/ beside this binary)\n"
                 "  --catalog PATH       the model catalog (default: catalog/models.json beside this binary);\n"
                 "                       the client catalog (clients.json) is read from the same folder\n"
@@ -285,6 +288,8 @@ int parse_args(int argc, char ** argv, Options & o) {
             o.models_dir = next();
         else if (a == "--scan-dir")
             o.scan_dirs.push_back(next());
+        else if (a == "--backend-dir")
+            o.backend_dirs.push_back(next());
         else if (a == flag::data_dir)
             o.data_dir = next();
         else if (a == "--ui-dir")
@@ -1923,7 +1928,7 @@ int run(int argc, char ** argv, const Embedding & embedding) {
                      p.c_str(), version());
     if (load_backends) {
         platform::prepare_backend_modules(extra_backend_modules(platform::executable_dir(), pack_dirs));
-        register_backends(pack_dirs);
+        register_backends(pack_dirs, o.backend_dirs);
     }
     // The child of an isolated device probe: one device, its facts on one line, nothing else. If
     // the driver ends this process, or it never returns, that is the parent's answer about the device.

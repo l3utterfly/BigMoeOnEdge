@@ -292,7 +292,7 @@ std::vector<std::string> extra_backend_modules(const std::string & exe_dir,
     return out;
 }
 
-void register_backends(const std::vector<std::string> & extra_dirs) {
+void register_backends(const std::vector<std::string> & extra_dirs, const std::vector<std::string> & search_dirs) {
     // Once: llama_backend_init() loads nothing when the registry is already filled, and a second
     // pass here would count the modules the first one loaded as linked in.
     if (g_backends_looked) return;
@@ -310,6 +310,11 @@ void register_backends(const std::vector<std::string> & extra_dirs) {
         const size_t slash = self.find_last_of("/\\");
         const std::string dir = slash == std::string::npos ? std::string(".") : self.substr(0, slash);
         ggml_backend_load_all_from_path(dir.c_str());
+        // Then the folders the front-end was told the release keeps modules in, searched as the
+        // executable's own is, so the CPU backend's best tier for this machine is the one picked. A
+        // release keeps each backend in one folder: one found in two would be registered twice.
+        for (const std::string & d : search_dirs)
+            if (!d.empty()) ggml_backend_load_all_from_path(d.c_str());
         // Then the folders the front-end installed backends into, one module per backend the
         // executable's folder did not already supply, so no device is registered twice.
         for (const std::string & m : extra_backend_modules(dir, extra_dirs))

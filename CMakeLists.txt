@@ -116,10 +116,17 @@ endif()
 # upstream versions, so a submodule bump may need the chat glue in runtime.cpp updated (the
 # gates catch it at build time). That trade-off is deliberate; see docs/seam.md.
 set(BMOE_HAVE_LLAMA OFF)
+# The llama.cpp checkout this build compiles and links: the submodule, unless the build names another
+# (-DBMOE_LLAMA_SOURCE_DIR=PATH). A product that ships its own llama.cpp libraries builds the server
+# against that same checkout, so the two agree on `common`, which has no stable ABI. An embedder that
+# already declared the llama targets names it too: the server builds cpp-httplib and reads the JSON
+# header from its vendor tree.
+set(BMOE_LLAMA_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp" CACHE PATH
+    "The llama.cpp checkout to build against (default: the submodule)")
 if(TARGET llama AND TARGET llama-common)
     # Embedders share one llama.cpp runtime; never build a second set of llama/ggml symbols.
     set(BMOE_HAVE_LLAMA ON)
-elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/CMakeLists.txt")
+elseif(EXISTS "${BMOE_LLAMA_SOURCE_DIR}/CMakeLists.txt")
     set(BMOE_HAVE_LLAMA ON)
     # Upstream examples/tests/server stay off; build the common utils we link for chat.
     set(LLAMA_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
@@ -182,7 +189,7 @@ elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/CMakeLists.txt"
     if(APPLE AND GGML_METAL)
         enable_language(OBJCXX)
     endif()
-    add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL)
+    add_subdirectory("${BMOE_LLAMA_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/third_party/llama.cpp" EXCLUDE_FROM_ALL)
     # Upstream's headers are upstream's code: included as system headers, so a warning inside one
     # (common/'s jinja headers have unused static functions) is not reported against our sources.
     foreach(_t llama llama-common ggml ggml-base mtmd)
@@ -203,7 +210,7 @@ endif()
 # on Windows are not what the releases are built with, and get nothing.
 function(bmoe_utf8_process target)
     if(MSVC)
-        target_sources(${target} PRIVATE ${CMAKE_SOURCE_DIR}/packaging/windows/utf8.manifest)
+        target_sources(${target} PRIVATE ${PROJECT_SOURCE_DIR}/packaging/windows/utf8.manifest)
     endif()
 endfunction()
 
@@ -241,7 +248,7 @@ endif()
 # skipped with everything under it, so those targets keep upstream's flags.
 function(bmoe_apply_warnings dir)
     get_property(_src DIRECTORY ${dir} PROPERTY SOURCE_DIR)
-    string(FIND "${_src}/" "${CMAKE_SOURCE_DIR}/third_party/" _pos)
+    string(FIND "${_src}/" "${PROJECT_SOURCE_DIR}/third_party/" _pos)
     if(_pos EQUAL 0)
         return()
     endif()

@@ -6,7 +6,7 @@
 # HTTP on loopback, and downloads go through the system curl.
 
 if(NOT TARGET cpp-httplib)
-    add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/llama.cpp/vendor/cpp-httplib
+    add_subdirectory(${BMOE_LLAMA_SOURCE_DIR}/vendor/cpp-httplib
                      ${CMAKE_BINARY_DIR}/vendor/cpp-httplib EXCLUDE_FROM_ALL)
 endif()
 
@@ -51,7 +51,7 @@ set(BMOE_FEED_PUBLIC_KEY "" CACHE STRING "Base64 Ed25519 public key the release 
 add_library(bmoe_server_platform STATIC platform.cpp listen_port.cpp)
 target_link_libraries(bmoe_server_platform PUBLIC bmoe_frontend PRIVATE cpp-httplib)
 target_include_directories(bmoe_server_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(bmoe_server_platform SYSTEM PUBLIC ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/vendor)
+target_include_directories(bmoe_server_platform SYSTEM PUBLIC ${BMOE_LLAMA_SOURCE_DIR}/vendor)
 target_compile_definitions(bmoe_server_platform PRIVATE BMOE_BUILD_TARGET="${BMOE_BUILD_TARGET}")
 target_compile_features(bmoe_server_platform PUBLIC cxx_std_17)
 if(WIN32)
@@ -66,11 +66,11 @@ endif()
 # GitHub release both publish), unmodified, used for nothing else. Compiled as C++, which it is written to be, since this project
 # enables no C compiler of its own.
 set(BMOE_MONOCYPHER_SOURCES
-    ${CMAKE_SOURCE_DIR}/third_party/monocypher/monocypher.c
-    ${CMAKE_SOURCE_DIR}/third_party/monocypher/monocypher-ed25519.c)
+    ${PROJECT_SOURCE_DIR}/third_party/monocypher/monocypher.c
+    ${PROJECT_SOURCE_DIR}/third_party/monocypher/monocypher-ed25519.c)
 set_source_files_properties(${BMOE_MONOCYPHER_SOURCES} PROPERTIES LANGUAGE CXX)
 add_library(bmoe_monocypher STATIC ${BMOE_MONOCYPHER_SOURCES})
-target_include_directories(bmoe_monocypher SYSTEM PUBLIC ${CMAKE_SOURCE_DIR}/third_party/monocypher)
+target_include_directories(bmoe_monocypher SYSTEM PUBLIC ${PROJECT_SOURCE_DIR}/third_party/monocypher)
 
 # The server's own policy, with no HTTP, no session and no platform code, so tests/ can drive it:
 # the chat protocol, the line turns wait in, the layered settings, the event fan-out, the JSON
@@ -117,7 +117,7 @@ target_link_libraries(bmoe_server_core PUBLIC bmoe_core PRIVATE bmoe_monocypher 
 target_include_directories(bmoe_server_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # The vendored libraries (cpp-httplib, nlohmann/json) as system headers: upstream's code, upstream's
 # warnings.
-target_include_directories(bmoe_server_core SYSTEM PUBLIC ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/vendor)
+target_include_directories(bmoe_server_core SYSTEM PUBLIC ${BMOE_LLAMA_SOURCE_DIR}/vendor)
 
 # The whole server as a library (server.h): the engine host, the model library, the planner
 # adapter, the platform and the HTTP API. The executable is main() over it; an app that may not
@@ -158,7 +158,7 @@ set_target_properties(bmoe-server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BI
 # every build: the server finds both relative to itself, so a build tree, a package and an install
 # all look the same, and no source path is compiled into the binary.
 add_custom_target(bmoe-server-assets ALL
-    COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DDEST=$<TARGET_FILE_DIR:bmoe-server>
+    COMMAND ${CMAKE_COMMAND} -DSRC=${PROJECT_SOURCE_DIR} -DDEST=$<TARGET_FILE_DIR:bmoe-server>
             -P ${CMAKE_CURRENT_SOURCE_DIR}/stage_assets.cmake
     COMMENT "Staging the web UI and model catalog beside bmoe-server"
     VERBATIM)

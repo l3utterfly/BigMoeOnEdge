@@ -14,6 +14,12 @@ Carried on `layla-build` on top of each upstream release.
 - Per-request custom sampling, cancellation, prefill progress, and normal stop
   hooks; raw-prompt KV prefix reuse and sequence-cache persistence for native hosts.
   Cache save/restore is refused when a prefill device holds the model state.
+- `-DBMOE_LLAMA_SOURCE_DIR=PATH` builds against another llama.cpp checkout than the submodule, so a
+  product that ships its own llama.cpp libraries can build `bmoe-server` against the same sources.
+  The server's CMake reads cpp-httplib, the JSON header and its own assets from paths that hold
+  inside an embedding build too.
+- `bmoe-server --backend-dir PATH` (repeatable) also loads the compute backends found in `PATH`,
+  searched as the executable's own folder is, for a package that keeps its modules elsewhere.
 
 ### Changed
 - The prefill arena is upstream's again: loader threads write weights themselves, and Layla's llama.cpp

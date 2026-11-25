@@ -263,7 +263,8 @@ A llama.cpp backend is a CMake flag passed through: `scripts/build-host.sh -DGGM
 `scripts/build-android.ps1`, then the APK in [examples/android](examples/android). On the phone
 itself, in Termux: `pkg install git cmake clang make nodejs-lts`, then the steps above with
 `scripts/build-host.sh -DBMOE_BACKEND_MODULES=OFF`, one CPU library for that phone's cores instead
-of a module per instruction-set tier. More: [CONTRIBUTING.md](CONTRIBUTING.md).
+of a module per instruction-set tier. `-DBMOE_LLAMA_SOURCE_DIR=PATH` builds against another llama.cpp
+checkout than the submodule. More: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Documentation
 
